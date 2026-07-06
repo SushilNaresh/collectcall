@@ -1,0 +1,34 @@
+[Unit]
+Description=Collect Call B2BUA (PJSUA C)
+After=network.target
+
+[Service]
+Type=simple
+User=sip
+WorkingDirectory=/opt/collect_call
+# Production runtime overrides can be set here or in an EnvironmentFile.
+# Environment=CC_LOCAL_HOST=10.185.49.39
+# Environment=CC_LOCAL_SIP_PORT=5060
+# Environment=CC_SBC_HOST=<MTN_SBC_IP>
+# Environment=CC_SBC_PORT=5060
+# Environment=CC_COLLECT_PREFIXES=49013,49014,612,613
+# Environment=CC_DEFAULT_COUNTRY_CODE=234
+# Environment=CC_PREFIX_MODE=strip_required
+# Environment=CC_SERVICE_KEY_MODE=request_uri_and_from
+# Environment=CC_SERVICE_KEY_PLACEHOLDER=8024
+# Environment=CC_VALIDATION_HOST=127.0.0.1
+# Environment=CC_VALIDATION_PORT=9090
+# Environment=CC_ENDCALL_HOST=127.0.0.1
+# Environment=CC_ENDCALL_PORT=9092
+# Environment=CC_MEDIA_MODE=local_bridge
+ExecStart=/opt/collect_call/collect_call
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=collectcall
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

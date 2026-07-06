@@ -46,6 +46,11 @@ pj_status_t cc_extract_to_header_user(pjsip_rx_data *rdata,
                                       char *user,
                                       pj_size_t user_len);
 
+/** Extract user from the Diversion header (call-forward scenarios). */
+pj_status_t cc_extract_diversion_user(pjsip_msg *msg,
+                                      char *user,
+                                      pj_size_t user_len);
+
 /** Extract user from a pj_str_t URI-like value. */
 pj_status_t cc_extract_pj_uri_user(const pj_str_t *uri,
                                    char *user,

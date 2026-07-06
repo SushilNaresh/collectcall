@@ -277,6 +277,35 @@ pj_status_t cc_extract_to_header_user(pjsip_rx_data *rdata,
     return cc_extract_uri_user(uri_buf, user, user_len);
 }
 
+pj_status_t cc_extract_diversion_user(pjsip_msg *msg,
+                                      char *user,
+                                      pj_size_t user_len)
+{
+    pj_str_t hdr_name = pj_str("Diversion");
+    pjsip_generic_string_hdr *hdr;
+    char value_buf[512];
+    pj_size_t vlen;
+
+    if (!msg || !user || user_len == 0)
+        return PJ_EINVAL;
+
+    user[0] = '\0';
+
+    hdr = (pjsip_generic_string_hdr *)
+          pjsip_msg_find_hdr_by_name(msg, &hdr_name, NULL);
+    if (!hdr || hdr->hvalue.slen == 0)
+        return PJ_ENOTFOUND;
+
+    vlen = (pj_size_t)hdr->hvalue.slen;
+    if (vlen >= sizeof(value_buf))
+        vlen = sizeof(value_buf) - 1;
+
+    memcpy(value_buf, hdr->hvalue.ptr, vlen);
+    value_buf[vlen] = '\0';
+
+    return cc_extract_uri_user(value_buf, user, user_len);
+}
+
 pj_status_t cc_extract_pj_uri_user(const pj_str_t *uri,
                                    char *user,
                                    pj_size_t user_len)
@@ -481,12 +510,20 @@ pj_status_t cc_build_b_from_uri(const char *b_number,
     if (!b_number || !buf || buf_len == 0)
         return PJ_EINVAL;
 
-    len = snprintf(buf,
-                   buf_len,
-                   "sip:%s@%s:%d;user=phone",
-                   b_number,
-                   cc_cfg_local_host(),
-                   cc_cfg_local_sip_port());
+    /* Use E.164 format with '+' prefix for IMS/SBC compatibility */
+    if (b_number[0] == '+')
+        len = snprintf(buf, buf_len,
+                       "sip:%s@%s:%d;user=phone",
+                       b_number,
+                       cc_cfg_local_host(),
+                       cc_cfg_local_sip_port());
+    else
+        len = snprintf(buf, buf_len,
+                       "sip:+%s@%s:%d;user=phone",
+                       b_number,
+                       cc_cfg_local_host(),
+                       cc_cfg_local_sip_port());
+
     if (len < 0 || (pj_size_t)len >= buf_len) {
         buf[0] = '\0';
         return PJ_ETOOSMALL;

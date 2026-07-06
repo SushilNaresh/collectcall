@@ -199,13 +199,43 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
 
     status = cc_split_collect_number(dialed_raw, &collect_number);
     if (status != PJ_SUCCESS) {
-        PJ_LOG(2, (THIS_FILE,
-                   "[PREFIX] mode=%s prefixes=%s matched=<none>; rejecting call %d",
-                   cc_cfg_prefix_mode_name(),
-                   cc_cfg_collect_prefixes(),
-                   call_id));
-        pjsua_call_answer(call_id, PJSIP_SC_NOT_FOUND, NULL, NULL);
-        return;
+        /*
+         * Dialed number may be the bare short code (e.g. "612") from a
+         * call-forward scenario. Check Diversion/History-Info for the
+         * original called party to use as sponsor MSISDN.
+         */
+        char diversion_user[128] = {0};
+
+        if (rdata && rdata->msg_info.msg &&
+            cc_extract_diversion_user(rdata->msg_info.msg,
+                                      diversion_user,
+                                      sizeof(diversion_user)) == PJ_SUCCESS &&
+            diversion_user[0] != '\0')
+        {
+            PJ_LOG(3, (THIS_FILE,
+                       "[DIVERSION] bare prefix=%s; using Diversion user=%s as sponsor",
+                       dialed_raw, diversion_user));
+            memset(&collect_number, 0, sizeof(collect_number));
+            snprintf(collect_number.sponsor_raw,
+                     sizeof(collect_number.sponsor_raw),
+                     "%s", diversion_user);
+            snprintf(collect_number.dialed_digits,
+                     sizeof(collect_number.dialed_digits),
+                     "%s", dialed_raw);
+            snprintf(collect_number.matched_prefix,
+                     sizeof(collect_number.matched_prefix),
+                     "%s", dialed_raw);
+            collect_number.already_stripped = 1;
+            status = PJ_SUCCESS;
+        } else {
+            PJ_LOG(2, (THIS_FILE,
+                       "[PREFIX] mode=%s prefixes=%s matched=<none>; rejecting call %d",
+                       cc_cfg_prefix_mode_name(),
+                       cc_cfg_collect_prefixes(),
+                       call_id));
+            pjsua_call_answer(call_id, PJSIP_SC_NOT_FOUND, NULL, NULL);
+            return;
+        }
     }
 
     PJ_LOG(3, (THIS_FILE,
@@ -448,8 +478,15 @@ pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
     snprintf(original_b, sizeof(original_b), "%s", session->b_number);
     snprintf(arg->b_dial_number, sizeof(arg->b_dial_number),
              "%s", session->b_number);
-    snprintf(arg->b_from_user, sizeof(arg->b_from_user),
-             "%s", session->b_number);
+    if (session->caller_msisdn[0] != '\0') {
+        snprintf(arg->b_from_user, sizeof(arg->b_from_user),
+                 "%s", session->caller_msisdn);
+    } else {
+        snprintf(arg->b_from_user, sizeof(arg->b_from_user),
+                 "%s", session->b_number);
+        PJ_LOG(2, (THIS_FILE,
+                   "[B-LEG] caller_msisdn empty; falling back to b_number for From"));
+    }
 
     CC_SESSION_UNLOCK(session);
 
@@ -620,7 +657,7 @@ pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
             snprintf(arg->b_from_user,
                      sizeof(arg->b_from_user),
                      "%s",
-                     original_b);
+                     session->caller_msisdn);
 
             if (sk_mode != CC_SERVICE_KEY_MODE_DISABLED) {
                 if (have_service_key) {
@@ -645,7 +682,7 @@ pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
                                   sk_mode ==
                                       CC_SERVICE_KEY_MODE_REQUEST_URI_AND_FROM)
                                      ? keyed_user
-                                     : original_b);
+                                     : session->caller_msisdn);
 
                         if (sk_mode ==
                                 CC_SERVICE_KEY_MODE_REQUEST_URI ||
@@ -877,6 +914,7 @@ void *cc_originate_b_thread(void *arg_ptr)
     int pani_copied = 0;
     int pani_static = 0;
     int pai_copied = 0;
+    int p_early_media_added = 0;
 
     if (hdr_pool) {
         pj_list_init(&msg_data.hdr_list);
@@ -927,6 +965,12 @@ void *cc_originate_b_thread(void *arg_ptr)
                        "[ERROR] B-leg static PANI add failed"));
         }
 #endif
+
+        /* P-Early-Media: Supported — required by IMS/SBC for early media */
+        p_early_media_added = cc_add_msg_header(hdr_pool,
+                                                &msg_data,
+                                                "P-Early-Media",
+                                                "Supported");
     } else {
         PJ_LOG(1, (THIS_FILE,
                    "[ERROR] B-leg header pool creation failed"));

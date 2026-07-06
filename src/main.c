@@ -259,10 +259,13 @@ int main(void)
     codec_id = pj_str("PCMA/8000");
     pjsua_codec_set_priority(&codec_id, 255);
 
+    codec_id = pj_str("PCMU/8000");
+    pjsua_codec_set_priority(&codec_id, 253);
+
     codec_id = pj_str("telephone-event/8000");
     pjsua_codec_set_priority(&codec_id, 254);
 
-    PJ_LOG(3, (THIS_FILE, "Codec policy applied: PCMA/8000 + telephone-event/8000 only"));
+    PJ_LOG(3, (THIS_FILE, "Codec policy applied: PCMA/8000 + PCMU/8000 + telephone-event/8000"));
 }
 
 
@@ -276,6 +279,7 @@ int main(void)
     acc_cfg.id           = pj_str(acc_id_buf);
     acc_cfg.reg_uri      = pj_str("");     /* no REGISTER */
     acc_cfg.register_on_acc_add = PJ_FALSE;
+    acc_cfg.use_rfc5626  = 0;              /* disable ;ob in Contact */
 
     /* Configured RTP port range */
     acc_cfg.rtp_cfg.port = CC_RTP_PORT_START;
