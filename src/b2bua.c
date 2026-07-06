@@ -925,11 +925,17 @@ void *cc_originate_b_thread(void *arg_ptr)
             const char *value = session->fwd_hdrs[i].value;
             int is_pani = cc_header_name_is(name,
                                              "P-Access-Network-Info");
+            int is_pai = cc_header_name_is(name,
+                                            "P-Asserted-Identity");
 
 #if CC_BLEG_STATIC_PANI_ENABLE && CC_BLEG_REPLACE_COPIED_PANI
             if (is_pani)
                 continue;
 #endif
+
+            /* PAI is rebuilt from caller MSISDN + local host below */
+            if (is_pai)
+                continue;
 
             if (!cc_add_msg_header(hdr_pool, &msg_data, name, value)) {
                 PJ_LOG(1, (THIS_FILE,
@@ -942,8 +948,6 @@ void *cc_originate_b_thread(void *arg_ptr)
                 pcv_copied = 1;
             else if (is_pani)
                 pani_copied = 1;
-            else if (cc_header_name_is(name, "P-Asserted-Identity"))
-                pai_copied = 1;
         }
 
 #if CC_BLEG_STATIC_PANI_ENABLE
@@ -971,6 +975,32 @@ void *cc_originate_b_thread(void *arg_ptr)
                                                 &msg_data,
                                                 "P-Early-Media",
                                                 "Supported");
+
+        /* Build PAI from caller MSISDN + local host (same as From URI) */
+        {
+            char pai_buf[256];
+            const char *caller = session->caller_msisdn;
+            int pai_len;
+
+            if (caller[0] == '+')
+                pai_len = snprintf(pai_buf, sizeof(pai_buf),
+                                   "<sip:%s@%s;user=phone>",
+                                   caller, cc_cfg_local_host());
+            else
+                pai_len = snprintf(pai_buf, sizeof(pai_buf),
+                                   "<sip:+%s@%s;user=phone>",
+                                   caller, cc_cfg_local_host());
+
+            if (pai_len > 0 && (size_t)pai_len < sizeof(pai_buf)) {
+                pai_copied = cc_add_msg_header(hdr_pool,
+                                               &msg_data,
+                                               "P-Asserted-Identity",
+                                               pai_buf);
+            }
+            PJ_LOG(3, (THIS_FILE,
+                       "[B-LEG-HDR] PAI built=%s added=%s",
+                       pai_buf, pai_copied ? "yes" : "no"));
+        }
     } else {
         PJ_LOG(1, (THIS_FILE,
                    "[ERROR] B-leg header pool creation failed"));

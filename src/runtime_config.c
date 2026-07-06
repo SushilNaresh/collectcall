@@ -235,6 +235,12 @@ const char *cc_cfg_pani_value(void)
     return value ? value : CC_BLEG_STATIC_PANI;
 }
 
+const char *cc_cfg_user_agent(void)
+{
+    const char *value = env_nonempty("CC_USER_AGENT");
+    return value ? value : CC_USER_AGENT;
+}
+
 cc_media_mode_t cc_cfg_media_mode(void)
 {
     const char *value = env_nonempty("CC_MEDIA_MODE");

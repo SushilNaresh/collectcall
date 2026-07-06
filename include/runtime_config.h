@@ -44,6 +44,8 @@ int         cc_cfg_endcall_port(void);
 
 const char *cc_cfg_pani_value(void);
 
+const char *cc_cfg_user_agent(void);
+
 cc_media_mode_t cc_cfg_media_mode(void);
 const char     *cc_cfg_media_mode_name(void);
 

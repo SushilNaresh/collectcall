@@ -100,7 +100,7 @@ int main(void)
     /* ── 2. Configure ────────────────────────────────────────────── */
     pjsua_config_default(&ua_cfg);
     ua_cfg.max_calls = CC_MAX_CALLS;
-    ua_cfg.user_agent = pj_str(CC_USER_AGENT);
+    ua_cfg.user_agent = pj_str((char *)cc_cfg_user_agent());
 
     /* Wire global callbacks */
     ua_cfg.cb.on_incoming_call    = cc_on_incoming_call;
@@ -137,6 +137,23 @@ int main(void)
         pjsua_destroy();
         cc_app_logger_close();
         return 1;
+    }
+
+    /* Add REGISTER and PUBLISH to Allow header */
+    {
+        pjsip_endpoint *endpt = pjsua_get_pjsip_endpt();
+        const pj_str_t allow_methods[] = {
+            { "REGISTER", 8 },
+            { "PUBLISH", 7 }
+        };
+        const pj_str_t supported_ext[] = {
+            { "histinfo", 8 }
+        };
+
+        pjsip_endpt_add_capability(endpt, NULL, PJSIP_H_ALLOW,
+                                   NULL, 2, allow_methods);
+        pjsip_endpt_add_capability(endpt, NULL, PJSIP_H_SUPPORTED,
+                                   NULL, 1, supported_ext);
     }
 
     cc_app_logger_install_pj_writer();
