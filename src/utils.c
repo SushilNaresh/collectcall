@@ -510,16 +510,16 @@ pj_status_t cc_build_b_from_uri(const char *b_number,
     if (!b_number || !buf || buf_len == 0)
         return PJ_EINVAL;
 
-    /* Use E.164 format with '+' prefix for IMS/SBC compatibility */
+    /* Format: <sip:+<number>@host:port;user=phone> */
     if (b_number[0] == '+')
         len = snprintf(buf, buf_len,
-                       "sip:%s@%s:%d;user=phone",
+                       "<sip:%s@%s:%d;user=phone>",
                        b_number,
                        cc_cfg_local_host(),
                        cc_cfg_local_sip_port());
     else
         len = snprintf(buf, buf_len,
-                       "sip:+%s@%s:%d;user=phone",
+                       "<sip:+%s@%s:%d;user=phone>",
                        b_number,
                        cc_cfg_local_host(),
                        cc_cfg_local_sip_port());

@@ -976,20 +976,19 @@ void *cc_originate_b_thread(void *arg_ptr)
                                                 "P-Early-Media",
                                                 "Supported");
 
-        /* Build PAI from caller MSISDN + local host (same as From URI) */
+        /* Build PAI from caller MSISDN + local host (no '+' prefix per network spec) */
         {
             char pai_buf[256];
             const char *caller = session->caller_msisdn;
             int pai_len;
 
+            /* Strip leading '+' if present — PAI uses bare digits */
             if (caller[0] == '+')
-                pai_len = snprintf(pai_buf, sizeof(pai_buf),
-                                   "<sip:%s@%s;user=phone>",
-                                   caller, cc_cfg_local_host());
-            else
-                pai_len = snprintf(pai_buf, sizeof(pai_buf),
-                                   "<sip:+%s@%s;user=phone>",
-                                   caller, cc_cfg_local_host());
+                caller++;
+
+            pai_len = snprintf(pai_buf, sizeof(pai_buf),
+                               "<sip:%s@%s;user=phone>",
+                               caller, cc_cfg_local_host());
 
             if (pai_len > 0 && (size_t)pai_len < sizeof(pai_buf)) {
                 pai_copied = cc_add_msg_header(hdr_pool,
@@ -1036,6 +1035,29 @@ void *cc_originate_b_thread(void *arg_ptr)
                pai_copied ? "yes" : "no",
                pani_static ? "static" : (pani_copied ? "copy" : "none"),
                pani_static ? cc_cfg_pani_value() : ""));
+
+    /* Require: 100rel — needed for PRACK support on B-leg */
+    if (hdr_pool) {
+        cc_add_msg_header(hdr_pool, &msg_data, "Require", "100rel");
+    }
+
+    /* Route header to SBC (loose-route) — added only if configured */
+    {
+        const char *route_host = cc_cfg_sbc_host();
+        int route_port = cc_cfg_sbc_port();
+
+        if (route_host && route_host[0] != '\0' && hdr_pool) {
+            char route_buf[256];
+            int rlen = snprintf(route_buf, sizeof(route_buf),
+                                "<sip:%s:%d;transport=udp;lr>",
+                                route_host, route_port);
+            if (rlen > 0 && (size_t)rlen < sizeof(route_buf)) {
+                cc_add_msg_header(hdr_pool, &msg_data, "Route", route_buf);
+                PJ_LOG(3, (THIS_FILE,
+                           "[B-LEG-HDR] Route=%s", route_buf));
+            }
+        }
+    }
 
     target = pj_str(b_uri);
     status = pjsua_call_make_call(acc_id,

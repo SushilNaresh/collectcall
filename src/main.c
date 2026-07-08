@@ -18,12 +18,13 @@
 
 #include <pjsua-lib/pjsua.h>
 #include <pjsip/sip_endpoint.h>
-#include <pj/ioqueue.h>
+#include <pjsip/sip_config.h>
 #include <pj/timer.h>
 #include <pj/log.h>
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/select.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -138,6 +139,10 @@ int main(void)
         cc_app_logger_close();
         return 1;
     }
+
+    /* Disable auto UDP->TCP switch for messages >1300 bytes (RFC 3261 18.1.1).
+     * The SBC expects UDP; our B-leg INVITE with all headers exceeds 1300. */
+    pjsip_cfg()->endpt.disable_tcp_switch = PJ_TRUE;
 
     /* Add REGISTER and PUBLISH to Allow header */
     {
@@ -290,7 +295,8 @@ int main(void)
     pjsua_acc_config_default(&acc_cfg);
     snprintf(acc_id_buf,
              sizeof(acc_id_buf),
-             "sip:collectcall@%s:%d",
+             "sip:%s@%s:%d",
+             cc_cfg_user_agent(),
              local_host,
              local_sip_port);
     acc_cfg.id           = pj_str(acc_id_buf);
@@ -329,110 +335,87 @@ int main(void)
 
     /* ── 7. Main event loop ──────────────────────────────────────── */
     /*
-     * True blocking event loop using pjsip_endpt_handle_events2().
+     * Blocking event loop using select() on the wakeup pipe +
+     * pjsip_endpt_handle_events2() for SIP I/O and timers.
      *
-     * Strategy:
-     *   1. Create a pipe. Register the read-end with PJSIP's ioqueue so
-     *      that pjsip_endpt_handle_events2() wakes up when a byte arrives.
-     *   2. Pass the next timer deadline as max_timeout so the call blocks
-     *      exactly until the earliest scheduled timer fires or I/O arrives —
-     *      whichever comes first.
-     *   3. sig_handler writes one byte to the write-end of the pipe, which
-     *      unblocks the select() immediately on SIGINT/SIGTERM.
+     * select() blocks on the pipe read-fd with a timeout derived from
+     * the earliest PJSIP timer. When a signal arrives, sig_handler writes
+     * to the pipe and select() returns immediately.
      *
-     * CPU cost when idle: effectively zero — the thread is blocked in
-     * select()/epoll_wait() inside PJSIP until real work arrives.
+     * After select(), pjsip_endpt_handle_events2() is called with timeout=0
+     * to process any pending SIP I/O and fire due timers without blocking.
      */
     {
-        int pipe_fds[2];
-        pj_sock_t wake_sock;
-        pj_ioqueue_t *ioq;
-        pj_ioqueue_key_t *wake_key = NULL;
-        pj_ioqueue_callback wake_cb;
         pjsip_endpoint *endpt = pjsua_get_pjsip_endpt();
         pj_timer_heap_t *timer_heap = pjsip_endpt_get_timer_heap(endpt);
-        pj_pool_t *loop_pool = pjsua_pool_create("evloop", 512, 512);
+        int pipe_fds[2];
 
         if (pipe(pipe_fds) == 0) {
-            /* Make write-end non-blocking so sig_handler never stalls */
             fcntl(pipe_fds[1], F_SETFL,
                   fcntl(pipe_fds[1], F_GETFL) | O_NONBLOCK);
-
             g_wake_rfd = pipe_fds[0];
             g_wake_wfd = pipe_fds[1];
-
-            ioq = pjsip_endpt_get_ioqueue(endpt);
-            wake_sock = (pj_sock_t)pipe_fds[0];
-
-            pj_bzero(&wake_cb, sizeof(wake_cb));
-            if (loop_pool && ioq &&
-                pj_ioqueue_register_sock(loop_pool, ioq,
-                                         wake_sock, NULL,
-                                         &wake_cb,
-                                         &wake_key) == PJ_SUCCESS)
-            {
-                PJ_LOG(3, (THIS_FILE,
-                           "[LOOP] wakeup pipe registered with ioqueue fd=%d",
-                           pipe_fds[0]));
-            } else {
-                PJ_LOG(2, (THIS_FILE,
-                           "[LOOP] wakeup pipe ioqueue registration failed; "
-                           "falling back to capped timeout"));
-                wake_key = NULL;
-            }
-        } else {
-            PJ_LOG(2, (THIS_FILE,
-                       "[LOOP] pipe() failed; falling back to capped timeout"));
         }
 
+        PJ_LOG(3, (THIS_FILE, "[LOOP] select-based event loop started, max_ms=%d",
+                   CC_EVENT_LOOP_MAX_MS));
+
         while (g_running) {
+            fd_set rfds;
+            struct timeval tv;
             pj_time_val now;
             pj_time_val earliest;
-            pj_time_val timeout;
-            pj_time_val max_timeout;
+            pj_time_val pj_timeout;
+            unsigned event_count = 0;
+            long wait_ms = CC_EVENT_LOOP_MAX_MS;
+            int nfds;
 
-            max_timeout.sec  = 0;
-            max_timeout.msec = CC_EVENT_LOOP_MAX_MS;
+            /* Process pending SIP events first (non-blocking) */
+            pj_timeout.sec  = 0;
+            pj_timeout.msec = 0;
+            pjsip_endpt_handle_events2(endpt, &pj_timeout, &event_count);
 
-            /* Ask the timer heap for the next deadline */
+            /* If events were processed, loop immediately — no sleep */
+            if (event_count > 0)
+                continue;
+
+            /* No events: determine sleep time from next PJSIP timer */
             if (pj_timer_heap_earliest_time(timer_heap,
                                             &earliest) == PJ_SUCCESS) {
                 pj_gettimeofday(&now);
                 PJ_TIME_VAL_SUB(earliest, now);
 
-                /* earliest may be negative if a timer is already overdue */
                 if (earliest.sec < 0 ||
                     (earliest.sec == 0 && earliest.msec <= 0))
                 {
-                    timeout.sec  = 0;
-                    timeout.msec = 0;
+                    wait_ms = 1; /* timer due — brief yield then re-process */
                 } else {
-                    timeout = earliest;
+                    long timer_ms = earliest.sec * 1000 + earliest.msec;
+                    if (timer_ms < wait_ms)
+                        wait_ms = timer_ms;
                 }
-
-                if (PJ_TIME_VAL_GT(timeout, max_timeout))
-                    timeout = max_timeout;
-            } else {
-                /* No timers scheduled — sleep up to max */
-                timeout = max_timeout;
             }
 
-            pjsip_endpt_handle_events2(endpt, &timeout, NULL);
+            /* Block in select() on the wakeup pipe */
+            FD_ZERO(&rfds);
+            if (g_wake_rfd >= 0)
+                FD_SET(g_wake_rfd, &rfds);
+
+            tv.tv_sec  = wait_ms / 1000;
+            tv.tv_usec = (wait_ms % 1000) * 1000;
+
+            nfds = (g_wake_rfd >= 0) ? g_wake_rfd + 1 : 0;
+            select(nfds, &rfds, NULL, NULL, &tv);
+
+            /* Drain wakeup pipe if signaled */
+            if (g_wake_rfd >= 0 && FD_ISSET(g_wake_rfd, &rfds)) {
+                char drain[16];
+                (void)read(g_wake_rfd, drain, sizeof(drain));
+            }
         }
 
-        /* Cleanup wakeup pipe */
-        if (wake_key)
-            pj_ioqueue_unregister(wake_key);
-        else if (g_wake_rfd >= 0)
-            close(g_wake_rfd);
-
-        if (g_wake_wfd >= 0) {
-            close(g_wake_wfd);
-            g_wake_wfd = -1;
-        }
-
-        if (loop_pool)
-            pj_pool_release(loop_pool);
+        if (g_wake_rfd >= 0) close(g_wake_rfd);
+        if (g_wake_wfd >= 0) close(g_wake_wfd);
     }
 
     PJ_LOG(3, (THIS_FILE, "Shutting down..."));
