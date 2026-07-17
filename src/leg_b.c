@@ -28,7 +28,8 @@ static void on_reject_mapped(pjsua_call_id call_b,
                              cc_session_t *session,
                              const char *status,
                              const char *reason,
-                             char decision_digit);
+                             char decision_digit,
+                             cc_prompt_tag_t prompt_tag);
 
 static const char *disconnect_before_accept_reason(pjsip_status_code code)
 {
@@ -111,11 +112,27 @@ void leg_b_on_call_state(pjsua_call_id call_id, cc_session_t *session)
         if (should_reject_a) {
             /* B dropped before accepting — play rejection to A */
             PJ_LOG(3, (THIS_FILE, "[B] disconnected before accept — reject A"));
-            cc_session_mark_end(session,
-                                "CANCELLED",
-                                disconnect_before_accept_reason(
-                                    ci.last_status));
-            leg_a_play_rejected_then_hangup(session);
+
+            if (ci.last_status == PJSIP_SC_TEMPORARILY_UNAVAILABLE) {
+                /* 480: play UNAVAILABLE prompt, wait for A DTMF 1 for MCA */
+                leg_a_play_mca_wait(session, CC_PROMPT_UNAVAILABLE);
+            } else if (ci.last_status == PJSIP_SC_BUSY_HERE) {
+                /* 486: play BUSY prompt, wait for A DTMF 1 for MCA */
+                leg_a_play_mca_wait(session, CC_PROMPT_BUSY);
+            } else if (ci.last_status == PJSIP_SC_DECLINE) {
+                /* 603 Decline: B explicitly rejected */
+                cc_session_mark_end(session, "CANCELLED", "REJECTED_BY_SPONSOR");
+                leg_a_play_rejected_then_hangup(session);
+            } else {
+                /* 408 no-answer, 487 cancelled, 503 unreachable, etc. */
+                cc_session_mark_end(session,
+                                    "CANCELLED",
+                                    disconnect_before_accept_reason(
+                                        ci.last_status));
+                leg_a_play_prompt_then_hangup(session,
+                                             CC_PROMPT_NOT_AVAILABLE_TO_PAY,
+                                             PJSIP_SC_TEMPORARILY_UNAVAILABLE);
+            }
         }
 
         if (should_hangup_a) {
@@ -179,6 +196,17 @@ void leg_b_on_media_state(pjsua_call_id call_id, cc_session_t *session)
                        "[VOICE] B collect prompt already active/starting, skip"));
         return;
     }
+
+    /* Whitelisted: skip collect prompt, auto-accept immediately */
+    if (session->whitelisted) {
+        CC_SESSION_UNLOCK(session);
+        PJ_LOG(3, (THIS_FILE,
+                   "[WHITELIST] B-leg media active; skipping collect prompt, auto-accept (whitelisted=%d)",
+                   session->whitelisted));
+        on_accept(call_id, session);
+        return;
+    }
+
     session->b_prompt_starting = 1;
     CC_SESSION_UNLOCK(session);
 
@@ -391,8 +419,17 @@ static void run_accept_transition(cc_session_t *session,
         return;
     }
 
-    if (delay_ms > 0)
+    if (delay_ms > 0) {
+        PJ_LOG(3, (THIS_FILE,
+                   "[FREE-PERIOD] waiting %dms before bridge/charging", delay_ms));
         cc_sleep_ms(delay_ms);
+    }
+
+    /* Set billing start AFTER free period delay */
+    CC_SESSION_LOCK(session);
+    if (session->call_connected_ts == 0)
+        session->call_connected_ts = time(NULL);
+    CC_SESSION_UNLOCK(session);
 
     CC_SESSION_LOCK(session);
     {
@@ -480,12 +517,14 @@ typedef struct {
     cc_session_t   *session;
     pjsua_call_id   call_a;
     pjsua_call_id   call_b;
+    int             delay_ms;
 } accept_transition_arg_t;
 
 static void *accept_transition_thread(void *opaque)
 {
     accept_transition_arg_t *arg = (accept_transition_arg_t *)opaque;
     cc_session_t *session = arg->session;
+    int delay_ms = arg->delay_ms;
     pj_thread_desc desc;
     pj_thread_t *this_thread = NULL;
     pj_status_t thread_status;
@@ -502,7 +541,7 @@ static void *accept_transition_thread(void *opaque)
         return NULL;
     }
 
-    run_accept_transition(session, arg->call_a, arg->call_b, 500);
+    run_accept_transition(session, arg->call_a, arg->call_b, delay_ms);
 
     free(arg);
     cc_session_maybe_finalize(session);
@@ -512,7 +551,8 @@ static void *accept_transition_thread(void *opaque)
 
 static int spawn_accept_transition(cc_session_t *session,
                                    pjsua_call_id call_a,
-                                   pjsua_call_id call_b)
+                                   pjsua_call_id call_b,
+                                   int delay_ms)
 {
     accept_transition_arg_t *arg;
     pthread_t thread;
@@ -531,6 +571,7 @@ static int spawn_accept_transition(cc_session_t *session,
     arg->session = session;
     arg->call_a = call_a;
     arg->call_b = call_b;
+    arg->delay_ms = delay_ms;
 
     rc = pthread_create(&thread, NULL, accept_transition_thread, arg);
     if (rc != 0) {
@@ -559,6 +600,7 @@ static void on_accept(pjsua_call_id call_b, cc_session_t *session)
     char completed_digit;
     pjsua_call_id call_a;
     int duplicate;
+    int free_delay_ms = 0;
 
     CC_SESSION_LOCK(session);
     completed_digit = session->decision_digit;
@@ -584,20 +626,41 @@ static void on_accept(pjsua_call_id call_b, cc_session_t *session)
     session->decision_completed = 1;
     session->decision_digit = CC_DTMF_ACCEPT;
     session->accepted = 1;
-    if (session->call_connected_ts == 0)
-        session->call_connected_ts = time(NULL);
+
+    /*
+     * Compute free-period delay: if B accepts before the free period
+     * expires, defer call_connected_ts and bridge until it does.
+     * A keeps hearing the waiting prompt during this delay.
+     */
+    if (session->a_confirmed_ms > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        long long elapsed = now_ms - session->a_confirmed_ms;
+        int free_period = cc_cfg_free_period_ms();
+        if (elapsed < free_period)
+            free_delay_ms = (int)(free_period - elapsed);
+    }
+
+    /* Defer call_connected_ts — will be set after free period in transition */
     snprintf(call_id, sizeof(call_id), "%s", session->call_id);
     call_a = session->call_a;
     CC_SESSION_UNLOCK(session);
+
+    if (free_delay_ms > 0) {
+        PJ_LOG(3, (THIS_FILE,
+                   "[FREE-PERIOD] B accepted early; delaying bridge by %dms",
+                   free_delay_ms));
+    }
 
     PJ_LOG(3, (THIS_FILE, "[CALL-CONNECTED] callId=%s", call_id));
     PJ_LOG(3, (THIS_FILE,
                "[DTMF] accept media transition queued outside callback"));
 
-    if (!spawn_accept_transition(session, call_a, call_b)) {
+    if (!spawn_accept_transition(session, call_a, call_b, free_delay_ms)) {
         PJ_LOG(2, (THIS_FILE,
                    "[DTMF] accept worker unavailable; running immediate fallback"));
-        run_accept_transition(session, call_a, call_b, 0);
+        run_accept_transition(session, call_a, call_b, free_delay_ms);
     }
 }
 
@@ -607,14 +670,16 @@ static void on_reject(pjsua_call_id call_b, cc_session_t *session)
                      session,
                      "CANCELLED",
                      "REJECTED_BY_SPONSOR",
-                     CC_DTMF_REJECT);
+                     CC_DTMF_REJECT,
+                     CC_PROMPT_REJECTED);
 }
 
 static void on_reject_mapped(pjsua_call_id call_b,
                              cc_session_t *session,
                              const char *status,
                              const char *reason,
-                             char decision_digit)
+                             char decision_digit,
+                             cc_prompt_tag_t prompt_tag)
 {
     pjsua_player_id player_b = PJSUA_INVALID_ID;
     char completed_digit;
@@ -655,7 +720,7 @@ static void on_reject_mapped(pjsua_call_id call_b,
     else
         PJ_LOG(3, (THIS_FILE,
                    "[TIMER] skipped stale action: reject B call=%d", call_b));
-    leg_a_play_rejected_then_hangup(session);
+    leg_a_play_prompt_then_hangup(session, prompt_tag, PJSIP_SC_DECLINE);
 }
 
 /* ── Timer threads ───────────────────────────────────────────────────────── */
@@ -739,7 +804,8 @@ static void *timer_thread(void *arg)
                 else
                     PJ_LOG(3, (THIS_FILE,
                                "[TIMER] skipped stale action call=%d", call_b));
-                leg_a_play_unavailable_then_hangup(s);
+                leg_a_play_prompt_then_hangup(s, CC_PROMPT_NOT_AVAILABLE_TO_PAY,
+                                             PJSIP_SC_TEMPORARILY_UNAVAILABLE);
             }
         } else {
             PJ_LOG(2, (THIS_FILE, "[B] DTMF timeout (%d s) — reject", t));
@@ -747,7 +813,8 @@ static void *timer_thread(void *arg)
                              s,
                              "FAILED",
                              "ELIGIBILITY_TIMEOUT",
-                             '\0');
+                             '\0',
+                             CC_PROMPT_NOT_AVAILABLE_TO_PAY);
         }
     } else {
         PJ_LOG(3, (THIS_FILE,

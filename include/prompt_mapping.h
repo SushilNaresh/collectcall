@@ -11,6 +11,7 @@ typedef enum {
     CC_PROMPT_NOT_AVAILABLE_TO_PAY,
     CC_PROMPT_MCA_SENT,
     CC_PROMPT_MCA_NOT_SENT,
+    CC_PROMPT_FUNDLESS,
     CC_PROMPT_COUNT
 } cc_prompt_tag_t;
 

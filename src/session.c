@@ -3,6 +3,7 @@
  */
 #include "session.h"
 #include "config.h"
+#include "runtime_config.h"
 
 #include <pj/pool.h>
 #include <string.h>
@@ -48,6 +49,7 @@ cc_session_t *cc_session_create(pj_pool_factory *pf)
     s->sponsor_msisdn_normalized[0] = '\0';
     s->icid[0]       = '\0';
     s->call_start_ts = 0;
+    s->free_period_ms = cc_cfg_free_period_ms();
     s->call_connected_ts = 0;
     s->call_end_ts   = 0;
     s->end_reported  = 0;

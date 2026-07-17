@@ -25,7 +25,8 @@ static cc_prompt_entry_t g_prompts[CC_PROMPT_COUNT] = {
     { CC_PROMPT_BUSY, "BUSY", "wav/rejected.wav", "" },
     { CC_PROMPT_NOT_AVAILABLE_TO_PAY, "NOT_AVAILABLE_TO_PAY", "wav/unavailable.wav", "" },
     { CC_PROMPT_MCA_SENT, "MCA_SENT", "wav/unavailable.wav", "" },
-    { CC_PROMPT_MCA_NOT_SENT, "MCA_NOT_SENT", "wav/rejected.wav", "" }
+    { CC_PROMPT_MCA_NOT_SENT, "MCA_NOT_SENT", "wav/rejected.wav", "" },
+    { CC_PROMPT_FUNDLESS, "FUNDLESS", "wav/0.1.wav", "" }
 };
 
 static void set_fallback_paths(void)

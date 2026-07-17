@@ -292,6 +292,7 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
              sizeof(session->matched_prefix),
              "%s",
              collect_number.matched_prefix);
+    session->fundless = cc_cfg_is_fundless_prefix(session->matched_prefix);
     snprintf(session->sponsor_msisdn_raw,
              sizeof(session->sponsor_msisdn_raw),
              "%s",
@@ -503,6 +504,8 @@ pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
         time_t now;
         int vstatus;
 
+        memset(&validation_result, 0, sizeof(validation_result));
+
         now = time(NULL);
         if (cc_format_nigeria_time(now,
                                    time_str,
@@ -565,7 +568,6 @@ pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
                    vstatus, validation_result.reason));
 
         if (vstatus != 0) {
-            pjsua_call_id rejected_call_a;
             const char *end_status;
             const char *end_reason;
 
@@ -584,7 +586,6 @@ pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
                 return PJSUA_INVALID_ID;
             }
             session->torn_down = 1;
-            rejected_call_a = session->call_a;
             CC_SESSION_UNLOCK(session);
 
             end_status = (vstatus < 0 ||
@@ -601,14 +602,53 @@ pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
             free(arg);
 
             /*
-             * Return the hangup to the global call-state callback. It must
-             * release its callback reference before pjsua_call_hangup() can
-             * synchronously trigger the DISCONNECTED callback.
+             * Play the appropriate rejection prompt to A before hanging up.
+             * The prompt thread will hangup A after playback completes.
              */
-            if (cc_session_call_is_current(session, rejected_call_a, 1))
-                return rejected_call_a;
+            {
+                cc_prompt_tag_t prompt_tag;
+                pjsip_status_code sip_code;
+
+                switch (vstatus) {
+                case CC_VALIDATION_CALLER_BLACKLISTED:
+                    prompt_tag = CC_PROMPT_NOT_AVAILABLE_TO_PAY;
+                    sip_code = PJSIP_SC_FORBIDDEN;
+                    break;
+                case CC_VALIDATION_SPONSOR_BALANCE_FAIL:
+                    prompt_tag = CC_PROMPT_LOW_BALANCE;
+                    sip_code = PJSIP_SC_FORBIDDEN;
+                    break;
+                case CC_VALIDATION_SPONSOR_DND_ACTIVE:
+                case CC_VALIDATION_SPONSOR_ROAMING:
+                    prompt_tag = CC_PROMPT_NOT_AVAILABLE_TO_PAY;
+                    sip_code = PJSIP_SC_FORBIDDEN;
+                    break;
+                default:
+                    /* API_FAILURE, ELIGIBILITY_TIMEOUT, SYSTEM_ERROR */
+                    prompt_tag = CC_PROMPT_NOT_AVAILABLE_TO_PAY;
+                    sip_code = PJSIP_SC_SERVICE_UNAVAILABLE;
+                    break;
+                }
+
+                leg_a_play_prompt_then_hangup(session, prompt_tag, sip_code);
+            }
 
             return PJSUA_INVALID_ID;
+        }
+
+        /* Check if caller is whitelisted — skip B-leg collect prompt */
+        PJ_LOG(3, (THIS_FILE,
+                   "[WHITELIST-CHECK] details='%s' len=%d",
+                   validation_result.details,
+                   (int)strlen(validation_result.details)));
+        if (validation_result.details[0] != '\0' &&
+            strcasestr(validation_result.details, "IS_WHITELISTED") != NULL)
+        {
+            CC_SESSION_LOCK(session);
+            session->whitelisted = 1;
+            CC_SESSION_UNLOCK(session);
+            PJ_LOG(3, (THIS_FILE,
+                       "[WHITELIST] caller whitelisted; B-leg will bridge directly"));
         }
 
         {
@@ -1188,8 +1228,18 @@ static void cc_dispatch_dtmf(pjsua_call_id call_id,
     if (leg == 2) {
         leg_b_on_dtmf(call_id, digit, session);
     } else if (leg == 1) {
-        PJ_LOG(3, (THIS_FILE,
-                   "[DTMF] A-leg digit ignored; sponsor decision requires leg=B"));
+        int mca_waiting = 0;
+        CC_SESSION_LOCK(session);
+        mca_waiting = session->mca_waiting;
+        CC_SESSION_UNLOCK(session);
+
+        if (mca_waiting) {
+            leg_a_on_dtmf_mca(call_id, digit, session);
+        } else {
+            PJ_LOG(3, (THIS_FILE,
+                       "[DTMF] A-leg digit=%c ignored; no MCA pending",
+                       (char)digit));
+        }
     } else {
         PJ_LOG(2, (THIS_FILE,
                    "[DTMF] digit ignored; call is not associated with A or B leg"));

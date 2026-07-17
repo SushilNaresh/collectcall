@@ -67,6 +67,8 @@ typedef struct cc_session {
     char                sponsor_msisdn_normalized[64];
     char                icid[128];     /* P-Charging-Vector icid-value */
     time_t              call_start_ts;
+    long long           a_confirmed_ms;  /* monotonic ms when A-leg CONFIRMED */
+    int                 free_period_ms;  /* snapshot of CC_FREE_PERIOD_MS at session start */
     time_t              call_connected_ts;
     time_t              call_end_ts;
     int                 end_reported;  /* 1 after final [CALL-END] log */
@@ -76,10 +78,14 @@ typedef struct cc_session {
     int                 decision_completed; /* B decision/timeout claimed once */
     char                decision_digit; /* '1', '2', or '\0' for timeout */
     int                 accepted;      /* 1 after B presses DTMF_ACCEPT     */
+    int                 whitelisted;   /* 1 if API returned ELIGIBLE+whitelisted; skip B prompt */
+    int                 fundless;      /* 1 if matched prefix is in CC_FUNDLESS_PREFIXES */
     int                 torn_down;     /* 1 once teardown has started       */
     int                 a_prompt_starting;
     int                 b_prompt_starting;
     int                 a_treatment_running;
+    int                 mca_waiting;       /* 1 = waiting for A DTMF 1 to trigger MCA */
+    int                 mca_decided;       /* 1 = MCA decision claimed */
     int                 ring_timer_started;
     int                 dtmf_timer_started;
 

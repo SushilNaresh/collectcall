@@ -197,6 +197,12 @@ int main(void)
                "[CONFIG] pani_value=%s",
                cc_cfg_pani_value()));
     PJ_LOG(3, (THIS_FILE,
+               "[CONFIG] free_period_ms=%d",
+               cc_cfg_free_period_ms()));
+    PJ_LOG(3, (THIS_FILE,
+               "[CONFIG] fundless_prefixes=%s",
+               cc_cfg_fundless_prefixes()));
+    PJ_LOG(3, (THIS_FILE,
                "[CONFIG] max_call_legs=%d",
                CC_MAX_CALLS));
     PJ_LOG(3, (THIS_FILE,

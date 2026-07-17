@@ -49,4 +49,9 @@ const char *cc_cfg_user_agent(void);
 cc_media_mode_t cc_cfg_media_mode(void);
 const char     *cc_cfg_media_mode_name(void);
 
+int cc_cfg_free_period_ms(void);
+
+const char *cc_cfg_fundless_prefixes(void);
+int         cc_cfg_is_fundless_prefix(const char *prefix);
+
 #endif /* CC_RUNTIME_CONFIG_H */

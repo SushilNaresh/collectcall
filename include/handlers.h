@@ -3,6 +3,7 @@
 
 #include <pjsua-lib/pjsua.h>
 #include "session.h"
+#include "prompt_mapping.h"
 
 /*
  * handlers.h — Per-leg call logic declarations
@@ -29,6 +30,12 @@ pjsua_call_id leg_a_on_call_state(pjsua_call_id call_id,
 void leg_a_on_media_state(pjsua_call_id call_id, cc_session_t *session);
 
 /**
+ * Called when A-leg receives DTMF while mca_waiting is set.
+ * Digit 1 triggers MCA API + MCA_SENT prompt.
+ */
+void leg_a_on_dtmf_mca(pjsua_call_id call_id, int digit, cc_session_t *session);
+
+/**
  * Send 200 OK to A — called only after B accepts.
  * CDR billing clock starts here.
  */
@@ -44,6 +51,21 @@ void leg_a_play_rejected_then_hangup(cc_session_t *session);
  * Play the unavailable WAV to A, then hang up.
  */
 void leg_a_play_unavailable_then_hangup(cc_session_t *session);
+
+/**
+ * Play specified prompt to A on loop, wait for DTMF for MCA decision.
+ * If A presses 1, sends end-call with MCA reason and plays MCA_SENT.
+ * If A presses other key, plays MCA_NOT_SENT then hangup.
+ * If timeout, hangs up with NoMCA reason.
+ */
+void leg_a_play_mca_wait(cc_session_t *session, cc_prompt_tag_t prompt_tag);
+
+/**
+ * Play a specific prompt to A, then hang up with the given SIP code.
+ */
+void leg_a_play_prompt_then_hangup(cc_session_t *session,
+                                   cc_prompt_tag_t tag,
+                                   pjsip_status_code code);
 
 /**
  * Send SIP UPDATE on A's leg to exit the RTP path.

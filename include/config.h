@@ -154,4 +154,10 @@ static const char *CC_FWD_HEADERS[] = {
  */
 #define CC_EVENT_LOOP_MAX_MS        500
 
+/* Free period: max prompt duration for A-party, and minimum time before
+ * charging starts (B-accept is delayed if it arrives within this window).
+ * Override: export CC_FREE_PERIOD_MS=10000
+ */
+#define CC_FREE_PERIOD_MS           10000
+
 #endif /* CC_CONFIG_H */

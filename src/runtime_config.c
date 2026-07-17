@@ -271,3 +271,51 @@ const char *cc_cfg_media_mode_name(void)
         return "update";
     }
 }
+
+int cc_cfg_free_period_ms(void)
+{
+    const char *value = env_nonempty("CC_FREE_PERIOD_MS");
+    char *end = NULL;
+    long parsed;
+
+    if (!value)
+        return CC_FREE_PERIOD_MS;
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 0 || parsed > 300000)
+        return CC_FREE_PERIOD_MS;
+
+    return (int)parsed;
+}
+
+const char *cc_cfg_fundless_prefixes(void)
+{
+    const char *value = env_nonempty("CC_FUNDLESS_PREFIXES");
+    return value ? value : "";
+}
+
+int cc_cfg_is_fundless_prefix(const char *prefix)
+{
+    const char *list = cc_cfg_fundless_prefixes();
+    size_t plen;
+
+    if (!prefix || prefix[0] == '\0' || list[0] == '\0')
+        return 0;
+
+    plen = strlen(prefix);
+
+    const char *p = list;
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        size_t seg_len = comma ? (size_t)(comma - p) : strlen(p);
+
+        if (seg_len == plen && strncmp(p, prefix, plen) == 0)
+            return 1;
+
+        p += seg_len;
+        if (*p == ',')
+            p++;
+    }
+
+    return 0;
+}
