@@ -319,3 +319,35 @@ int cc_cfg_is_fundless_prefix(const char *prefix)
 
     return 0;
 }
+
+int cc_cfg_validation_timeout_ms(void)
+{
+    const char *value = env_nonempty("CC_VALIDATION_TIMEOUT_MS");
+    char *end = NULL;
+    long parsed;
+
+    if (!value)
+        return CC_VALIDATION_TIMEOUT_MS;
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 500 || parsed > 30000)
+        return CC_VALIDATION_TIMEOUT_MS;
+
+    return (int)parsed;
+}
+
+int cc_cfg_b_dtmf_timeout_sec(void)
+{
+    const char *value = env_nonempty("CC_B_DTMF_TIMEOUT_SEC");
+    char *end = NULL;
+    long parsed;
+
+    if (!value)
+        return CC_B_DTMF_TIMEOUT_SEC;
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 5 || parsed > 300)
+        return CC_B_DTMF_TIMEOUT_SEC;
+
+    return (int)parsed;
+}

@@ -224,15 +224,21 @@ void cc_send_end_call_udp(cc_session_t *session)
     char final_status[32];
     char final_reason[64];
     char icid[128];
+    char caller_msisdn[64];
+    char sponsor_msisdn[64];
     char start_date[32];
+    char connected_date[32];
     char end_date[32];
     char call_id_json[512];
     char status_json[128];
     char reason_json[256];
     char icid_json[512];
+    char caller_json[128];
+    char sponsor_json[128];
     char payload[2048];
     time_t start_ts;
     time_t connected_ts;
+    time_t b_answer_ts;
     time_t end_ts;
     long duration;
     int payload_len;
@@ -257,8 +263,11 @@ void cc_send_end_call_udp(cc_session_t *session)
     snprintf(final_status, sizeof(final_status), "%s", session->final_status);
     snprintf(final_reason, sizeof(final_reason), "%s", session->final_reason);
     snprintf(icid, sizeof(icid), "%s", session->icid);
+    snprintf(caller_msisdn, sizeof(caller_msisdn), "%s", session->caller_msisdn);
+    snprintf(sponsor_msisdn, sizeof(sponsor_msisdn), "%s", session->sponsor_msisdn_normalized);
     start_ts = session->call_start_ts;
-    connected_ts = session->call_connected_ts;
+    b_answer_ts = session->b_answer_ts;
+    connected_ts = b_answer_ts;   /* MTN: duration from B answer (toll-free + charged) */
     end_ts = session->call_end_ts;
 
     CC_SESSION_UNLOCK(session);
@@ -310,17 +319,22 @@ void cc_send_end_call_udp(cc_session_t *session)
         return;
     }
 
+    connected_date[0] = '\0';
+    if (b_answer_ts > 0)
+        cc_format_nigeria_time(b_answer_ts, connected_date, sizeof(connected_date));
+
     PJ_LOG(3, (THIS_FILE,
-               "[API-TIME] startDate=%s",
-               start_date));
-    PJ_LOG(3, (THIS_FILE,
-               "[API-TIME] endDate=%s",
+               "[API-TIME] startDate=%s connectedDate=%s endDate=%s",
+               start_date,
+               connected_date[0] ? connected_date : "<not-connected>",
                end_date));
 
     if (json_escape(call_id, call_id_json, sizeof(call_id_json)) != 0 ||
         json_escape(api_status, status_json, sizeof(status_json)) != 0 ||
         json_escape(api_reason, reason_json, sizeof(reason_json)) != 0 ||
-        json_escape(icid, icid_json, sizeof(icid_json)) != 0)
+        json_escape(icid, icid_json, sizeof(icid_json)) != 0 ||
+        json_escape(caller_msisdn, caller_json, sizeof(caller_json)) != 0 ||
+        json_escape(sponsor_msisdn, sponsor_json, sizeof(sponsor_json)) != 0)
     {
         PJ_LOG(1, (THIS_FILE,
                    "[END-UDP] send failed: payload field too long"));
@@ -329,14 +343,17 @@ void cc_send_end_call_udp(cc_session_t *session)
 
     payload_len = snprintf(
         payload, sizeof(payload),
-        "{\"callId\":\"%s\",\"callDuration\":%ld,"
-        "\"status\":\"%s\",\"reason\":\"%s\","
-        "\"startDate\":\"%s\",\"endDate\":\"%s\",\"ICID\":\"%s\"}",
+        "{\"callId\":\"%s\",\"callerMsisdn\":\"%s\",\"sponsorMsisdn\":\"%s\","
+        "\"callDuration\":%ld,\"status\":\"%s\",\"reason\":\"%s\","
+        "\"startDate\":\"%s\",\"connectedDate\":\"%s\",\"endDate\":\"%s\",\"ICID\":\"%s\"}",
         call_id_json,
+        caller_json,
+        sponsor_json,
         duration,
         status_json,
         reason_json,
         start_date,
+        connected_date,
         end_date,
         icid_json);
     if (payload_len < 0 || (size_t)payload_len >= sizeof(payload)) {

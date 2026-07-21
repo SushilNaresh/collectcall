@@ -69,6 +69,7 @@ typedef struct cc_session {
     time_t              call_start_ts;
     long long           a_confirmed_ms;  /* monotonic ms when A-leg CONFIRMED */
     int                 free_period_ms;  /* snapshot of CC_FREE_PERIOD_MS at session start */
+    time_t              b_answer_ts;     /* wall clock when B-leg answered (CONFIRMED) */
     time_t              call_connected_ts;
     time_t              call_end_ts;
     int                 end_reported;  /* 1 after final [CALL-END] log */
@@ -82,7 +83,10 @@ typedef struct cc_session {
     int                 fundless;      /* 1 if matched prefix is in CC_FUNDLESS_PREFIXES */
     int                 torn_down;     /* 1 once teardown has started       */
     int                 a_prompt_starting;
+    int                 a_prompt_done;       /* 1 after one-shot A waiting prompt finishes */
+    int                 a_prompt_duration_ms; /* duration of A waiting prompt for B-leg wait */
     int                 b_prompt_starting;
+    int                 b_collect_done;      /* 1 after one-shot B collect prompt finishes */
     int                 a_treatment_running;
     int                 mca_waiting;       /* 1 = waiting for A DTMF 1 to trigger MCA */
     int                 mca_decided;       /* 1 = MCA decision claimed */

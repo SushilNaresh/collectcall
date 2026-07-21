@@ -54,4 +54,7 @@ int cc_cfg_free_period_ms(void);
 const char *cc_cfg_fundless_prefixes(void);
 int         cc_cfg_is_fundless_prefix(const char *prefix);
 
+int cc_cfg_validation_timeout_ms(void);
+int cc_cfg_b_dtmf_timeout_sec(void);
+
 #endif /* CC_RUNTIME_CONFIG_H */

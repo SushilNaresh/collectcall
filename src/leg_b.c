@@ -12,6 +12,7 @@
 
 #include <pjsua-lib/pjsua.h>
 #include <pjmedia/sdp.h>
+#include <pjmedia/wav_port.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -20,6 +21,32 @@
 #include <unistd.h>
 
 #define THIS_FILE "leg_b.c"
+
+/* WAV player duration in ms. Fallback 4000ms. */
+static int cc_player_duration_ms(pjsua_player_id pid)
+{
+    pjmedia_port *port = NULL;
+    pj_ssize_t data_len;
+    const pjmedia_port_info *info;
+    int bytes_per_sample;
+    int duration_ms;
+
+    if (pid == PJSUA_INVALID_ID)
+        return 4000;
+    if (pjsua_player_get_port(pid, &port) != PJ_SUCCESS || !port)
+        return 4000;
+    data_len = pjmedia_wav_player_get_len(port);
+    if (data_len <= 0)
+        return 4000;
+    info = &port->info;
+    bytes_per_sample = (info->fmt.det.aud.bits_per_sample / 8) *
+                       info->fmt.det.aud.channel_count;
+    if (bytes_per_sample <= 0 || info->fmt.det.aud.clock_rate == 0)
+        return 4000;
+    duration_ms = (int)((long long)data_len * 1000 /
+                        (info->fmt.det.aud.clock_rate * bytes_per_sample));
+    return duration_ms > 0 ? duration_ms + 500 : 4000;
+}
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
 static void on_accept(pjsua_call_id call_b, cc_session_t *session);
@@ -69,6 +96,13 @@ void leg_b_on_call_state(pjsua_call_id call_id, cc_session_t *session)
                call_id,
                (int)ci.state_text.slen, ci.state_text.ptr,
                (int)ci.last_status_text.slen, ci.last_status_text.ptr));
+
+    if (ci.state == PJSIP_INV_STATE_CONFIRMED) {
+        /* Attempt early collect prompt start at CONFIRMED, before media active.
+         * The guard in leg_b_on_media_state prevents double-start. */
+        PJ_LOG(3, (THIS_FILE, "[B] CONFIRMED — attempting early collect prompt start"));
+        leg_b_on_media_state(call_id, session);
+    }
 
     if (ci.state == PJSIP_INV_STATE_DISCONNECTED) {
         int already_accepted;
@@ -148,6 +182,63 @@ void leg_b_on_call_state(pjsua_call_id call_id, cc_session_t *session)
 }
 
 
+/* Thread: wait for B collect prompt to finish, then start DTMF timer (fix 4b) */
+void *cc_b_prompt_done_thread(void *opaque)
+{
+    typedef struct { cc_session_t *s; int ms; } bpd_arg_t;
+    bpd_arg_t    *arg = (bpd_arg_t *)opaque;
+    cc_session_t *s   = arg->s;
+    int           wait_ms = arg->ms;
+    pj_thread_desc desc;
+    pj_thread_t   *th = NULL;
+
+    pj_bzero(desc, sizeof(desc));
+    pj_thread_register("cc_bpd", desc, &th);
+    free(arg);
+
+    /* After 1s, log RTP state to confirm B is actually sending RTP back.
+     * If remote/src is still invalid:0 here, B's RTP path is not live
+     * and B cannot hear the prompt. */
+    int rtp_checked = 0;
+    int remaining = wait_ms;
+    while (remaining > 0) {
+        int slice = remaining > 100 ? 100 : remaining;
+        cc_sleep_ms(slice);
+        remaining -= slice;
+
+        if (!rtp_checked && (wait_ms - remaining) >= 1000) {
+            rtp_checked = 1;
+            pjsua_call_id call_b_id;
+            CC_SESSION_LOCK(s);
+            call_b_id = s->call_b;
+            CC_SESSION_UNLOCK(s);
+            if (call_b_id != PJSUA_INVALID_ID)
+                cc_log_call_rtp_info(call_b_id, "B-rtp-1s");
+        }
+
+        int done;
+        CC_SESSION_LOCK(s);
+        done = s->accepted || s->torn_down || s->final_cleanup_started;
+        CC_SESSION_UNLOCK(s);
+        if (done) {
+            cc_session_maybe_finalize(s);
+            cc_session_release_reason(s, "b-prompt-done");
+            return NULL;
+        }
+    }
+
+    CC_SESSION_LOCK(s);
+    s->b_collect_done = 1;
+    CC_SESSION_UNLOCK(s);
+
+    PJ_LOG(3, (THIS_FILE, "[B] Collect prompt finished; starting DTMF timer"));
+    leg_b_start_dtmf_timer(s);
+
+    cc_session_maybe_finalize(s);
+    cc_session_release_reason(s, "b-prompt-done");
+    return NULL;
+}
+
 /* ── Media state callback ────────────────────────────────────────────────── */
 
 void leg_b_on_media_state(pjsua_call_id call_id, cc_session_t *session)
@@ -177,6 +268,12 @@ void leg_b_on_media_state(pjsua_call_id call_id, cc_session_t *session)
     (void)ep;
     
    cc_log_call_rtp_info(call_id, "B"); 
+
+    /* Record B answer timestamp (toll-free period start) */
+    CC_SESSION_LOCK(session);
+    if (session->b_answer_ts == 0)
+        session->b_answer_ts = time(NULL);
+    CC_SESSION_UNLOCK(session);
 
     CC_SESSION_LOCK(session);
     if (session->accepted || session->torn_down ||
@@ -214,7 +311,7 @@ void leg_b_on_media_state(pjsua_call_id call_id, cc_session_t *session)
     PJ_LOG(3, (THIS_FILE,
                "[VOICE] Start B collect prompt: %s",
                collect_prompt_path));
-    pid = cc_start_wav(call_id, collect_prompt_path, PJ_TRUE);
+    pid = cc_start_wav(call_id, collect_prompt_path, PJ_FALSE);
 
     CC_SESSION_LOCK(session);
     if (pid != PJSUA_INVALID_ID &&
@@ -230,9 +327,34 @@ void leg_b_on_media_state(pjsua_call_id call_id, cc_session_t *session)
     CC_SESSION_UNLOCK(session);
 
     if (keep_player) {
+        int prompt_ms = cc_player_duration_ms(pid);
         PJ_LOG(3, (THIS_FILE,
-                   "[B] Collect prompt started (loop) player=%d", pid));
-        leg_b_start_dtmf_timer(session);
+                   "[B] Collect prompt started (one-shot) player=%d duration=%dms",
+                   pid, prompt_ms));
+        /* Start DTMF timer only after collect prompt finishes playing */
+        CC_SESSION_LOCK(session);
+        session->b_collect_done = 0;
+        CC_SESSION_UNLOCK(session);
+        {
+            /* Inline wait in a detached thread so we don't block the callback */
+            typedef struct { cc_session_t *s; int ms; } bpd_arg_t;
+            bpd_arg_t *bpd = malloc(sizeof(*bpd));
+            if (bpd && cc_session_acquire_reason(session, "b-prompt-done")) {
+                bpd->s  = session;
+                bpd->ms = prompt_ms;
+                pthread_t bpd_t;
+                if (pthread_create(&bpd_t, NULL, cc_b_prompt_done_thread, bpd) == 0)
+                    pthread_detach(bpd_t);
+                else {
+                    free(bpd);
+                    cc_session_release_reason(session, "b-prompt-done");
+                    leg_b_start_dtmf_timer(session);
+                }
+            } else {
+                free(bpd);
+                leg_b_start_dtmf_timer(session); /* fallback */
+            }
+        }
     } else if (pid != PJSUA_INVALID_ID) {
         PJ_LOG(3, (THIS_FILE,
                    "[VOICE] B collect prompt became stale, destroying player=%d",
@@ -419,10 +541,79 @@ static void run_accept_transition(cc_session_t *session,
         return;
     }
 
-    if (delay_ms > 0) {
-        PJ_LOG(3, (THIS_FILE,
-                   "[FREE-PERIOD] waiting %dms before bridge/charging", delay_ms));
-        cc_sleep_ms(delay_ms);
+    {
+        int whitelisted;
+        CC_SESSION_LOCK(session);
+        whitelisted = session->whitelisted;
+        CC_SESSION_UNLOCK(session);
+
+        if (whitelisted) {
+            /*
+             * Whitelisted flow:
+             * 1. Play 4.1.wav to B (one-shot, full duration)
+             * 2. A keeps hearing 4.wav (player_a) or silence if already done
+             * 3. After 4.1.wav finishes, stop 4.wav on A, then bridge
+             * Free-period delay is not used for whitelisted calls.
+             */
+            pjsua_player_id b_conn_pid = PJSUA_INVALID_ID;
+            const char *b_conn_path = cc_prompt_get_path(CC_PROMPT_B_CONNECTED);
+
+            if (cc_session_call_is_current(session, call_b, 0))
+                b_conn_pid = cc_start_wav(call_b, b_conn_path, PJ_FALSE);
+
+            int b_conn_ms = cc_player_duration_ms(b_conn_pid);
+            PJ_LOG(3, (THIS_FILE,
+                       "[WHITELIST] Playing 4.1.wav to B: %s (%dms); A keeps 4.wav",
+                       b_conn_path, b_conn_ms));
+            cc_sleep_ms(b_conn_ms);
+
+            if (b_conn_pid != PJSUA_INVALID_ID)
+                cc_stop_wav(b_conn_pid, PJSUA_INVALID_ID);
+
+            /* Stop 4.wav on A now that 4.1.wav has finished on B */
+            CC_SESSION_LOCK(session);
+            if (session->player_a != PJSUA_INVALID_ID) {
+                player_a = session->player_a;
+                session->player_a = PJSUA_INVALID_ID;
+            }
+            CC_SESSION_UNLOCK(session);
+            if (player_a != PJSUA_INVALID_ID) {
+                PJ_LOG(3, (THIS_FILE, "[VOICE] Stop A MOH (4.wav) after B-connected prompt"));
+                cc_stop_wav(player_a, PJSUA_INVALID_ID);
+                player_a = PJSUA_INVALID_ID;
+            }
+        } else {
+            /* Non-whitelisted: stop A prompt, then free-period dial tone on both legs */
+            CC_SESSION_LOCK(session);
+            if (session->player_a != PJSUA_INVALID_ID) {
+                player_a = session->player_a;
+                session->player_a = PJSUA_INVALID_ID;
+            }
+            CC_SESSION_UNLOCK(session);
+            if (player_a != PJSUA_INVALID_ID) {
+                PJ_LOG(3, (THIS_FILE, "[VOICE] Stop A waiting prompt before dial tone"));
+                cc_stop_wav(player_a, PJSUA_INVALID_ID);
+                player_a = PJSUA_INVALID_ID;
+            }
+
+            if (delay_ms > 0) {
+                pjsua_player_id tone_a = PJSUA_INVALID_ID;
+                pjsua_player_id tone_b = PJSUA_INVALID_ID;
+                const char *dial_tone_path = cc_prompt_get_path(CC_PROMPT_DIAL_TONE);
+                PJ_LOG(3, (THIS_FILE,
+                           "[FREE-PERIOD] waiting %dms before bridge/charging; playing dial tone",
+                           delay_ms));
+                if (cc_session_call_is_current(session, call_a, 1))
+                    tone_a = cc_start_wav(call_a, dial_tone_path, PJ_TRUE);
+                if (cc_session_call_is_current(session, call_b, 0))
+                    tone_b = cc_start_wav(call_b, dial_tone_path, PJ_TRUE);
+                cc_sleep_ms(delay_ms);
+                if (tone_a != PJSUA_INVALID_ID)
+                    cc_stop_wav(tone_a, PJSUA_INVALID_ID);
+                if (tone_b != PJSUA_INVALID_ID)
+                    cc_stop_wav(tone_b, PJSUA_INVALID_ID);
+            }
+        }
     }
 
     /* Set billing start AFTER free period delay */
@@ -454,7 +645,7 @@ static void run_accept_transition(cc_session_t *session,
         return;
     }
 
-    /* 3. Stop A's waiting player */
+    /* 3. Stop A's waiting player (no-op if already stopped before dial tone) */
     CC_SESSION_LOCK(session);
     if (session->player_a != PJSUA_INVALID_ID) {
         player_a = session->player_a;
@@ -910,5 +1101,5 @@ void leg_b_start_ring_timer(cc_session_t *session)
 
 void leg_b_start_dtmf_timer(cc_session_t *session)
 {
-    spawn_timer(session, CC_B_DTMF_TIMEOUT_SEC, 0);
+    spawn_timer(session, cc_cfg_b_dtmf_timeout_sec(), 0);
 }

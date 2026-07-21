@@ -347,8 +347,8 @@ int cc_udp_validate_call(const char *caller_msisdn,
         return -1;
     }
 
-    tv.tv_sec = CC_VALIDATION_TIMEOUT_MS / 1000;
-    tv.tv_usec = (CC_VALIDATION_TIMEOUT_MS % 1000) * 1000;
+    tv.tv_sec = cc_cfg_validation_timeout_ms() / 1000;
+    tv.tv_usec = (cc_cfg_validation_timeout_ms() % 1000) * 1000;
 
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
         copy_string(result->reason, sizeof(result->reason), "SYSTEM_ERROR");

@@ -49,12 +49,12 @@
 
 /* ── Timers (seconds) ─────────────────────────────────────────────────── */
 #define CC_B_RING_TIMEOUT_SEC       60
-#define CC_B_DTMF_TIMEOUT_SEC       30
+#define CC_B_DTMF_TIMEOUT_SEC       10
 
 /* ── UDP Validation Stub ─────────────────────────────────────────────── */
 #define CC_VALIDATION_UDP_HOST       "127.0.0.1"
 #define CC_VALIDATION_UDP_PORT       9090
-#define CC_VALIDATION_TIMEOUT_MS     1000
+#define CC_VALIDATION_TIMEOUT_MS     5000
 #define CC_VALIDATION_UDP_BIND_LOCAL_PORT 0
 #define CC_VALIDATION_UDP_LOCAL_PORT 9091
 #define CC_INITIATE_SOURCE           "PREFIX_INITIATED"

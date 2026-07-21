@@ -1248,10 +1248,10 @@ static void cc_session_finish_end(cc_session_t *session,
                      sizeof(session->final_reason),
                      reason);
 
-    if (session->call_connected_ts > 0 &&
-        session->call_end_ts >= session->call_connected_ts)
+    if (session->b_answer_ts > 0 &&
+        session->call_end_ts >= session->b_answer_ts)
     {
-        duration = (long)(session->call_end_ts - session->call_connected_ts);
+        duration = (long)(session->call_end_ts - session->b_answer_ts);
     } else {
         duration = 0;
     }

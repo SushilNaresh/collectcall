@@ -203,6 +203,12 @@ int main(void)
                "[CONFIG] fundless_prefixes=%s",
                cc_cfg_fundless_prefixes()));
     PJ_LOG(3, (THIS_FILE,
+               "[CONFIG] validation_timeout_ms=%d",
+               cc_cfg_validation_timeout_ms()));
+    PJ_LOG(3, (THIS_FILE,
+               "[CONFIG] b_dtmf_timeout_sec=%d",
+               cc_cfg_b_dtmf_timeout_sec()));
+    PJ_LOG(3, (THIS_FILE,
                "[CONFIG] max_call_legs=%d",
                CC_MAX_CALLS));
     PJ_LOG(3, (THIS_FILE,

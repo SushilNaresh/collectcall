@@ -919,6 +919,81 @@ void *cc_originate_b_thread(void *arg_ptr)
     }
     CC_SESSION_UNLOCK(session);
 
+    /* Wait for A's one-shot waiting prompt to finish before ringing B.
+     * This ensures B does not ring while A is still hearing the prompt. */
+    {
+        int prompt_ms;
+        CC_SESSION_LOCK(session);
+        prompt_ms = session->a_prompt_duration_ms;
+        CC_SESSION_UNLOCK(session);
+
+        if (prompt_ms > 0) {
+            int waited_ms = 0;
+            const int max_wait_ms = prompt_ms + 1000; /* cap: prompt + 1s slack */
+            PJ_LOG(3, (THIS_FILE,
+                       "[B-LEG] waiting %dms for A prompt to finish before originating B",
+                       prompt_ms));
+            while (waited_ms < max_wait_ms) {
+                int done;
+                cc_sleep_ms(50);
+                waited_ms += 50;
+                CC_SESSION_LOCK(session);
+                done = session->torn_down ||
+                       session->call_a == PJSUA_INVALID_ID ||
+                       session->final_cleanup_started;
+                CC_SESSION_UNLOCK(session);
+                if (done) {
+                    PJ_LOG(3, (THIS_FILE,
+                               "[B-LEG] A prompt wait aborted: call torn down"));
+                    CC_SESSION_LOCK(session);
+                    session->b_origination_pending = 0;
+                    CC_SESSION_UNLOCK(session);
+                    cc_session_maybe_finalize(session);
+                    cc_session_release_reason(session, "b-origination-stale");
+                    return NULL;
+                }
+                if (waited_ms >= prompt_ms)
+                    break;
+            }
+            PJ_LOG(3, (THIS_FILE,
+                       "[B-LEG] A prompt wait done after %dms; originating B",
+                       waited_ms));
+        }
+    }
+
+    /* Start MOH on A-leg while B is ringing — all callers */
+    {
+        pjsua_call_id call_a;
+        CC_SESSION_LOCK(session);
+        call_a = session->call_a;
+        CC_SESSION_UNLOCK(session);
+
+        if (call_a != PJSUA_INVALID_ID) {
+            const char *moh_path = cc_prompt_get_path(CC_PROMPT_MOH);
+            pjsua_player_id moh_pid = cc_start_wav(call_a, moh_path, PJ_FALSE);
+            if (moh_pid != PJSUA_INVALID_ID) {
+                CC_SESSION_LOCK(session);
+                if (session->call_a == call_a &&
+                    !session->accepted &&
+                    !session->torn_down &&
+                    session->player_a == PJSUA_INVALID_ID)
+                {
+                    session->player_a = moh_pid;
+                    PJ_LOG(3, (THIS_FILE,
+                               "[VOICE] MOH started on A-leg player=%d path=%s",
+                               moh_pid, moh_path));
+                } else {
+                    CC_SESSION_UNLOCK(session);
+                    cc_stop_wav(moh_pid, PJSUA_INVALID_ID);
+                    PJ_LOG(3, (THIS_FILE, "[VOICE] MOH discarded (stale)"));
+                    goto skip_moh_store;
+                }
+                CC_SESSION_UNLOCK(session);
+            }
+        }
+        skip_moh_store:;
+    }
+
     PJ_LOG(3, (THIS_FILE, "Originating B leg to %s", b_uri));
 
     pjsua_call_setting_default(&cs);
@@ -1076,9 +1151,9 @@ void *cc_originate_b_thread(void *arg_ptr)
                pani_static ? "static" : (pani_copied ? "copy" : "none"),
                pani_static ? cc_cfg_pani_value() : ""));
 
-    /* Require: 100rel — needed for PRACK support on B-leg */
+    /* Supported: 100rel — advertise support without requiring it */
     if (hdr_pool) {
-        cc_add_msg_header(hdr_pool, &msg_data, "Require", "100rel");
+        cc_add_msg_header(hdr_pool, &msg_data, "Supported", "100rel");
     }
 
     /* Route header to SBC (loose-route) — added only if configured */

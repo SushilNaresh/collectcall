@@ -57,6 +57,7 @@ static void stop_a_waiting_prompt_before_treatment(cc_session_t *session,
                                                    const char *reason)
 {
     pjsua_player_id player_a = PJSUA_INVALID_ID;
+    int remaining_ms = 0;
 
     if (!session)
         return;
@@ -65,11 +66,28 @@ static void stop_a_waiting_prompt_before_treatment(cc_session_t *session,
     if (session->player_a != PJSUA_INVALID_ID) {
         player_a = session->player_a;
         session->player_a = PJSUA_INVALID_ID;
-    }
 
+        /* Compute how much of the waiting prompt is still left to play */
+        if (session->a_prompt_duration_ms > 0 && session->a_confirmed_ms > 0) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            long long now_ms = (long long)ts.tv_sec * 1000 +
+                               ts.tv_nsec / 1000000;
+            long long elapsed = now_ms - session->a_confirmed_ms;
+            long long total   = session->a_prompt_duration_ms;
+            if (elapsed < total)
+                remaining_ms = (int)(total - elapsed);
+        }
+    }
     CC_SESSION_UNLOCK(session);
 
     if (player_a != PJSUA_INVALID_ID) {
+        if (remaining_ms > 0) {
+            PJ_LOG(3, (THIS_FILE,
+                       "[VOICE] A waiting prompt still playing; waiting %dms before treatment: %s",
+                       remaining_ms, reason ? reason : "unknown"));
+            cc_sleep_ms(remaining_ms);
+        }
         PJ_LOG(3, (THIS_FILE,
                    "[VOICE] Stop A waiting prompt before treatment: %s",
                    reason ? reason : "unknown"));
@@ -221,7 +239,7 @@ void leg_a_on_media_state(pjsua_call_id call_id, cc_session_t *session)
         int keep_player = 0;
 
         PJ_LOG(3, (THIS_FILE, "[VOICE] Start A waiting prompt: %s", waiting_path));
-        pid = cc_start_wav(call_id, waiting_path, PJ_TRUE);
+        pid = cc_start_wav(call_id, waiting_path, PJ_FALSE);
 
         CC_SESSION_LOCK(session);
         if (pid != PJSUA_INVALID_ID &&
@@ -237,8 +255,14 @@ void leg_a_on_media_state(pjsua_call_id call_id, cc_session_t *session)
         CC_SESSION_UNLOCK(session);
 
         if (keep_player) {
+            int wait_ms = cc_player_duration_ms(pid);
             PJ_LOG(3, (THIS_FILE,
-                       "[A] Waiting WAV started (loop) player=%d", pid));
+                       "[A] Waiting WAV started (one-shot) player=%d duration=%dms",
+                       pid, wait_ms));
+            CC_SESSION_LOCK(session);
+            session->a_prompt_done = 0;
+            session->a_prompt_duration_ms = wait_ms;
+            CC_SESSION_UNLOCK(session);
         } else if (pid != PJSUA_INVALID_ID) {
             PJ_LOG(3, (THIS_FILE,
                        "[VOICE] A waiting prompt became stale, destroying player=%d",
@@ -436,11 +460,8 @@ static void *wav_then_hangup_thread(void *arg)
                    a->wav_path));
         pjsua_player_id pid = cc_start_wav(call_a, a->wav_path, PJ_FALSE);
         int wait_ms = cc_player_duration_ms(pid);
-        int free_cap = cc_cfg_free_period_ms();
-        if (wait_ms > free_cap)
-            wait_ms = free_cap;
         PJ_LOG(3, (THIS_FILE,
-                   "[VOICE] prompt duration wait=%dms (cap=%dms)", wait_ms, free_cap));
+                   "[VOICE] prompt duration wait=%dms", wait_ms));
         cc_sleep_ms(wait_ms);
         cc_stop_wav(pid, PJSUA_INVALID_ID);
 
@@ -624,7 +645,7 @@ static void *mca_wait_thread(void *arg)
     PJ_LOG(3, (THIS_FILE,
                "[VOICE] Play A prompt (loop) for MCA wait: %s",
                prompt_path));
-    pjsua_player_id pid = cc_start_wav(call_a, prompt_path, PJ_TRUE);
+    pjsua_player_id pid = cc_start_wav(call_a, prompt_path, PJ_FALSE);
 
     CC_SESSION_LOCK(s);
     if (pid != PJSUA_INVALID_ID &&

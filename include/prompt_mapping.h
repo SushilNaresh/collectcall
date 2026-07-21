@@ -12,6 +12,9 @@ typedef enum {
     CC_PROMPT_MCA_SENT,
     CC_PROMPT_MCA_NOT_SENT,
     CC_PROMPT_FUNDLESS,
+    CC_PROMPT_DIAL_TONE,
+    CC_PROMPT_MOH,
+    CC_PROMPT_B_CONNECTED,
     CC_PROMPT_COUNT
 } cc_prompt_tag_t;
 
