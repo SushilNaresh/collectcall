@@ -267,7 +267,18 @@ void leg_b_on_media_state(pjsua_call_id call_id, cc_session_t *session)
     (void)sdp;
     (void)ep;
     
-   cc_log_call_rtp_info(call_id, "B"); 
+   cc_log_call_rtp_info(call_id, "B");
+
+    /* Isolate both legs from the master mix to prevent audio cross-leak */
+    {
+        pjsua_call_id call_a;
+        CC_SESSION_LOCK(session);
+        call_a = session->call_a;
+        CC_SESSION_UNLOCK(session);
+        cc_isolate_call_from_master(call_id);   /* B */
+        if (call_a != PJSUA_INVALID_ID)
+            cc_isolate_call_from_master(call_a); /* A */
+    }
 
     /* Record B answer timestamp (toll-free period start) */
     CC_SESSION_LOCK(session);
@@ -294,11 +305,17 @@ void leg_b_on_media_state(pjsua_call_id call_id, cc_session_t *session)
         return;
     }
 
-    /* Whitelisted: skip collect prompt, auto-accept immediately */
+    /* Whitelisted: skip collect prompt, auto-accept on CONFIRMED only */
     if (session->whitelisted) {
         CC_SESSION_UNLOCK(session);
+        if (ci.state != PJSIP_INV_STATE_CONFIRMED) {
+            PJ_LOG(3, (THIS_FILE,
+                       "[WHITELIST] B-leg media active but not CONFIRMED (state=%d); deferring accept",
+                       ci.state));
+            return;
+        }
         PJ_LOG(3, (THIS_FILE,
-                   "[WHITELIST] B-leg media active; skipping collect prompt, auto-accept (whitelisted=%d)",
+                   "[WHITELIST] B-leg CONFIRMED; skipping collect prompt, auto-accept (whitelisted=%d)",
                    session->whitelisted));
         on_accept(call_id, session);
         return;
@@ -306,6 +323,38 @@ void leg_b_on_media_state(pjsua_call_id call_id, cc_session_t *session)
 
     session->b_prompt_starting = 1;
     CC_SESSION_UNLOCK(session);
+
+    /* Wait for B's remote RTP endpoint to become valid before playing.
+     * PJSUA marks media ACTIVE before the far-end RTP path is live;
+     * audio sent during this window is lost, causing the prompt start
+     * to be clipped. Poll up to 3 s in 100 ms slices. */
+    {
+        cc_rtp_ep_t rtp_ep;
+        int rtp_wait_ms = 0;
+        int aborted = 0;
+        while (rtp_wait_ms < 3000) {
+            if (cc_get_call_remote_rtp(call_id, &rtp_ep) == PJ_SUCCESS &&
+                rtp_ep.port != 0)
+                break;
+            cc_sleep_ms(100);
+            rtp_wait_ms += 100;
+            CC_SESSION_LOCK(session);
+            aborted = session->accepted || session->torn_down ||
+                      session->call_b != call_id;
+            CC_SESSION_UNLOCK(session);
+            if (aborted)
+                break;
+        }
+        if (aborted) {
+            CC_SESSION_LOCK(session);
+            session->b_prompt_starting = 0;
+            CC_SESSION_UNLOCK(session);
+            return;
+        }
+        PJ_LOG(3, (THIS_FILE,
+                   "[B] RTP ready after %dms (remote=%s:%d)",
+                   rtp_wait_ms, rtp_ep.ip, rtp_ep.port));
+    }
 
     collect_prompt_path = cc_prompt_get_path(CC_PROMPT_COLLECT_PROMPT);
     PJ_LOG(3, (THIS_FILE,

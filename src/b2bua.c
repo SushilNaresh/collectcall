@@ -138,6 +138,16 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
         pjsua_call_answer(call_id, PJSIP_SC_SERVICE_UNAVAILABLE, NULL, NULL);
         return;
     }
+
+    /* Log active call count and compile-time limit for diagnostics */
+    {
+        unsigned active = pjsua_call_get_count();
+        PJ_LOG(3, (THIS_FILE,
+                   "[CALL-SLOTS] incoming call_id=%d active_calls=%u "
+                   "pjsua_max_calls=%d",
+                   call_id, active, PJSUA_MAX_CALLS));
+    }
+
     PJ_LOG(3, (THIS_FILE, "Incoming call: from=%.*s to=%.*s",
                (int)ci.remote_info.slen, ci.remote_info.ptr,
                (int)ci.local_info.slen,  ci.local_info.ptr));
@@ -633,6 +643,8 @@ pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
                 leg_a_play_prompt_then_hangup(session, prompt_tag, sip_code);
             }
 
+            cc_session_maybe_finalize(session);
+            cc_session_release_reason(session, "b-origination-ineligible");
             return PJSUA_INVALID_ID;
         }
 
@@ -961,12 +973,24 @@ void *cc_originate_b_thread(void *arg_ptr)
         }
     }
 
-    /* Start MOH on A-leg while B is ringing — all callers */
+    /* Start MOH on A-leg while B is ringing — all callers.
+     * Clear player_a first: 1.1.wav finished naturally (one-shot) so
+     * session->player_a still holds its id but the player is done. */
     {
         pjsua_call_id call_a;
+        pjsua_player_id old_player;
         CC_SESSION_LOCK(session);
         call_a = session->call_a;
+        old_player = session->player_a;
+        session->player_a = PJSUA_INVALID_ID;
         CC_SESSION_UNLOCK(session);
+
+        if (old_player != PJSUA_INVALID_ID) {
+            PJ_LOG(3, (THIS_FILE,
+                       "[VOICE] Clearing finished 1.1.wav player=%d before MOH",
+                       old_player));
+            cc_stop_wav(old_player, PJSUA_INVALID_ID);
+        }
 
         if (call_a != PJSUA_INVALID_ID) {
             const char *moh_path = cc_prompt_get_path(CC_PROMPT_MOH);
@@ -995,6 +1019,9 @@ void *cc_originate_b_thread(void *arg_ptr)
     }
 
     PJ_LOG(3, (THIS_FILE, "Originating B leg to %s", b_uri));
+    PJ_LOG(3, (THIS_FILE,
+               "[CALL-SLOTS] before B-leg originate active_calls=%u pjsua_max_calls=%d",
+               pjsua_call_get_count(), PJSUA_MAX_CALLS));
 
     pjsua_call_setting_default(&cs);
 	

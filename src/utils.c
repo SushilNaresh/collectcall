@@ -1068,6 +1068,27 @@ void cc_stop_wav(pjsua_player_id player_id, pjsua_call_id call_id)
     }
 }
 
+void cc_isolate_call_from_master(pjsua_call_id call_id)
+{
+    pjsua_call_info ci;
+    pjsua_conf_port_id call_slot;
+
+    if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS ||
+        ci.media_cnt == 0 ||
+        ci.media[0].status != PJSUA_CALL_MEDIA_ACTIVE)
+        return;
+
+    call_slot = ci.media[0].stream.aud.conf_slot;
+
+    /* Disconnect master (slot 0) -> call and call -> master (slot 0) */
+    pjsua_conf_disconnect(0, call_slot);
+    pjsua_conf_disconnect(call_slot, 0);
+
+    PJ_LOG(4, (THIS_FILE,
+               "[BRIDGE] call %d (slot %d) isolated from master",
+               call_id, call_slot));
+}
+
 pj_status_t cc_bridge_calls(pjsua_call_id call_a, pjsua_call_id call_b)
 {
     pjsua_call_info ci_a, ci_b;

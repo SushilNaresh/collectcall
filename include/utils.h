@@ -180,6 +180,12 @@ pjsua_player_id cc_start_wav(pjsua_call_id call_id,
 void cc_stop_wav(pjsua_player_id player_id, pjsua_call_id call_id);
 
 /**
+ * Disconnect a call's conf slot from the master mix (slot 0) in both
+ * directions, preventing audio leaking between unrelated calls.
+ */
+void cc_isolate_call_from_master(pjsua_call_id call_id);
+
+/**
  * Bridge two calls — connect their conference ports bidirectionally.
  */
 pj_status_t cc_bridge_calls(pjsua_call_id call_a, pjsua_call_id call_b);

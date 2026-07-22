@@ -163,6 +163,9 @@ int main(void)
 
     cc_app_logger_install_pj_writer();
     PJ_LOG(3, (THIS_FILE,
+               "[CONFIG] PJSUA_MAX_CALLS compile_limit=%d ua_cfg.max_calls=%d",
+               PJSUA_MAX_CALLS, ua_cfg.max_calls));
+    PJ_LOG(3, (THIS_FILE,
                "[CONFIG] SIP local=%s:%d sbc_next_hop=%s",
                local_host,
                local_sip_port,
