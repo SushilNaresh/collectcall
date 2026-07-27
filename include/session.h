@@ -68,8 +68,10 @@ typedef struct cc_session {
     char                icid[128];     /* P-Charging-Vector icid-value */
     time_t              call_start_ts;
     long long           a_confirmed_ms;  /* monotonic ms when A-leg CONFIRMED */
+    long long           b_confirmed_ms;  /* monotonic ms when B-leg CONFIRMED */
     int                 free_period_ms;  /* snapshot of CC_FREE_PERIOD_MS at session start */
     time_t              b_answer_ts;     /* wall clock when B-leg answered (CONFIRMED) */
+    time_t              b_prompt_start_ts; /* wall clock when 1.2.wav started playing to B */
     time_t              call_connected_ts;
     time_t              call_end_ts;
     int                 end_reported;  /* 1 after final [CALL-END] log */
@@ -101,6 +103,9 @@ typedef struct cc_session {
     int                 update_b_pending; /* rewrite B UPDATE SDP with A RTP */
     int                 reinvite_a_pending; /* rewrite A re-INVITE SDP with B RTP */
     int                 reinvite_b_pending; /* rewrite B re-INVITE SDP with A RTP */
+    int                 update_a_acked;  /* A-leg UPDATE 200 OK received      */
+    int                 update_b_acked;  /* B-leg UPDATE 200 OK received      */
+    int                 media_bypassed;  /* conf slots silenced after bypass  */
 
     cc_sip_hdr_t        fwd_hdrs[CC_MAX_FWD_HDRS];
     int                 fwd_hdr_count;

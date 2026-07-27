@@ -88,14 +88,13 @@
 #define CC_COPY_P_HEADERS_IN_UPDATE  0
 
 /* Media change mode after B accepts with DTMF 1.
- * 0 = use existing SIP UPDATE flow
+ * 0 = use SIP UPDATE flow (production default — exits RTP path)
  * 1 = use SIP re-INVITE flow
  */
-#define CC_MEDIA_CHANGE_USE_REINVITE 1
+#define CC_MEDIA_CHANGE_USE_REINVITE 0
 
-/* RTP bypass experiment only.
- * Keep disabled by default because local VM/MicroSIP testing still needs VM media path for audio.
- * Set to 1 only when testing whether direct RTP works in real network/server setup.
+/* Unbridge local PJSUA conference after sending re-INVITE.
+ * Only relevant when CC_MEDIA_CHANGE_USE_REINVITE=1.
  */
 #define CC_REINVITE_UNBRIDGE_AFTER_SEND 0
 
@@ -109,10 +108,7 @@
 
 
 
-/* Bypass test mode:
- * 0 = keep the local PJSUA conference bridge
- * 1 = send UPDATEs without starting the local bridge
- */
+/* Bypass test mode — unused, kept for reference only */
 #define CC_BYPASS_TEST_MODE 0
 
 

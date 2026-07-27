@@ -195,6 +195,7 @@ pj_status_t cc_bridge_calls(pjsua_call_id call_a, pjsua_call_id call_b);
  * Unbridge two calls — disconnect their conference ports bidirectionally.
  */
 pj_status_t cc_unbridge_calls(pjsua_call_id call_a, pjsua_call_id call_b);
+void        cc_silence_call(pjsua_call_id call_id);
 
 
 /* ── Misc ───────────────────────────────────────────────────────────────── */
