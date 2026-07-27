@@ -1222,6 +1222,41 @@ pj_status_t cc_unbridge_calls(pjsua_call_id call_a, pjsua_call_id call_b)
     return PJ_SUCCESS;
 }
 
+/*
+ * Disconnect a call's conf slot from every other port (including master).
+ * Called after UPDATE/re-INVITE bypass so B2BUA stops transmitting RTP.
+ */
+void cc_silence_call(pjsua_call_id call_id)
+{
+    pjsua_call_info ci;
+    pjsua_conf_port_id slot;
+    pjsua_conf_port_info pi;
+    unsigned i;
+
+    if (call_id == PJSUA_INVALID_ID)
+        return;
+    if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS ||
+        ci.media_cnt == 0 ||
+        ci.media[0].status != PJSUA_CALL_MEDIA_ACTIVE)
+        return;
+
+    slot = ci.media[0].stream.aud.conf_slot;
+
+    if (pjsua_conf_get_port_info(slot, &pi) != PJ_SUCCESS)
+        return;
+
+    /* Disconnect this slot from all its listeners (outbound connections) */
+    for (i = 0; i < pi.listener_cnt; i++)
+        pjsua_conf_disconnect(slot, pi.listeners[i]);
+
+    /* Disconnect master (slot 0) -> this slot (inbound from soundcard/master) */
+    pjsua_conf_disconnect(0, slot);
+
+    PJ_LOG(3, (THIS_FILE,
+               "[BYPASS] call %d (slot %d) silenced — B2BUA exited RTP path",
+               call_id, slot));
+}
+
 
 /* ── Misc ─────────────────────────────────────────────────────────────────── */
 
@@ -1253,7 +1288,15 @@ static void cc_session_finish_end(cc_session_t *session,
 
     CC_SESSION_LOCK(session);
 
+    PJ_LOG(2, (THIS_FILE,
+               "[CALL-END-ENTER] callId=%s end_reported=%d",
+               session->call_id,
+               session->end_reported));
+
     if (session->end_reported) {
+        PJ_LOG(2, (THIS_FILE,
+                   "[CALL-END-SKIP] callId=%s already reported — duplicate mark_end ignored",
+                   session->call_id));
         CC_SESSION_UNLOCK(session);
         return;
     }
@@ -1269,10 +1312,18 @@ static void cc_session_finish_end(cc_session_t *session,
                      sizeof(session->final_reason),
                      reason);
 
-    if (session->b_answer_ts > 0 &&
-        session->call_end_ts >= session->b_answer_ts)
+    /* call_connected_ts is set by run_accept_transition (accept path only).
+     * For calls that end without accept (ELIGIBILITY_TIMEOUT, NO_ANSWER, etc.)
+     * it is never set. Use b_prompt_start_ts as the same baseline — consistent
+     * with how connected calls measure duration (from when B heard the prompt). */
+    if (session->call_connected_ts == 0 && session->b_prompt_start_ts > 0)
+        session->call_connected_ts = session->b_prompt_start_ts;
+
+    /* Use call_connected_ts (billing start) as the duration baseline. */
+    if (session->call_connected_ts > 0 &&
+        session->call_end_ts >= session->call_connected_ts)
     {
-        duration = (long)(session->call_end_ts - session->b_answer_ts);
+        duration = (long)(session->call_end_ts - session->call_connected_ts);
     } else {
         duration = 0;
     }

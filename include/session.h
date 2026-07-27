@@ -103,6 +103,8 @@ typedef struct cc_session {
     int                 update_b_pending; /* rewrite B UPDATE SDP with A RTP */
     int                 reinvite_a_pending; /* rewrite A re-INVITE SDP with B RTP */
     int                 reinvite_b_pending; /* rewrite B re-INVITE SDP with A RTP */
+    int                 update_a_sent;   /* A-leg UPDATE pjsua_call_update() succeeded */
+    int                 update_b_sent;   /* B-leg UPDATE pjsua_call_update() succeeded */
     int                 update_a_acked;  /* A-leg UPDATE 200 OK received      */
     int                 update_b_acked;  /* B-leg UPDATE 200 OK received      */
     int                 media_bypassed;  /* conf slots silenced after bypass  */

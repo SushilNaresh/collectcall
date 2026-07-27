@@ -432,6 +432,9 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
      * B-leg must start only after A-leg reaches CONFIRMED state.
      */
     pjsua_call_setting_default(&cs);
+    cs.aud_cnt = 1;
+    cs.vid_cnt = 0;
+    cs.txt_cnt = 0;
 
     status = pjsua_call_answer2(call_id, &cs,
                                  PJSIP_SC_OK, NULL, NULL);
@@ -1024,11 +1027,15 @@ void *cc_originate_b_thread(void *arg_ptr)
                pjsua_call_get_count(), PJSUA_MAX_CALLS));
 
     pjsua_call_setting_default(&cs);
-	
-	/* B-leg is audio only; disable video/text m= sections. */
-	cs.aud_cnt = 1;
-	cs.vid_cnt = 0;
-	cs.txt_cnt = 0; 
+
+    /* B-leg is audio only; disable video/text m= sections. */
+    cs.aud_cnt = 1;
+    cs.vid_cnt = 0;
+    cs.txt_cnt = 0;
+    /* Disable session timer on B-leg: prevents reinv_timer_cb from firing
+     * during EARLY state (while PRACK transaction holds the dialog lock),
+     * which causes the "Timed-out trying to acquire dialog mutex" warning. */
+
 
 
 
@@ -1390,6 +1397,44 @@ void cc_on_call_media_state(pjsua_call_id call_id)
     else if (leg == 2)
         leg_b_on_media_state(call_id, session);
 
+    /*
+     * UPDATE bypass post-processing: once both UPDATE 200 OKs have been
+     * processed by PJSUA (triggering on_call_media_state on each leg),
+     * silence both conf slots so B2BUA stops transmitting RTP.
+     * This is the industry-standard approach: the B2BUA exits the media
+     * path by disconnecting its conf ports after the UPDATEs complete.
+     */
+    if (cc_cfg_media_mode() == CC_MEDIA_MODE_UPDATE) {
+        pjsua_call_id call_a, call_b;
+        int do_silence = 0;
+
+        CC_SESSION_LOCK(session);
+        call_a = session->call_a;
+        call_b = session->call_b;
+        if (!session->media_bypassed &&
+            !session->torn_down &&
+            session->accepted)
+        {
+            if (call_id == call_a && session->update_a_sent)
+                session->update_a_acked = 1;
+            else if (call_id == call_b && session->update_b_sent)
+                session->update_b_acked = 1;
+
+            if (session->update_a_acked && session->update_b_acked) {
+                session->media_bypassed = 1;
+                do_silence = 1;
+            }
+        }
+        CC_SESSION_UNLOCK(session);
+
+        if (do_silence) {
+            PJ_LOG(3, (THIS_FILE,
+                       "[BYPASS] both UPDATE 200 OKs received — silencing B2BUA conf slots"));
+            cc_silence_call(call_a);
+            cc_silence_call(call_b);
+        }
+    }
+
     cc_session_release_reason(session, "callback-media-state");
 }
 
@@ -1470,6 +1515,12 @@ static void cc_rewrite_sdp_audio_endpoint(pj_pool_t *pool,
         /* Disable non-audio media like m=text in UPDATE SDP */
         if (pj_strcmp2(&m->desc.media, "audio") != 0) {
             m->desc.port = 0;
+            /* Clear connection line on rejected section to avoid
+             * confusing SBCs that inspect c= even when port=0 */
+            if (m->conn) {
+                m->conn->addr = pj_strdup3(pool, "0.0.0.0");
+            }
+            m->attr_count = 0;
             continue;
         }
 

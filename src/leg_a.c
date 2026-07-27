@@ -49,8 +49,7 @@ static int cc_player_duration_ms(pjsua_player_id pid)
     duration_ms = (int)((long long)data_len * 1000 /
                         (info->fmt.det.aud.clock_rate * bytes_per_sample));
 
-    /* Add small buffer for safety */
-    return duration_ms > 0 ? duration_ms + 500 : 4000;
+    return duration_ms > 0 ? duration_ms : 4000;
 }
 
 static void stop_a_waiting_prompt_before_treatment(cc_session_t *session,
@@ -319,6 +318,40 @@ void leg_a_send_update_bypass(pjsua_call_id call_id, cc_session_t *session)
             return;
         }
 
+        /* B-leg must be CONFIRMED before we redirect A's RTP to it */
+        {
+            pjsua_call_info ci_b;
+            if (pjsua_call_get_info(call_b, &ci_b) != PJ_SUCCESS ||
+                ci_b.state != PJSIP_INV_STATE_CONFIRMED) {
+                PJ_LOG(1, (THIS_FILE,
+                           "[A] UPDATE skipped: B-leg not CONFIRMED (call_b=%d)",
+                           call_b));
+                return;
+            }
+        }
+
+        /* Wait up to 500ms for B's post-CONFIRMED RTP to arrive so
+         * cc_get_call_remote_rtp returns src_rtp_name (actual packets)
+         * rather than the 183 early-media SDP address. */
+        {
+            int rtp_wait_ms = 0;
+            while (rtp_wait_ms < 500) {
+                int torn;
+                if (cc_get_call_remote_rtp(call_b, &rtp_b) == PJ_SUCCESS &&
+                    rtp_b.port != 0)
+                    break;
+                cc_sleep_ms(50);
+                rtp_wait_ms += 50;
+                CC_SESSION_LOCK(session);
+                torn = session->torn_down || session->call_b != call_b;
+                CC_SESSION_UNLOCK(session);
+                if (torn) return;
+            }
+            PJ_LOG(3, (THIS_FILE,
+                       "[A] B RTP endpoint after %dms wait: %s:%d",
+                       rtp_wait_ms, rtp_b.ip, rtp_b.port));
+        }
+
 	if (cc_get_call_remote_rtp(call_a, &rtp_a) == PJ_SUCCESS &&
 	    cc_get_call_remote_rtp(call_b, &rtp_b) == PJ_SUCCESS)
 	{
@@ -345,12 +378,29 @@ void leg_a_send_update_bypass(pjsua_call_id call_id, cc_session_t *session)
 
     PJ_LOG(3, (THIS_FILE, "[A] Sending basic SIP UPDATE"));
 
-    status = pjsua_call_update(call_id, 0, &msg_data);
+    /* Retry up to 2s if dialog has a pending transaction (e.g. INVITE retransmit) */
+    {
+        int retry_ms = 0;
+        do {
+            status = pjsua_call_update(call_id, 0, &msg_data);
+            if (status == PJ_SUCCESS || retry_ms >= 2000)
+                break;
+            cc_sleep_ms(100);
+            retry_ms += 100;
+        } while (1);
+    }
 
-    if (status == PJ_SUCCESS)
+    if (status == PJ_SUCCESS) {
+        CC_SESSION_LOCK(session);
+        session->update_a_sent = 1;
+        CC_SESSION_UNLOCK(session);
         PJ_LOG(3, (THIS_FILE, "[A] SIP UPDATE sent"));
-    else
+    } else {
+        CC_SESSION_LOCK(session);
+        session->update_a_pending = 0;
+        CC_SESSION_UNLOCK(session);
         PJ_LOG(1, (THIS_FILE, "[A] SIP UPDATE failed: %d", status));
+    }
 }
 
 /* ── Play WAV then hangup (runs in thread) ───────────────────────────────── */
@@ -593,8 +643,6 @@ void leg_a_play_prompt_then_hangup(cc_session_t *session,
 
 /* ── MCA flow: play UNAVAILABLE, wait for A DTMF 1, then MCA API ─────────── */
 
-#define CC_MCA_DTMF_TIMEOUT_SEC 10
-
 typedef struct {
     cc_session_t   *session;
     pjsua_call_id   expected_call_a;
@@ -657,7 +705,7 @@ static void *mca_wait_thread(void *arg)
     CC_SESSION_UNLOCK(s);
 
     /* Wait for DTMF 1 with timeout */
-    int remaining_ms = CC_MCA_DTMF_TIMEOUT_SEC * 1000;
+    int remaining_ms = cc_cfg_b_dtmf_timeout_sec() * 1000;
     int decided = 0;
 
     while (remaining_ms > 0) {
@@ -673,7 +721,7 @@ static void *mca_wait_thread(void *arg)
             break;
 
         if (!cc_session_call_is_current(s, call_a, 1)) {
-            decided = -1;
+            decided = -1;  /* A disconnected during MCA wait */
             break;
         }
     }
@@ -735,15 +783,17 @@ static void *mca_wait_thread(void *arg)
             if (cc_session_call_is_current(s, call_a, 1))
                 cc_safe_hangup(call_a, PJSIP_SC_OK);
         }
-    } else {
-        /* Timeout or A disconnected — hangup with NoMCA */
-        if (decided == 0) {
-            PJ_LOG(3, (THIS_FILE, "[MCA] DTMF timeout — no MCA"));
-            cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_NoMCA");
-        }
-
+    } else if (decided == 0) {
+        /* DTMF timeout — no MCA */
+        PJ_LOG(3, (THIS_FILE, "[MCA] DTMF timeout — no MCA"));
+        cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_NoMCA");
         if (cc_session_call_is_current(s, call_a, 1))
             cc_safe_hangup(call_a, PJSIP_SC_TEMPORARILY_UNAVAILABLE);
+    } else {
+        /* decided == -1: A disconnected during MCA wait */
+        PJ_LOG(2, (THIS_FILE, "[MCA] A disconnected during wait — no MCA"));
+        cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_NoMCA");
+        PJ_LOG(2, (THIS_FILE, "[MCA] mark_end complete"));
     }
 
     CC_SESSION_LOCK(s);

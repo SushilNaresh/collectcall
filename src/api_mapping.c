@@ -238,7 +238,6 @@ void cc_send_end_call_udp(cc_session_t *session)
     char payload[2048];
     time_t start_ts;
     time_t connected_ts;
-    time_t b_answer_ts;
     time_t end_ts;
     long duration;
     int payload_len;
@@ -266,8 +265,7 @@ void cc_send_end_call_udp(cc_session_t *session)
     snprintf(caller_msisdn, sizeof(caller_msisdn), "%s", session->caller_msisdn);
     snprintf(sponsor_msisdn, sizeof(sponsor_msisdn), "%s", session->sponsor_msisdn_normalized);
     start_ts = session->call_start_ts;
-    b_answer_ts = session->b_answer_ts;
-    connected_ts = b_answer_ts;   /* MTN: duration from B answer (toll-free + charged) */
+    connected_ts = session->call_connected_ts;  /* billing start = when B accepted (DTMF 1) */
     end_ts = session->call_end_ts;
 
     CC_SESSION_UNLOCK(session);
@@ -320,8 +318,8 @@ void cc_send_end_call_udp(cc_session_t *session)
     }
 
     connected_date[0] = '\0';
-    if (b_answer_ts > 0)
-        cc_format_nigeria_time(b_answer_ts, connected_date, sizeof(connected_date));
+    if (connected_ts > 0)
+        cc_format_nigeria_time(connected_ts, connected_date, sizeof(connected_date));
 
     PJ_LOG(3, (THIS_FILE,
                "[API-TIME] startDate=%s connectedDate=%s endDate=%s",
@@ -399,25 +397,36 @@ void cc_send_end_call_udp(cc_session_t *session)
         return;
     }
 
-    sent = sendto(sockfd,
-                  payload,
-                  (size_t)payload_len,
-                  0,
-                  (struct sockaddr *)&server_addr,
-                  sizeof(server_addr));
-    if (sent < 0) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[END-UDP] send failed: %s",
-                   strerror(errno)));
-    } else if (sent != payload_len) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[END-UDP] send failed: partial datagram bytes=%ld expected=%d",
-                   (long)sent,
-                   payload_len));
-    } else {
-        PJ_LOG(3, (THIS_FILE,
-                   "[END-UDP] sent ok bytes=%ld",
-                   (long)sent));
+    {
+        int attempt;
+        int max_attempts = 3;
+        for (attempt = 1; attempt <= max_attempts; attempt++) {
+            sent = sendto(sockfd,
+                          payload,
+                          (size_t)payload_len,
+                          0,
+                          (struct sockaddr *)&server_addr,
+                          sizeof(server_addr));
+            if (sent == payload_len) {
+                PJ_LOG(3, (THIS_FILE,
+                           "[END-UDP] sent ok bytes=%ld attempt=%d",
+                           (long)sent, attempt));
+                break;
+            }
+            if (sent < 0) {
+                PJ_LOG(1, (THIS_FILE,
+                           "[END-UDP] send failed attempt=%d: %s",
+                           attempt, strerror(errno)));
+            } else {
+                PJ_LOG(1, (THIS_FILE,
+                           "[END-UDP] send failed attempt=%d: partial bytes=%ld expected=%d",
+                           attempt, (long)sent, payload_len));
+            }
+            if (attempt < max_attempts) {
+                struct timespec retry_sleep = {0, 200000000L}; /* 200ms */
+                nanosleep(&retry_sleep, NULL);
+            }
+        }
     }
 
     close(sockfd);

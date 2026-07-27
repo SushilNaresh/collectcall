@@ -193,6 +193,62 @@ static int extract_json_string_or_number(const char *json,
     return extract_json_number(json, key, value, value_len);
 }
 
+/*
+ * Extract the first element of a JSON array value, as a string.
+ * Handles both string and numeric first elements.
+ * e.g. "serviceKeys":[3]        -> "3"
+ *      "serviceKeys":["8024",2] -> "8024"
+ */
+static int extract_json_array_first(const char *json,
+                                    const char *key,
+                                    char *value,
+                                    size_t value_len)
+{
+    char pattern[128];
+    const char *p;
+    size_t used = 0;
+
+    if (!json || !key || !value || value_len == 0)
+        return 0;
+
+    value[0] = '\0';
+    if (snprintf(pattern, sizeof(pattern), "\"%s\"", key) >= (int)sizeof(pattern))
+        return 0;
+
+    p = strstr(json, pattern);
+    if (!p)
+        return 0;
+
+    p += strlen(pattern);
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p++ != ':') return 0;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p++ != '[') return 0;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+
+    if (*p == '"') {
+        /* quoted string element */
+        p++;
+        while (*p && *p != '"') {
+            if (used + 1 >= value_len) return 0;
+            value[used++] = *p++;
+        }
+        if (*p != '"') return 0;
+    } else {
+        /* numeric element — copy digits as-is to preserve leading zeros */
+        while (*p >= '0' && *p <= '9') {
+            if (used + 1 >= value_len) return 0;
+            value[used++] = *p++;
+        }
+    }
+
+    if (used == 0)
+        return 0;
+
+    value[used] = '\0';
+    return 1;
+}
+
 static int extract_legacy_status(const char *response, int *status)
 {
     const char *p = strstr(response, "\"status\"");
@@ -430,10 +486,18 @@ int cc_udp_validate_call(const char *caller_msisdn,
                "[INITIATE-UDP] response: %s",
                response));
 
-    extract_json_string_or_number(response,
-                                  "serviceKey",
+    /* Extract serviceKey: try "serviceKeys" array (plural) first,
+     * then "serviceKey" string/number (singular) for backward compat. */
+    if (!extract_json_array_first(response,
+                                  "serviceKeys",
                                   result->service_key,
-                                  sizeof(result->service_key));
+                                  sizeof(result->service_key)))
+    {
+        extract_json_string_or_number(response,
+                                      "serviceKey",
+                                      result->service_key,
+                                      sizeof(result->service_key));
+    }
 
     if (extract_json_string(response,
                             "status",
@@ -453,7 +517,8 @@ int cc_udp_validate_call(const char *caller_msisdn,
             return result->status;
         }
 
-        if (strcmp(api_status, "INELIGIBLE") == 0) {
+        if (strcmp(api_status, "INELIGIBLE") == 0 ||
+            strcmp(api_status, "FAILED") == 0) {
             if (!extract_json_string(response,
                                      "statusCode",
                                      status_code,

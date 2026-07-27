@@ -45,7 +45,7 @@ static int cc_player_duration_ms(pjsua_player_id pid)
         return 4000;
     duration_ms = (int)((long long)data_len * 1000 /
                         (info->fmt.det.aud.clock_rate * bytes_per_sample));
-    return duration_ms > 0 ? duration_ms + 500 : 4000;
+    return duration_ms > 0 ? duration_ms : 4000;
 }
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
@@ -98,8 +98,20 @@ void leg_b_on_call_state(pjsua_call_id call_id, cc_session_t *session)
                (int)ci.last_status_text.slen, ci.last_status_text.ptr));
 
     if (ci.state == PJSIP_INV_STATE_CONFIRMED) {
-        /* Attempt early collect prompt start at CONFIRMED, before media active.
-         * The guard in leg_b_on_media_state prevents double-start. */
+        /* Stamp B-confirmed monotonic time — free-period baseline starts here */
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            CC_SESSION_LOCK(session);
+            if (session->b_confirmed_ms == 0)
+                session->b_confirmed_ms = (long long)ts.tv_sec * 1000 +
+                                          ts.tv_nsec / 1000000;
+            CC_SESSION_UNLOCK(session);
+        }
+        /* Trigger collect prompt start now that B has answered.
+         * If the media-state thread is already polling for CONFIRMED
+         * it will unblock naturally; this call handles the case where
+         * media was already active before CONFIRMED fired. */
         PJ_LOG(3, (THIS_FILE, "[B] CONFIRMED — attempting early collect prompt start"));
         leg_b_on_media_state(call_id, session);
     }
@@ -218,9 +230,13 @@ void *cc_b_prompt_done_thread(void *opaque)
 
         int done;
         CC_SESSION_LOCK(s);
-        done = s->accepted || s->torn_down || s->final_cleanup_started;
+        done = s->torn_down || s->final_cleanup_started;
         CC_SESSION_UNLOCK(s);
         if (done) {
+            /* torn down — still signal b_collect_done so on_accept spin-wait unblocks */
+            CC_SESSION_LOCK(s);
+            s->b_collect_done = 1;
+            CC_SESSION_UNLOCK(s);
             cc_session_maybe_finalize(s);
             cc_session_release_reason(s, "b-prompt-done");
             return NULL;
@@ -231,11 +247,145 @@ void *cc_b_prompt_done_thread(void *opaque)
     s->b_collect_done = 1;
     CC_SESSION_UNLOCK(s);
 
-    PJ_LOG(3, (THIS_FILE, "[B] Collect prompt finished; starting DTMF timer"));
-    leg_b_start_dtmf_timer(s);
+    PJ_LOG(3, (THIS_FILE, "[B] Collect prompt finished"));
 
     cc_session_maybe_finalize(s);
     cc_session_release_reason(s, "b-prompt-done");
+    return NULL;
+}
+
+/* Thread: wait for CONFIRMED, then RTP ready, then start collect prompt */
+static void *cc_b_prompt_start_thread(void *opaque)
+{
+    typedef struct { cc_session_t *s; pjsua_call_id cid; } bps_arg_t;
+    bps_arg_t    *arg     = (bps_arg_t *)opaque;
+    cc_session_t *session = arg->s;
+    pjsua_call_id call_id = arg->cid;
+    pjsua_player_id pid;
+    int keep_player = 0;
+    const char *collect_prompt_path;
+    pj_thread_desc desc;
+    pj_thread_t   *th = NULL;
+
+    pj_bzero(desc, sizeof(desc));
+    pj_thread_register("cc_bps", desc, &th);
+    free(arg);
+
+    /* Poll until CONFIRMED (max 30s) */
+    {
+        int wait_ms = 0, aborted = 0;
+        while (wait_ms < 30000) {
+            pjsua_call_info ci2;
+            if (pjsua_call_get_info(call_id, &ci2) == PJ_SUCCESS &&
+                ci2.state == PJSIP_INV_STATE_CONFIRMED)
+                break;
+            cc_sleep_ms(100);
+            wait_ms += 100;
+            CC_SESSION_LOCK(session);
+            aborted = session->accepted || session->torn_down ||
+                      session->call_b != call_id;
+            CC_SESSION_UNLOCK(session);
+            if (aborted) break;
+        }
+        CC_SESSION_LOCK(session);
+        aborted = aborted || session->accepted || session->torn_down ||
+                  session->call_b != call_id;
+        CC_SESSION_UNLOCK(session);
+        if (aborted) goto done_clear;
+        PJ_LOG(3, (THIS_FILE, "[B] CONFIRMED — starting collect prompt after %dms", wait_ms));
+    }
+
+    /* Poll until B's remote RTP endpoint is valid (max 3s) */
+    {
+        cc_rtp_ep_t rtp_ep;
+        int rtp_wait_ms = 0, aborted = 0;
+        while (rtp_wait_ms < 3000) {
+            if (cc_get_call_remote_rtp(call_id, &rtp_ep) == PJ_SUCCESS &&
+                rtp_ep.port != 0)
+                break;
+            cc_sleep_ms(100);
+            rtp_wait_ms += 100;
+            CC_SESSION_LOCK(session);
+            aborted = session->accepted || session->torn_down ||
+                      session->call_b != call_id;
+            CC_SESSION_UNLOCK(session);
+            if (aborted) break;
+        }
+        if (aborted) goto done_clear;
+        PJ_LOG(3, (THIS_FILE, "[B] RTP ready after %dms (remote=%s:%d)",
+                   rtp_wait_ms, rtp_ep.ip, rtp_ep.port));
+    }
+
+    collect_prompt_path = cc_prompt_get_path(CC_PROMPT_COLLECT_PROMPT);
+    PJ_LOG(3, (THIS_FILE, "[VOICE] Start B collect prompt: %s", collect_prompt_path));
+
+    CC_SESSION_LOCK(session);
+    if (session->b_prompt_start_ts == 0)
+        session->b_prompt_start_ts = time(NULL);
+    CC_SESSION_UNLOCK(session);
+
+    pid = cc_start_wav(call_id, collect_prompt_path, PJ_FALSE);
+
+    CC_SESSION_LOCK(session);
+    if (pid != PJSUA_INVALID_ID &&
+        !session->accepted && !session->torn_down &&
+        session->call_b == call_id &&
+        session->player_b == PJSUA_INVALID_ID)
+    {
+        session->player_b = pid;
+        keep_player = 1;
+    }
+    session->b_prompt_starting = 0;
+    CC_SESSION_UNLOCK(session);
+
+    if (keep_player) {
+        int prompt_ms = cc_player_duration_ms(pid);
+        PJ_LOG(3, (THIS_FILE, "[B] Collect prompt started (one-shot) player=%d duration=%dms",
+                   pid, prompt_ms));
+        CC_SESSION_LOCK(session);
+        session->b_collect_done = 0;
+        CC_SESSION_UNLOCK(session);
+        /* Spawn thread to signal b_collect_done when prompt finishes.
+         * DTMF timer starts in parallel — B can press 1/2 at any time,
+         * but accept transition waits for b_collect_done before bridging. */
+        typedef struct { cc_session_t *s; int ms; } bpd_arg_t;
+        bpd_arg_t *bpd = malloc(sizeof(*bpd));
+        if (bpd && cc_session_acquire_reason(session, "b-prompt-done")) {
+            bpd->s  = session;
+            bpd->ms = prompt_ms;
+            pthread_t bpd_t;
+            if (pthread_create(&bpd_t, NULL, cc_b_prompt_done_thread, bpd) == 0) {
+                pthread_detach(bpd_t);
+            } else {
+                free(bpd);
+                cc_session_release_reason(session, "b-prompt-done");
+                /* fallback: mark done immediately so accept is not blocked */
+                CC_SESSION_LOCK(session);
+                session->b_collect_done = 1;
+                CC_SESSION_UNLOCK(session);
+            }
+        } else {
+            free(bpd);
+            CC_SESSION_LOCK(session);
+            session->b_collect_done = 1;
+            CC_SESSION_UNLOCK(session);
+        }
+        leg_b_start_dtmf_timer(session);
+    } else if (pid != PJSUA_INVALID_ID) {
+        PJ_LOG(3, (THIS_FILE, "[VOICE] B collect prompt became stale, destroying player=%d", pid));
+        cc_stop_wav(pid, PJSUA_INVALID_ID);
+    }
+
+    cc_session_maybe_finalize(session);
+    cc_session_release_reason(session, "b-prompt-start");
+    return NULL;
+
+done_clear:
+    CC_SESSION_LOCK(session);
+    session->b_prompt_starting = 0;
+    CC_SESSION_UNLOCK(session);
+    cc_session_maybe_finalize(session);
+    cc_session_release_reason(session, "b-prompt-start");
     return NULL;
 }
 
@@ -246,9 +396,6 @@ void leg_b_on_media_state(pjsua_call_id call_id, cc_session_t *session)
     pjsua_call_info       ci;
     pjmedia_sdp_session  *sdp = NULL;
     cc_rtp_ep_t           ep;
-    const char           *collect_prompt_path;
-    pjsua_player_id       pid;
-    int                   keep_player = 0;
 
     if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS) {
         PJ_LOG(1, (THIS_FILE,
@@ -317,6 +464,16 @@ void leg_b_on_media_state(pjsua_call_id call_id, cc_session_t *session)
         PJ_LOG(3, (THIS_FILE,
                    "[WHITELIST] B-leg CONFIRMED; skipping collect prompt, auto-accept (whitelisted=%d)",
                    session->whitelisted));
+        /* Stamp b_prompt_start_ts at CONFIRMED — used as call_connected_ts
+         * baseline in run_accept_transition (no prompt thread runs for
+         * whitelisted calls so it would otherwise remain 0). */
+        CC_SESSION_LOCK(session);
+        if (session->b_prompt_start_ts == 0)
+            session->b_prompt_start_ts = time(NULL);
+        /* No collect prompt plays for whitelisted calls — mark done immediately
+         * so the on_accept spin-wait does not block. */
+        session->b_collect_done = 1;
+        CC_SESSION_UNLOCK(session);
         on_accept(call_id, session);
         return;
     }
@@ -324,92 +481,29 @@ void leg_b_on_media_state(pjsua_call_id call_id, cc_session_t *session)
     session->b_prompt_starting = 1;
     CC_SESSION_UNLOCK(session);
 
-    /* Wait for B's remote RTP endpoint to become valid before playing.
-     * PJSUA marks media ACTIVE before the far-end RTP path is live;
-     * audio sent during this window is lost, causing the prompt start
-     * to be clipped. Poll up to 3 s in 100 ms slices. */
-    {
-        cc_rtp_ep_t rtp_ep;
-        int rtp_wait_ms = 0;
-        int aborted = 0;
-        while (rtp_wait_ms < 3000) {
-            if (cc_get_call_remote_rtp(call_id, &rtp_ep) == PJ_SUCCESS &&
-                rtp_ep.port != 0)
-                break;
-            cc_sleep_ms(100);
-            rtp_wait_ms += 100;
-            CC_SESSION_LOCK(session);
-            aborted = session->accepted || session->torn_down ||
-                      session->call_b != call_id;
-            CC_SESSION_UNLOCK(session);
-            if (aborted)
-                break;
+    /* Spawn a thread to do the CONFIRMED poll + RTP poll + WAV start.
+     * Must not block the PJSUA callback thread — doing so holds the
+     * PJSIP worker while PRACK/200 transactions are pending, which
+     * causes reinv_timer_cb to time out acquiring the dialog lock. */
+    if (cc_session_acquire_reason(session, "b-prompt-start")) {
+        typedef struct { cc_session_t *s; pjsua_call_id cid; } bps_arg_t;
+        bps_arg_t *arg = malloc(sizeof(*arg));
+        if (arg) {
+            arg->s   = session;
+            arg->cid = call_id;
+            pthread_t t;
+            if (pthread_create(&t, NULL, cc_b_prompt_start_thread, arg) == 0) {
+                pthread_detach(t);
+                return;
+            }
+            free(arg);
         }
-        if (aborted) {
-            CC_SESSION_LOCK(session);
-            session->b_prompt_starting = 0;
-            CC_SESSION_UNLOCK(session);
-            return;
-        }
-        PJ_LOG(3, (THIS_FILE,
-                   "[B] RTP ready after %dms (remote=%s:%d)",
-                   rtp_wait_ms, rtp_ep.ip, rtp_ep.port));
+        cc_session_release_reason(session, "b-prompt-start");
     }
-
-    collect_prompt_path = cc_prompt_get_path(CC_PROMPT_COLLECT_PROMPT);
-    PJ_LOG(3, (THIS_FILE,
-               "[VOICE] Start B collect prompt: %s",
-               collect_prompt_path));
-    pid = cc_start_wav(call_id, collect_prompt_path, PJ_FALSE);
-
+    /* fallback: clear flag so a future media-state callback can retry */
     CC_SESSION_LOCK(session);
-    if (pid != PJSUA_INVALID_ID &&
-        !session->accepted &&
-        !session->torn_down &&
-        session->call_b == call_id &&
-        session->player_b == PJSUA_INVALID_ID)
-    {
-        session->player_b = pid;
-        keep_player = 1;
-    }
     session->b_prompt_starting = 0;
     CC_SESSION_UNLOCK(session);
-
-    if (keep_player) {
-        int prompt_ms = cc_player_duration_ms(pid);
-        PJ_LOG(3, (THIS_FILE,
-                   "[B] Collect prompt started (one-shot) player=%d duration=%dms",
-                   pid, prompt_ms));
-        /* Start DTMF timer only after collect prompt finishes playing */
-        CC_SESSION_LOCK(session);
-        session->b_collect_done = 0;
-        CC_SESSION_UNLOCK(session);
-        {
-            /* Inline wait in a detached thread so we don't block the callback */
-            typedef struct { cc_session_t *s; int ms; } bpd_arg_t;
-            bpd_arg_t *bpd = malloc(sizeof(*bpd));
-            if (bpd && cc_session_acquire_reason(session, "b-prompt-done")) {
-                bpd->s  = session;
-                bpd->ms = prompt_ms;
-                pthread_t bpd_t;
-                if (pthread_create(&bpd_t, NULL, cc_b_prompt_done_thread, bpd) == 0)
-                    pthread_detach(bpd_t);
-                else {
-                    free(bpd);
-                    cc_session_release_reason(session, "b-prompt-done");
-                    leg_b_start_dtmf_timer(session);
-                }
-            } else {
-                free(bpd);
-                leg_b_start_dtmf_timer(session); /* fallback */
-            }
-        }
-    } else if (pid != PJSUA_INVALID_ID) {
-        PJ_LOG(3, (THIS_FILE,
-                   "[VOICE] B collect prompt became stale, destroying player=%d",
-                   pid));
-        cc_stop_wav(pid, PJSUA_INVALID_ID);
-    }
 }
 
 /* ── DTMF callback ───────────────────────────────────────────────────────── */
@@ -456,6 +550,39 @@ void leg_b_send_update_bypass(pjsua_call_id call_id, cc_session_t *session)
             return;
         }
 
+        /* B-leg must be CONFIRMED before we redirect B's RTP to A */
+        {
+            pjsua_call_info ci_b;
+            if (pjsua_call_get_info(call_b, &ci_b) != PJ_SUCCESS ||
+                ci_b.state != PJSIP_INV_STATE_CONFIRMED) {
+                PJ_LOG(1, (THIS_FILE,
+                           "[B] UPDATE skipped: B-leg not CONFIRMED (call_b=%d)",
+                           call_b));
+                return;
+            }
+        }
+
+        /* Wait up to 500ms for A's post-CONFIRMED RTP src_rtp_name */
+        {
+            int rtp_wait_ms = 0;
+            cc_rtp_ep_t rtp_a_check;
+            while (rtp_wait_ms < 500) {
+                int torn;
+                if (cc_get_call_remote_rtp(call_a, &rtp_a_check) == PJ_SUCCESS &&
+                    rtp_a_check.port != 0)
+                    break;
+                cc_sleep_ms(50);
+                rtp_wait_ms += 50;
+                CC_SESSION_LOCK(session);
+                torn = session->torn_down || session->call_a != call_a;
+                CC_SESSION_UNLOCK(session);
+                if (torn) return;
+            }
+            PJ_LOG(3, (THIS_FILE,
+                       "[B] A RTP endpoint after %dms wait: %s:%d",
+                       rtp_wait_ms, rtp_a_check.ip, rtp_a_check.port));
+        }
+
 	if (cc_get_call_remote_rtp(call_a, &rtp_a) == PJ_SUCCESS &&
 	    cc_get_call_remote_rtp(call_b, &rtp_b) == PJ_SUCCESS)
 	{
@@ -485,10 +612,17 @@ void leg_b_send_update_bypass(pjsua_call_id call_id, cc_session_t *session)
 
     status = pjsua_call_update(call_id, 0, &msg_data);
 
-    if (status == PJ_SUCCESS)
+    if (status == PJ_SUCCESS) {
+        CC_SESSION_LOCK(session);
+        session->update_b_sent = 1;
+        CC_SESSION_UNLOCK(session);
         PJ_LOG(3, (THIS_FILE, "[B] SIP UPDATE sent"));
-    else
+    } else {
+        CC_SESSION_LOCK(session);
+        session->update_b_pending = 0;
+        CC_SESSION_UNLOCK(session);
         PJ_LOG(1, (THIS_FILE, "[B] SIP UPDATE failed: %d", status));
+    }
 }
 
 /* ── Accept / Reject FSM ─────────────────────────────────────────────────── */
@@ -601,8 +735,10 @@ static void run_accept_transition(cc_session_t *session,
              * Whitelisted flow:
              * 1. Play 4.1.wav to B (one-shot, full duration)
              * 2. A keeps hearing 4.wav (player_a) or silence if already done
-             * 3. After 4.1.wav finishes, stop 4.wav on A, then bridge
-             * Free-period delay is not used for whitelisted calls.
+             * 3. After 4.1.wav finishes, honour any remaining free-period
+             *    delay before bridging — call must not connect before the
+             *    toll-free period expires regardless of whitelist status.
+             * 4. Stop 4.wav on A, then bridge.
              */
             pjsua_player_id b_conn_pid = PJSUA_INVALID_ID;
             const char *b_conn_path = cc_prompt_get_path(CC_PROMPT_B_CONNECTED);
@@ -619,7 +755,36 @@ static void run_accept_transition(cc_session_t *session,
             if (b_conn_pid != PJSUA_INVALID_ID)
                 cc_stop_wav(b_conn_pid, PJSUA_INVALID_ID);
 
-            /* Stop 4.wav on A now that 4.1.wav has finished on B */
+            /* Honour remaining free-period after 4.1.wav finishes — recompute
+             * from wall clock so prompt-wait time is not double-counted. */
+            {
+                int fp_remaining = 0;
+                long long b_confirmed_ms;
+                int free_period;
+                CC_SESSION_LOCK(session);
+                b_confirmed_ms = session->b_confirmed_ms;
+                free_period    = session->free_period_ms > 0
+                                 ? session->free_period_ms
+                                 : cc_cfg_free_period_ms();
+                CC_SESSION_UNLOCK(session);
+                if (b_confirmed_ms > 0) {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    long long now_ms = (long long)ts.tv_sec * 1000 +
+                                       ts.tv_nsec / 1000000;
+                    long long elapsed = now_ms - b_confirmed_ms;
+                    long long rem = (long long)free_period - elapsed;
+                    fp_remaining = rem > 0 ? (int)rem : 0;
+                }
+                if (fp_remaining > 0) {
+                    PJ_LOG(3, (THIS_FILE,
+                               "[FREE-PERIOD] whitelist: waiting remaining %dms after 4.1.wav",
+                               fp_remaining));
+                    cc_sleep_ms(fp_remaining);
+                }
+            }
+
+            /* Stop 4.wav on A now that free period is satisfied */
             CC_SESSION_LOCK(session);
             if (session->player_a != PJSUA_INVALID_ID) {
                 player_a = session->player_a;
@@ -646,29 +811,59 @@ static void run_accept_transition(cc_session_t *session,
             }
 
             if (delay_ms > 0) {
-                pjsua_player_id tone_a = PJSUA_INVALID_ID;
-                pjsua_player_id tone_b = PJSUA_INVALID_ID;
-                const char *dial_tone_path = cc_prompt_get_path(CC_PROMPT_DIAL_TONE);
-                PJ_LOG(3, (THIS_FILE,
-                           "[FREE-PERIOD] waiting %dms before bridge/charging; playing dial tone",
-                           delay_ms));
-                if (cc_session_call_is_current(session, call_a, 1))
-                    tone_a = cc_start_wav(call_a, dial_tone_path, PJ_TRUE);
-                if (cc_session_call_is_current(session, call_b, 0))
-                    tone_b = cc_start_wav(call_b, dial_tone_path, PJ_TRUE);
-                cc_sleep_ms(delay_ms);
-                if (tone_a != PJSUA_INVALID_ID)
-                    cc_stop_wav(tone_a, PJSUA_INVALID_ID);
-                if (tone_b != PJSUA_INVALID_ID)
-                    cc_stop_wav(tone_b, PJSUA_INVALID_ID);
+                /* Recompute remaining free period now — prompt-wait consumed some of it */
+                int actual_delay = 0;
+                {
+                    long long b_confirmed_ms;
+                    int free_period;
+                    CC_SESSION_LOCK(session);
+                    b_confirmed_ms = session->b_confirmed_ms;
+                    free_period    = session->free_period_ms > 0
+                                     ? session->free_period_ms
+                                     : cc_cfg_free_period_ms();
+                    CC_SESSION_UNLOCK(session);
+                    if (b_confirmed_ms > 0) {
+                        struct timespec ts;
+                        clock_gettime(CLOCK_MONOTONIC, &ts);
+                        long long now_ms = (long long)ts.tv_sec * 1000 +
+                                           ts.tv_nsec / 1000000;
+                        long long elapsed = now_ms - b_confirmed_ms;
+                        long long remaining = (long long)free_period - elapsed;
+                        actual_delay = remaining > 0 ? (int)remaining : 0;
+                    }
+                }
+                if (actual_delay > 0) {
+                    pjsua_player_id tone_a = PJSUA_INVALID_ID;
+                    pjsua_player_id tone_b = PJSUA_INVALID_ID;
+                    const char *dial_tone_path = cc_prompt_get_path(CC_PROMPT_DIAL_TONE);
+                    PJ_LOG(3, (THIS_FILE,
+                               "[FREE-PERIOD] waiting %dms before bridge/charging; playing dial tone",
+                               actual_delay));
+                    if (cc_session_call_is_current(session, call_a, 1))
+                        tone_a = cc_start_wav(call_a, dial_tone_path, PJ_TRUE);
+                    if (cc_session_call_is_current(session, call_b, 0))
+                        tone_b = cc_start_wav(call_b, dial_tone_path, PJ_TRUE);
+                    cc_sleep_ms(actual_delay);
+                    if (tone_a != PJSUA_INVALID_ID)
+                        cc_stop_wav(tone_a, PJSUA_INVALID_ID);
+                    if (tone_b != PJSUA_INVALID_ID)
+                        cc_stop_wav(tone_b, PJSUA_INVALID_ID);
+                } else {
+                    PJ_LOG(3, (THIS_FILE,
+                               "[FREE-PERIOD] already elapsed during prompt wait; bridging immediately"));
+                }
             }
         }
     }
 
-    /* Set billing start AFTER free period delay */
+    /* Set call_connected_ts to when B started hearing the collect prompt
+     * (non-whitelisted) or when B answered (whitelisted, no prompt plays).
+     * This is independent of the free-period bridge delay. */
     CC_SESSION_LOCK(session);
     if (session->call_connected_ts == 0)
-        session->call_connected_ts = time(NULL);
+        session->call_connected_ts = session->b_prompt_start_ts > 0
+                                     ? session->b_prompt_start_ts
+                                     : time(NULL);
     CC_SESSION_UNLOCK(session);
 
     CC_SESSION_LOCK(session);
@@ -707,45 +902,33 @@ static void run_accept_transition(cc_session_t *session,
         cc_stop_wav(player_a, PJSUA_INVALID_ID);
     }
 
-    /* 4. Bridge A <-> B in PJSUA conference bridge 
-    cc_bridge_calls(call_a, call_b);
-    */
-    
-    
-    
-    #if CC_BYPASS_TEST_MODE
-    PJ_LOG(3, (THIS_FILE,
-               "[B] BYPASS TEST MODE: not bridging calls in PJSUA conference"));
-    #else
-        cc_bridge_calls(call_a, call_b);
-    #endif
-    
-    
-    
-
-    /* 5. Optional media-change signalling after B accepts. */
+    /* 4. Media-change signalling: bridge locally or exit RTP path via SIP. */
     {
         cc_media_mode_t media_mode = cc_cfg_media_mode();
 
         if (media_mode == CC_MEDIA_MODE_LOCAL_BRIDGE) {
+            /* Stay in RTP path — bridge A<->B in PJSUA conference. */
             PJ_LOG(3, (THIS_FILE,
-                       "[MEDIA-MODE] local_bridge selected; keeping local PJSUA media bridge active"));
+                       "[MEDIA-MODE] local_bridge: bridging A<->B in PJSUA conference"));
+            cc_bridge_calls(call_a, call_b);
         } else if (media_mode == CC_MEDIA_MODE_REINVITE) {
+            /* Bridge locally first so audio is uninterrupted during re-INVITE
+             * negotiation, then unbridge once both 200 OKs arrive. */
             PJ_LOG(3, (THIS_FILE,
-                       "[MEDIA-MODE] Using SIP re-INVITE for media change"));
+                       "[MEDIA-MODE] reinvite: bridging locally then sending re-INVITEs"));
+            cc_bridge_calls(call_a, call_b);
             leg_a_send_reinvite_bypass(session);
             leg_b_send_reinvite_bypass(session);
 #if CC_REINVITE_UNBRIDGE_AFTER_SEND
             PJ_LOG(3, (THIS_FILE,
-                       "[MEDIA-MODE] CC_REINVITE_UNBRIDGE_AFTER_SEND enabled; unbridging local A-B media after re-INVITE send"));
+                       "[MEDIA-MODE] unbridging after re-INVITE send"));
             cc_unbridge_calls(call_a, call_b);
-#else
-            PJ_LOG(3, (THIS_FILE,
-                       "[MEDIA-MODE] Re-INVITE sent; local media bridge left active for stable local audio/testing"));
 #endif
         } else {
+            /* UPDATE mode: send SIP UPDATEs to redirect RTP directly A<->B.
+             * Do NOT bridge locally — the B2BUA must exit the RTP path. */
             PJ_LOG(3, (THIS_FILE,
-                       "[MEDIA-MODE] Using SIP UPDATE for media change"));
+                       "[MEDIA-MODE] update: sending SIP UPDATEs to exit RTP path"));
             leg_a_send_update_bypass(call_a, session);
             leg_b_send_update_bypass(call_b, session);
         }
@@ -779,6 +962,70 @@ static void *accept_transition_thread(void *opaque)
         cc_session_maybe_finalize(session);
         cc_session_release_reason(session, "accept-transition-register-failed");
         return NULL;
+    }
+
+    /*
+     * Wait for collect prompt to finish OR free period to expire,
+     * whichever comes first.
+     *
+     * - Prompt finishes first (prompt < free period): b_collect_done fires,
+     *   we exit and the remaining free period is slept in run_accept_transition.
+     * - Free period expires first (prompt > free period): we stop the prompt
+     *   ourselves, set b_collect_done, and proceed to bridge immediately.
+     */
+    {
+        long long b_confirmed_ms;
+        int free_period;
+        CC_SESSION_LOCK(session);
+        b_confirmed_ms = session->b_confirmed_ms;
+        free_period    = session->free_period_ms > 0
+                         ? session->free_period_ms
+                         : cc_cfg_free_period_ms();
+        CC_SESSION_UNLOCK(session);
+
+        int waited_ms = 0;
+        for (;;) {
+            int done;
+            CC_SESSION_LOCK(session);
+            done = session->b_collect_done || session->torn_down;
+            CC_SESSION_UNLOCK(session);
+            if (done) break;
+
+            /* Check if free period has expired — stop prompt early if so */
+            if (b_confirmed_ms > 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                long long now_ms = (long long)ts.tv_sec * 1000 +
+                                   ts.tv_nsec / 1000000;
+                if ((now_ms - b_confirmed_ms) >= free_period) {
+                    pjsua_player_id player_b = PJSUA_INVALID_ID;
+                    CC_SESSION_LOCK(session);
+                    if (session->player_b != PJSUA_INVALID_ID) {
+                        player_b = session->player_b;
+                        session->player_b = PJSUA_INVALID_ID;
+                    }
+                    session->b_collect_done = 1;
+                    CC_SESSION_UNLOCK(session);
+                    if (player_b != PJSUA_INVALID_ID) {
+                        PJ_LOG(3, (THIS_FILE,
+                                   "[FREE-PERIOD] prompt cut at free period expiry; stopping player"));
+                        cc_stop_wav(player_b, PJSUA_INVALID_ID);
+                    }
+                    break;
+                }
+            }
+
+            cc_sleep_ms(50);
+            waited_ms += 50;
+            if (waited_ms % 1000 == 0)
+                PJ_LOG(3, (THIS_FILE,
+                           "[B] waiting for collect prompt to finish before bridge (%dms)",
+                           waited_ms));
+        }
+        if (waited_ms > 0)
+            PJ_LOG(3, (THIS_FILE,
+                       "[B] collect prompt finished after %dms wait; proceeding to bridge",
+                       waited_ms));
     }
 
     run_accept_transition(session, arg->call_a, arg->call_b, delay_ms);
@@ -872,11 +1119,11 @@ static void on_accept(pjsua_call_id call_b, cc_session_t *session)
      * expires, defer call_connected_ts and bridge until it does.
      * A keeps hearing the waiting prompt during this delay.
      */
-    if (session->a_confirmed_ms > 0) {
+    if (session->b_confirmed_ms > 0) {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-        long long elapsed = now_ms - session->a_confirmed_ms;
+        long long elapsed = now_ms - session->b_confirmed_ms;
         int free_period = cc_cfg_free_period_ms();
         if (elapsed < free_period)
             free_delay_ms = (int)(free_period - elapsed);
@@ -1150,5 +1397,7 @@ void leg_b_start_ring_timer(cc_session_t *session)
 
 void leg_b_start_dtmf_timer(cc_session_t *session)
 {
-    spawn_timer(session, cc_cfg_b_dtmf_timeout_sec(), 0);
+    /* DTMF window = free period: B must press 1 within the same window
+     * during which the call is free. After this, ELIGIBILITY_TIMEOUT fires. */
+    spawn_timer(session, cc_cfg_free_period_ms() / 1000, 0);
 }
