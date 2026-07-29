@@ -131,6 +131,17 @@ void leg_b_on_call_state(pjsua_call_id call_id, cc_session_t *session)
             session->player_b = PJSUA_INVALID_ID;
         }
         session->b_prompt_starting = 0;
+        session->b_on_hold = 0;
+        {
+            pjsua_player_id hold_pid = session->hold_player_a;
+            session->hold_player_a = PJSUA_INVALID_ID;
+            if (hold_pid != PJSUA_INVALID_ID) {
+                CC_SESSION_UNLOCK(session);
+                PJ_LOG(3, (THIS_FILE, "[VOICE] Stop A hold MOH on B disconnect"));
+                cc_stop_wav(hold_pid, PJSUA_INVALID_ID);
+                CC_SESSION_LOCK(session);
+            }
+        }
 
         already_accepted  = session->accepted;
         already_torn_down = session->torn_down;
@@ -562,11 +573,40 @@ void leg_b_send_update_bypass(pjsua_call_id call_id, cc_session_t *session)
             }
         }
 
-        /* Wait up to 500ms for A's post-CONFIRMED RTP src_rtp_name */
+        /* Wait up to 5s for both:
+         *   1. SBC re-INVITE on B-leg to complete (b_reinvite_active == 0)
+         *   2. B's src_rtp_name valid (RTP packets from post-re-INVITE MGW)
+         *
+         * These must be checked simultaneously: b_reinvite_active clears at
+         * CONFIRMED but RTP from the new MGW IP may not have arrived yet.
+         * Checking them in sequence risks arming with the stale 183 endpoint
+         * if RTP restarts before the flag clears or vice versa. */
+        {
+            int wait_ms = 0;
+            for (; wait_ms < 5000; wait_ms += 50) {
+                int ri_active, torn;
+                CC_SESSION_LOCK(session);
+                ri_active = session->b_reinvite_active;
+                torn = session->torn_down || session->call_b != call_b;
+                CC_SESSION_UNLOCK(session);
+                if (torn) return;
+                if (!ri_active &&
+                    cc_get_call_remote_rtp(call_b, &rtp_b) == PJ_SUCCESS &&
+                    rtp_b.port != 0)
+                    break;
+                cc_sleep_ms(50);
+            }
+            PJ_LOG(3, (THIS_FILE,
+                       "[B] B RTP endpoint after %dms wait: %s:%d",
+                       wait_ms, rtp_b.ip, rtp_b.port));
+        }
+
+        /* Wait up to 1s for A's src_rtp_name — A has been confirmed since
+         * call start so this is typically 0ms. */
         {
             int rtp_wait_ms = 0;
             cc_rtp_ep_t rtp_a_check;
-            while (rtp_wait_ms < 500) {
+            while (rtp_wait_ms < 1000) {
                 int torn;
                 if (cc_get_call_remote_rtp(call_a, &rtp_a_check) == PJ_SUCCESS &&
                     rtp_a_check.port != 0)

@@ -188,8 +188,7 @@ int main(void)
                cc_cfg_validation_port(),
                CC_VALIDATION_TIMEOUT_MS));
     PJ_LOG(3, (THIS_FILE,
-               "[CONFIG] initiate_source=%s service_key_mode=%s",
-               CC_INITIATE_SOURCE,
+               "[CONFIG] initiate_source=PREFIX_INITIATED|LOW_BALANCE(fundless) service_key_mode=%s",
                cc_cfg_service_key_mode_name()));
     PJ_LOG(3, (THIS_FILE,
                "[CONFIG] end_udp_enable=%d target=%s:%d",

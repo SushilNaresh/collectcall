@@ -68,6 +68,8 @@ cc_session_t *cc_session_create(pj_pool_factory *pf)
     s->fwd_hdr_count = 0;
     s->player_a      = PJSUA_INVALID_ID;
     s->player_b      = PJSUA_INVALID_ID;
+    s->hold_player_a = PJSUA_INVALID_ID;
+    s->hold_player_b = PJSUA_INVALID_ID;
 
     memset(&s->rtp_a, 0, sizeof(s->rtp_a));
     memset(&s->rtp_b, 0, sizeof(s->rtp_b));

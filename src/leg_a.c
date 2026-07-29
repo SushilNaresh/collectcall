@@ -147,6 +147,17 @@ pjsua_call_id leg_a_on_call_state(pjsua_call_id call_id,
             session->player_a = PJSUA_INVALID_ID;
         }
         session->a_prompt_starting = 0;
+        session->a_on_hold = 0;
+        {
+            pjsua_player_id hold_pid = session->hold_player_b;
+            session->hold_player_b = PJSUA_INVALID_ID;
+            if (hold_pid != PJSUA_INVALID_ID) {
+                CC_SESSION_UNLOCK(session);
+                PJ_LOG(3, (THIS_FILE, "[VOICE] Stop B hold MOH on A disconnect"));
+                cc_stop_wav(hold_pid, PJSUA_INVALID_ID);
+                CC_SESSION_LOCK(session);
+            }
+        }
         already_accepted = session->accepted;
         b = session->call_b;
 
@@ -330,26 +341,36 @@ void leg_a_send_update_bypass(pjsua_call_id call_id, cc_session_t *session)
             }
         }
 
-        /* Wait up to 500ms for B's post-CONFIRMED RTP to arrive so
-         * cc_get_call_remote_rtp returns src_rtp_name (actual packets)
-         * rather than the 183 early-media SDP address. */
+        /* Wait up to 5s for both:
+         *   1. SBC re-INVITE on B-leg to complete (b_reinvite_active == 0)
+         *   2. B's src_rtp_name to be valid (actual RTP packets received)
+         *
+         * Trace analysis showed the SBC sends a re-INVITE after 200 OK
+         * (late-offer pattern) which moves B's media to a NEW MGW IP.
+         * The 183 early-media endpoint and the post-re-INVITE endpoint are
+         * on different MGW IPs (e.g. .92 vs .91). Polling src_rtp_name
+         * alone is insufficient — it may return the stale 183 address if
+         * polled before the re-INVITE sendrecv completes and RTP restarts
+         * from the new MGW. Both conditions must be true simultaneously. */
         {
-            int rtp_wait_ms = 0;
-            while (rtp_wait_ms < 500) {
-                int torn;
-                if (cc_get_call_remote_rtp(call_b, &rtp_b) == PJ_SUCCESS &&
-                    rtp_b.port != 0)
-                    break;
-                cc_sleep_ms(50);
-                rtp_wait_ms += 50;
+            int wait_ms = 0;
+            int torn = 0;
+            for (; wait_ms < 5000; wait_ms += 50) {
+                int ri_active;
                 CC_SESSION_LOCK(session);
+                ri_active = session->b_reinvite_active;
                 torn = session->torn_down || session->call_b != call_b;
                 CC_SESSION_UNLOCK(session);
                 if (torn) return;
+                if (!ri_active &&
+                    cc_get_call_remote_rtp(call_b, &rtp_b) == PJ_SUCCESS &&
+                    rtp_b.port != 0)
+                    break;
+                cc_sleep_ms(50);
             }
             PJ_LOG(3, (THIS_FILE,
                        "[A] B RTP endpoint after %dms wait: %s:%d",
-                       rtp_wait_ms, rtp_b.ip, rtp_b.port));
+                       wait_ms, rtp_b.ip, rtp_b.port));
         }
 
 	if (cc_get_call_remote_rtp(call_a, &rtp_a) == PJ_SUCCESS &&

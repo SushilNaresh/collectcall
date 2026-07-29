@@ -532,31 +532,22 @@ pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
                    "[API-TIME] timestamp=%s",
                    time_str));
 
+        const char *initiate_source;
         CC_SESSION_LOCK(session);
         snprintf(call_id, sizeof(call_id), "%s", session->call_id);
-        snprintf(caller_msisdn,
-                 sizeof(caller_msisdn),
-                 "%s",
-                 session->caller_msisdn);
+        snprintf(caller_msisdn, sizeof(caller_msisdn), "%s", session->caller_msisdn);
+        initiate_source = session->fundless ? CC_INITIATE_SOURCE_FUNDLESS
+                                            : CC_INITIATE_SOURCE_NORMAL;
         CC_SESSION_UNLOCK(session);
 
         PJ_LOG(3, (THIS_FILE,
                    "[INITIATE-API] callerMsisdn=%s sponsorMsisdn=%s callId=%s source=%s timestamp=%s",
-                   caller_msisdn,
-                   original_b,
-                   call_id,
-                   CC_INITIATE_SOURCE,
-                   time_str));
-        PJ_LOG(3, (THIS_FILE,
-                   "[API] initiate caller=%s sponsor=%s",
-                   caller_msisdn,
-                   original_b));
+                   caller_msisdn, original_b, call_id, initiate_source, time_str));
+        PJ_LOG(3, (THIS_FILE, "[API] initiate caller=%s sponsor=%s",
+                   caller_msisdn, original_b));
 
-        vstatus = cc_udp_validate_call(caller_msisdn,
-                                       original_b,
-                                       call_id,
-                                       CC_INITIATE_SOURCE,
-                                       time_str,
+        vstatus = cc_udp_validate_call(caller_msisdn, original_b, call_id,
+                                       initiate_source, time_str,
                                        &validation_result);
 
         /*
@@ -587,6 +578,7 @@ pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
             PJ_LOG(2, (THIS_FILE,
                        "UDP validation rejected call: status=%d reason=%s",
                        vstatus, validation_result.reason));
+
 
             CC_SESSION_LOCK(session);
             if (session->torn_down ||
@@ -1369,8 +1361,29 @@ void cc_on_call_state(pjsua_call_id call_id, pjsip_event *e)
     leg = cc_resolve_leg(session, call_id);
     if (leg == 1)
         deferred_hangup = leg_a_on_call_state(call_id, session);
-    else if (leg == 2)
+    else if (leg == 2) {
+        /* Track SBC-initiated re-INVITEs on B-leg (late-offer completion).
+         * Set b_reinvite_active when a new INVITE transaction starts on the
+         * B-leg dialog; clear it when the dialog returns to CONFIRMED.
+         * This blocks UPDATE dispatch while the re-INVITE is in progress. */
+        {
+            pjsua_call_info ci_b;
+            if (pjsua_call_get_info(call_id, &ci_b) == PJ_SUCCESS) {
+                if (ci_b.state == PJSIP_INV_STATE_CONNECTING) {
+                    CC_SESSION_LOCK(session);
+                    session->b_reinvite_active = 1;
+                    CC_SESSION_UNLOCK(session);
+                    PJ_LOG(3, (THIS_FILE,
+                               "[B] re-INVITE in progress (CONNECTING) — UPDATE blocked"));
+                } else if (ci_b.state == PJSIP_INV_STATE_CONFIRMED) {
+                    CC_SESSION_LOCK(session);
+                    session->b_reinvite_active = 0;
+                    CC_SESSION_UNLOCK(session);
+                }
+            }
+        }
         leg_b_on_call_state(call_id, session);
+    }
 
     cc_session_release_reason(session, "callback-call-state");
 
@@ -1380,6 +1393,97 @@ void cc_on_call_state(pjsua_call_id call_id, pjsip_event *e)
                    deferred_hangup));
         cc_safe_hangup(deferred_hangup, PJSIP_SC_FORBIDDEN);
     }
+}
+
+typedef struct {
+    cc_session_t  *session;
+    pjsua_call_id  call_b;
+} update_b_retry_arg_t;
+
+static void *update_b_retry_thread(void *arg_ptr)
+{
+    update_b_retry_arg_t *arg = (update_b_retry_arg_t *)arg_ptr;
+    cc_session_t *session = arg->session;
+    pjsua_call_id call_b = arg->call_b;
+    pj_thread_desc desc;
+    pj_thread_t *this_thread = NULL;
+
+    free(arg);
+
+    pj_bzero(desc, sizeof(desc));
+    if (pj_thread_register("cc_upd_b_retry", desc, &this_thread) != PJ_SUCCESS) {
+        CC_SESSION_LOCK(session);
+        session->update_b_retry_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        cc_session_release_reason(session, "update-b-retry-register-failed");
+        return NULL;
+    }
+
+    /* Wait up to 3s for the SBC's pending transaction to clear, then retry */
+    cc_sleep_ms(3000);
+
+    CC_SESSION_LOCK(session);
+    int skip = session->torn_down ||
+               session->media_bypassed ||
+               session->update_b_acked ||
+               session->call_b != call_b;
+    session->update_b_retry_pending = 0;
+    CC_SESSION_UNLOCK(session);
+
+    if (!skip) {
+        PJ_LOG(3, (THIS_FILE, "[BYPASS] retrying B-leg UPDATE after 491"));
+        leg_b_send_update_bypass(call_b, session);
+    }
+
+    cc_session_maybe_finalize(session);
+    cc_session_release_reason(session, "update-b-retry-complete");
+    return NULL;
+}
+
+static void spawn_update_b_retry(cc_session_t *session, pjsua_call_id call_b)
+{
+    update_b_retry_arg_t *arg;
+    pthread_t t;
+
+    CC_SESSION_LOCK(session);
+    if (session->update_b_retry_pending ||
+        session->media_bypassed ||
+        session->update_b_acked ||
+        session->torn_down)
+    {
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+    session->update_b_retry_pending = 1;
+    CC_SESSION_UNLOCK(session);
+
+    if (!cc_session_acquire_reason(session, "update-b-retry-worker")) {
+        CC_SESSION_LOCK(session);
+        session->update_b_retry_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+
+    arg = malloc(sizeof(*arg));
+    if (!arg) {
+        CC_SESSION_LOCK(session);
+        session->update_b_retry_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        cc_session_release_reason(session, "update-b-retry-alloc-failed");
+        return;
+    }
+    arg->session = session;
+    arg->call_b  = call_b;
+
+    if (pthread_create(&t, NULL, update_b_retry_thread, arg) != 0) {
+        free(arg);
+        CC_SESSION_LOCK(session);
+        session->update_b_retry_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        cc_session_release_reason(session, "update-b-retry-create-failed");
+        return;
+    }
+    pthread_detach(t);
 }
 
 void cc_on_call_media_state(pjsua_call_id call_id)
@@ -1407,6 +1511,10 @@ void cc_on_call_media_state(pjsua_call_id call_id)
     if (cc_cfg_media_mode() == CC_MEDIA_MODE_UPDATE) {
         pjsua_call_id call_a, call_b;
         int do_silence = 0;
+        int do_hold = 0;
+        int do_resume = 0;
+        pjsua_call_id resume_call_a = PJSUA_INVALID_ID;
+        pjsua_call_id resume_call_b = PJSUA_INVALID_ID;
 
         CC_SESSION_LOCK(session);
         call_a = session->call_a;
@@ -1423,6 +1531,70 @@ void cc_on_call_media_state(pjsua_call_id call_id)
             if (session->update_a_acked && session->update_b_acked) {
                 session->media_bypassed = 1;
                 do_silence = 1;
+            } else if (session->update_a_acked &&
+                       session->update_b_sent &&
+                       !session->update_b_acked) {
+                /* A acked but B hasn't — likely a 491 on B-leg.
+                 * Spawn a retry after a short delay. */
+                do_silence = 0;
+            }
+        } else if (session->media_bypassed &&
+                   !session->torn_down &&
+                   session->accepted)
+        {
+            /* Post-bypass: either leg media state changed — hold or resume */
+            if (call_id == call_b) {
+                pjsua_call_info ci_b;
+                if (pjsua_call_get_info(call_b, &ci_b) == PJ_SUCCESS) {
+                    if (ci_b.media[0].status == PJSUA_CALL_MEDIA_LOCAL_HOLD ||
+                        ci_b.media[0].status == PJSUA_CALL_MEDIA_REMOTE_HOLD)
+                    {
+                        if (!session->b_on_hold) {
+                            session->b_on_hold = 1;
+                            do_hold = 1;
+                        }
+                    } else if (ci_b.media[0].status == PJSUA_CALL_MEDIA_ACTIVE) {
+                        if (session->b_on_hold) {
+                            session->b_on_hold = 0;
+                            do_resume = 1;
+                            resume_call_a = call_a;
+                            resume_call_b = call_b;
+                            session->media_bypassed = 0;
+                            session->update_a_sent  = 0;
+                            session->update_b_sent  = 0;
+                            session->update_a_acked = 0;
+                            session->update_b_acked = 0;
+                            session->update_b_retry_pending = 0;
+                            session->b_reinvite_active = 0;
+                        }
+                    }
+                }
+            } else if (call_id == call_a) {
+                pjsua_call_info ci_a;
+                if (pjsua_call_get_info(call_a, &ci_a) == PJ_SUCCESS) {
+                    if (ci_a.media[0].status == PJSUA_CALL_MEDIA_LOCAL_HOLD ||
+                        ci_a.media[0].status == PJSUA_CALL_MEDIA_REMOTE_HOLD)
+                    {
+                        if (!session->a_on_hold) {
+                            session->a_on_hold = 1;
+                            do_hold = 2;
+                        }
+                    } else if (ci_a.media[0].status == PJSUA_CALL_MEDIA_ACTIVE) {
+                        if (session->a_on_hold) {
+                            session->a_on_hold = 0;
+                            do_resume = 2;
+                            resume_call_a = call_a;
+                            resume_call_b = call_b;
+                            session->media_bypassed = 0;
+                            session->update_a_sent  = 0;
+                            session->update_b_sent  = 0;
+                            session->update_a_acked = 0;
+                            session->update_b_acked = 0;
+                            session->update_b_retry_pending = 0;
+                            session->b_reinvite_active = 0;
+                        }
+                    }
+                }
             }
         }
         CC_SESSION_UNLOCK(session);
@@ -1432,6 +1604,224 @@ void cc_on_call_media_state(pjsua_call_id call_id)
                        "[BYPASS] both UPDATE 200 OKs received — silencing B2BUA conf slots"));
             cc_silence_call(call_a);
             cc_silence_call(call_b);
+        }
+
+        /* A acked but B hasn't — 491 on B-leg; retry after delay */
+        {
+            int need_retry = 0;
+            CC_SESSION_LOCK(session);
+            if (!session->media_bypassed &&
+                !session->torn_down &&
+                session->accepted &&
+                session->update_a_acked &&
+                session->update_b_sent &&
+                !session->update_b_acked &&
+                !session->update_b_retry_pending)
+            {
+                need_retry = 1;
+            }
+            CC_SESSION_UNLOCK(session);
+            if (need_retry) {
+                PJ_LOG(3, (THIS_FILE,
+                           "[BYPASS] A UPDATE acked but B UPDATE not acked — spawning 491 retry"));
+                spawn_update_b_retry(session, call_b);
+            }
+        }
+
+        if (do_hold == 1) {
+            /* B put the call on hold — play MOH to A */
+            pjsua_player_id moh_pid = PJSUA_INVALID_ID;
+            PJ_LOG(3, (THIS_FILE, "[HOLD] B on hold — playing MOH to A"));
+            if (cc_session_call_is_current(session, call_a, 1)) {
+                const char *moh_path = cc_prompt_get_path(CC_PROMPT_MOH);
+                moh_pid = cc_start_wav(call_a, moh_path, PJ_TRUE);
+            }
+            CC_SESSION_LOCK(session);
+            if (moh_pid != PJSUA_INVALID_ID &&
+                session->hold_player_a == PJSUA_INVALID_ID &&
+                !session->torn_down)
+            {
+                session->hold_player_a = moh_pid;
+            } else if (moh_pid != PJSUA_INVALID_ID) {
+                CC_SESSION_UNLOCK(session);
+                cc_stop_wav(moh_pid, PJSUA_INVALID_ID);
+                goto hold_done;
+            }
+            CC_SESSION_UNLOCK(session);
+            hold_done:;
+        }
+
+        if (do_hold == 2) {
+            /* A put the call on hold — play MOH to B */
+            pjsua_player_id moh_pid = PJSUA_INVALID_ID;
+            PJ_LOG(3, (THIS_FILE, "[HOLD] A on hold — playing MOH to B"));
+            if (cc_session_call_is_current(session, call_b, 0)) {
+                const char *moh_path = cc_prompt_get_path(CC_PROMPT_MOH);
+                moh_pid = cc_start_wav(call_b, moh_path, PJ_TRUE);
+            }
+            CC_SESSION_LOCK(session);
+            if (moh_pid != PJSUA_INVALID_ID &&
+                session->hold_player_b == PJSUA_INVALID_ID &&
+                !session->torn_down)
+            {
+                session->hold_player_b = moh_pid;
+            } else if (moh_pid != PJSUA_INVALID_ID) {
+                CC_SESSION_UNLOCK(session);
+                cc_stop_wav(moh_pid, PJSUA_INVALID_ID);
+                goto hold_b_done;
+            }
+            CC_SESSION_UNLOCK(session);
+            hold_b_done:;
+        }
+
+        if (do_resume == 1) {
+            /* B resumed — stop MOH on A, re-send UPDATEs to reconnect RTP */
+            pjsua_player_id moh_pid = PJSUA_INVALID_ID;
+            PJ_LOG(3, (THIS_FILE, "[HOLD] B resumed — stopping MOH, re-sending UPDATEs"));
+            CC_SESSION_LOCK(session);
+            if (session->hold_player_a != PJSUA_INVALID_ID) {
+                moh_pid = session->hold_player_a;
+                session->hold_player_a = PJSUA_INVALID_ID;
+            }
+            CC_SESSION_UNLOCK(session);
+            if (moh_pid != PJSUA_INVALID_ID)
+                cc_stop_wav(moh_pid, PJSUA_INVALID_ID);
+            leg_a_send_update_bypass(resume_call_a, session);
+            leg_b_send_update_bypass(resume_call_b, session);
+        }
+
+        if (do_resume == 2) {
+            /* A resumed — stop MOH on B, re-send UPDATEs to reconnect RTP */
+            pjsua_player_id moh_pid = PJSUA_INVALID_ID;
+            PJ_LOG(3, (THIS_FILE, "[HOLD] A resumed — stopping MOH, re-sending UPDATEs"));
+            CC_SESSION_LOCK(session);
+            if (session->hold_player_b != PJSUA_INVALID_ID) {
+                moh_pid = session->hold_player_b;
+                session->hold_player_b = PJSUA_INVALID_ID;
+            }
+            CC_SESSION_UNLOCK(session);
+            if (moh_pid != PJSUA_INVALID_ID)
+                cc_stop_wav(moh_pid, PJSUA_INVALID_ID);
+            leg_a_send_update_bypass(resume_call_a, session);
+            leg_b_send_update_bypass(resume_call_b, session);
+        }
+    }
+
+    if (cc_cfg_media_mode() == CC_MEDIA_MODE_LOCAL_BRIDGE) {
+        pjsua_call_id call_a, call_b;
+        int do_hold = 0;
+        int do_resume = 0;
+
+        CC_SESSION_LOCK(session);
+        call_a = session->call_a;
+        call_b = session->call_b;
+        if (session->accepted && !session->torn_down) {
+            if (call_id == call_b) {
+                pjsua_call_info ci_b;
+                if (pjsua_call_get_info(call_b, &ci_b) == PJ_SUCCESS) {
+                    if (ci_b.media[0].status == PJSUA_CALL_MEDIA_LOCAL_HOLD ||
+                        ci_b.media[0].status == PJSUA_CALL_MEDIA_REMOTE_HOLD)
+                    {
+                        if (!session->b_on_hold) {
+                            session->b_on_hold = 1;
+                            do_hold = 1;
+                        }
+                    } else if (ci_b.media[0].status == PJSUA_CALL_MEDIA_ACTIVE) {
+                        if (session->b_on_hold) {
+                            session->b_on_hold = 0;
+                            do_resume = 1;
+                        }
+                    }
+                }
+            } else if (call_id == call_a) {
+                pjsua_call_info ci_a;
+                if (pjsua_call_get_info(call_a, &ci_a) == PJ_SUCCESS) {
+                    if (ci_a.media[0].status == PJSUA_CALL_MEDIA_LOCAL_HOLD ||
+                        ci_a.media[0].status == PJSUA_CALL_MEDIA_REMOTE_HOLD)
+                    {
+                        if (!session->a_on_hold) {
+                            session->a_on_hold = 1;
+                            do_hold = 2;
+                        }
+                    } else if (ci_a.media[0].status == PJSUA_CALL_MEDIA_ACTIVE) {
+                        if (session->a_on_hold) {
+                            session->a_on_hold = 0;
+                            do_resume = 2;
+                        }
+                    }
+                }
+            }
+        }
+        CC_SESSION_UNLOCK(session);
+
+        if (do_hold == 1) {
+            pjsua_player_id moh_pid = PJSUA_INVALID_ID;
+            PJ_LOG(3, (THIS_FILE, "[HOLD/LB] B on hold — unbridging, playing MOH to A"));
+            cc_unbridge_calls(call_a, call_b);
+            if (cc_session_call_is_current(session, call_a, 1))
+                moh_pid = cc_start_wav(call_a, cc_prompt_get_path(CC_PROMPT_MOH), PJ_TRUE);
+            CC_SESSION_LOCK(session);
+            if (moh_pid != PJSUA_INVALID_ID &&
+                session->hold_player_a == PJSUA_INVALID_ID &&
+                !session->torn_down)
+            {
+                session->hold_player_a = moh_pid;
+            } else if (moh_pid != PJSUA_INVALID_ID) {
+                CC_SESSION_UNLOCK(session);
+                cc_stop_wav(moh_pid, PJSUA_INVALID_ID);
+                goto lb_hold_done;
+            }
+            CC_SESSION_UNLOCK(session);
+            lb_hold_done:;
+        }
+
+        if (do_hold == 2) {
+            pjsua_player_id moh_pid = PJSUA_INVALID_ID;
+            PJ_LOG(3, (THIS_FILE, "[HOLD/LB] A on hold — unbridging, playing MOH to B"));
+            cc_unbridge_calls(call_a, call_b);
+            if (cc_session_call_is_current(session, call_b, 0))
+                moh_pid = cc_start_wav(call_b, cc_prompt_get_path(CC_PROMPT_MOH), PJ_TRUE);
+            CC_SESSION_LOCK(session);
+            if (moh_pid != PJSUA_INVALID_ID &&
+                session->hold_player_b == PJSUA_INVALID_ID &&
+                !session->torn_down)
+            {
+                session->hold_player_b = moh_pid;
+            } else if (moh_pid != PJSUA_INVALID_ID) {
+                CC_SESSION_UNLOCK(session);
+                cc_stop_wav(moh_pid, PJSUA_INVALID_ID);
+                goto lb_hold_b_done;
+            }
+            CC_SESSION_UNLOCK(session);
+            lb_hold_b_done:;
+        }
+
+        if (do_resume == 1) {
+            pjsua_player_id moh_pid = PJSUA_INVALID_ID;
+            PJ_LOG(3, (THIS_FILE, "[HOLD/LB] B resumed — stopping MOH, re-bridging"));
+            CC_SESSION_LOCK(session);
+            if (session->hold_player_a != PJSUA_INVALID_ID) {
+                moh_pid = session->hold_player_a;
+                session->hold_player_a = PJSUA_INVALID_ID;
+            }
+            CC_SESSION_UNLOCK(session);
+            if (moh_pid != PJSUA_INVALID_ID)
+                cc_stop_wav(moh_pid, PJSUA_INVALID_ID);
+            cc_bridge_calls(call_a, call_b);
+        }
+
+        if (do_resume == 2) {
+            pjsua_player_id moh_pid = PJSUA_INVALID_ID;
+            PJ_LOG(3, (THIS_FILE, "[HOLD/LB] A resumed — stopping MOH, re-bridging"));
+            CC_SESSION_LOCK(session);
+            if (session->hold_player_b != PJSUA_INVALID_ID) {
+                moh_pid = session->hold_player_b;
+                session->hold_player_b = PJSUA_INVALID_ID;
+            }
+            CC_SESSION_UNLOCK(session);
+            if (moh_pid != PJSUA_INVALID_ID)
+                cc_stop_wav(moh_pid, PJSUA_INVALID_ID);
+            cc_bridge_calls(call_a, call_b);
         }
     }
 

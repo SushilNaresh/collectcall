@@ -107,7 +107,13 @@ typedef struct cc_session {
     int                 update_b_sent;   /* B-leg UPDATE pjsua_call_update() succeeded */
     int                 update_a_acked;  /* A-leg UPDATE 200 OK received      */
     int                 update_b_acked;  /* B-leg UPDATE 200 OK received      */
+    int                 update_b_retry_pending; /* retry thread spawned for 491 */
     int                 media_bypassed;  /* conf slots silenced after bypass  */
+    int                 b_reinvite_active; /* SBC re-INVITE in progress on B-leg; block UPDATE */
+    int                 b_on_hold;       /* 1 while B-leg is on hold (sendonly) */
+    pjsua_player_id     hold_player_a;   /* MOH player on A during B hold     */
+    int                 a_on_hold;       /* 1 while A-leg is on hold (sendonly) */
+    pjsua_player_id     hold_player_b;   /* MOH player on B during A hold     */
 
     cc_sip_hdr_t        fwd_hdrs[CC_MAX_FWD_HDRS];
     int                 fwd_hdr_count;
