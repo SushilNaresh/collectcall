@@ -119,6 +119,11 @@ const char *cc_cfg_sbc_next_hop(void)
     return next_hop;
 }
 
+const char *cc_cfg_sbc_route2(void)
+{
+    return env_nonempty("CC_SBC_ROUTE2");
+}
+
 const char *cc_cfg_collect_prefixes(void)
 {
     const char *value = env_nonempty("CC_COLLECT_PREFIXES");
@@ -350,4 +355,14 @@ int cc_cfg_b_dtmf_timeout_sec(void)
         return CC_B_DTMF_TIMEOUT_SEC;
 
     return (int)parsed;
+}
+
+/* Comma-separated list of valid prefixes that may appear before the
+ * 10-digit B number. Default: "0,234,313".
+ * Override: export CC_B_NUMBER_PREFIXES=0,234,313
+ */
+const char *cc_cfg_b_number_prefixes(void)
+{
+    const char *value = env_nonempty("CC_B_NUMBER_PREFIXES");
+    return value ? value : "0,234,313";
 }

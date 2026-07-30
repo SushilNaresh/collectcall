@@ -23,6 +23,7 @@ const char *cc_cfg_local_host(void);
 int         cc_cfg_local_sip_port(void);
 
 const char *cc_cfg_sbc_host(void);
+const char *cc_cfg_sbc_route2(void);
 int         cc_cfg_sbc_port(void);
 const char *cc_cfg_sbc_next_hop(void);
 
@@ -56,5 +57,6 @@ int         cc_cfg_is_fundless_prefix(const char *prefix);
 
 int cc_cfg_validation_timeout_ms(void);
 int cc_cfg_b_dtmf_timeout_sec(void);
+const char *cc_cfg_b_number_prefixes(void);
 
 #endif /* CC_RUNTIME_CONFIG_H */

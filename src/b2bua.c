@@ -207,6 +207,70 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
                dialed_raw,
                dialed_source));
 
+    /* Validate full dialed number against CC_B_NUMBER_PREFIXES.
+     * Only applies when a prefix matches: strip it, remaining must be 10 digits.
+     * If no prefix matches, fall through — cc_split_collect_number handles it. */
+    {
+        const char *pfxs = cc_cfg_b_number_prefixes();
+        if (pfxs && pfxs[0] != '\0') {
+            size_t dlen = strlen(dialed_raw);
+            size_t best = 0;
+            int    matched = 0;
+            const char *p = pfxs;
+            while (p && *p) {
+                const char *comma = strchr(p, ',');
+                size_t slen = comma ? (size_t)(comma - p) : strlen(p);
+                if (slen > 0 && slen <= dlen &&
+                    strncmp(dialed_raw, p, slen) == 0 && slen > best)
+                {
+                    best = slen;
+                    matched = 1;
+                }
+                p += slen;
+                if (*p == ',') p++;
+            }
+            if (matched && dlen - best != 10) {
+                PJ_LOG(2, (THIS_FILE,
+                           "[DIALED] prefix matched but remaining digits=%zu (need 10); "
+                           "playing incomplete-number prompt to call %d",
+                           dlen - best, call_id));
+                session = cc_session_create(pjsua_get_pool_factory());
+                if (!session) {
+                    pjsua_call_answer(call_id, PJSIP_SC_NOT_FOUND, NULL, NULL);
+                    return;
+                }
+                session->call_a = call_id;
+                session->acc_id = acc_id;
+                session->call_start_ts = time(NULL);
+                if (ci.call_id.slen > 0) {
+                    pj_size_t clen = (pj_size_t)ci.call_id.slen;
+                    if (clen >= sizeof(session->call_id))
+                        clen = sizeof(session->call_id) - 1;
+                    memcpy(session->call_id, ci.call_id.ptr, clen);
+                    session->call_id[clen] = '\0';
+                }
+                pjsua_call_set_user_data(call_id, session);
+                CC_SESSION_LOCK(session);
+                session->torn_down = 1;
+                CC_SESSION_UNLOCK(session);
+                pjsua_call_setting_default(&cs);
+                cs.aud_cnt = 1; cs.vid_cnt = 0; cs.txt_cnt = 0;
+                if (pjsua_call_answer2(call_id, &cs, PJSIP_SC_OK, NULL, NULL)
+                        != PJ_SUCCESS) {
+                    pjsua_call_answer(call_id, PJSIP_SC_NOT_FOUND, NULL, NULL);
+                    cc_session_invalidate_a(session, call_id);
+                    cc_session_maybe_finalize(session);
+                    return;
+                }
+                leg_a_play_prompt_then_hangup(session,
+                                              CC_PROMPT_INCOMPLETE_NUMBER,
+                                              PJSIP_SC_NOT_FOUND);
+                cc_session_maybe_finalize(session);
+                return;
+            }
+        }
+    }
+
     status = cc_split_collect_number(dialed_raw, &collect_number);
     if (status != PJ_SUCCESS) {
         /*
@@ -272,7 +336,59 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
                "[B-PARTY] raw=%s normalized=%s",
                collect_number.sponsor_raw,
                sponsor_normalized));
-    /* Create session */
+
+    /* Validate B-number length and prefix */
+    if (cc_validate_b_number(sponsor_normalized) != PJ_SUCCESS) {
+        PJ_LOG(2, (THIS_FILE,
+                   "[B-PARTY] invalid B number raw=%s normalized=%s; "
+                   "playing incomplete-number prompt to A",
+                   collect_number.sponsor_raw, sponsor_normalized));
+
+        /* Must create a minimal session so leg_a_play_prompt_then_hangup
+         * can play the WAV and hang up A cleanly. */
+        session = cc_session_create(pjsua_get_pool_factory());
+        if (!session) {
+            pjsua_call_answer(call_id, PJSIP_SC_NOT_FOUND, NULL, NULL);
+            return;
+        }
+        session->call_a = call_id;
+        session->acc_id = acc_id;
+        session->call_start_ts = time(NULL);
+        if (ci.call_id.slen > 0) {
+            pj_size_t clen = (pj_size_t)ci.call_id.slen;
+            if (clen >= sizeof(session->call_id))
+                clen = sizeof(session->call_id) - 1;
+            memcpy(session->call_id, ci.call_id.ptr, clen);
+            session->call_id[clen] = '\0';
+        }
+        pjsua_call_set_user_data(call_id, session);
+
+        pjsua_call_setting_default(&cs);
+        cs.aud_cnt = 1;
+        cs.vid_cnt = 0;
+        cs.txt_cnt = 0;
+        if (pjsua_call_answer2(call_id, &cs, PJSIP_SC_OK, NULL, NULL)
+                != PJ_SUCCESS) {
+            pjsua_call_answer(call_id, PJSIP_SC_NOT_FOUND, NULL, NULL);
+            cc_session_mark_end(session, "FAILED", "INVALID_B_NUMBER");
+            CC_SESSION_LOCK(session);
+            session->torn_down = 1;
+            CC_SESSION_UNLOCK(session);
+            cc_session_invalidate_a(session, call_id);
+            cc_session_maybe_finalize(session);
+            return;
+        }
+
+        cc_session_mark_end(session, "FAILED", "INVALID_B_NUMBER");
+        CC_SESSION_LOCK(session);
+        session->torn_down = 1;
+        CC_SESSION_UNLOCK(session);
+        leg_a_play_prompt_then_hangup(session,
+                                      CC_PROMPT_INCOMPLETE_NUMBER,
+                                      PJSIP_SC_NOT_FOUND);
+        cc_session_maybe_finalize(session);
+        return;
+    }
     session = cc_session_create(pjsua_get_pool_factory());
     if (!session) {
         PJ_LOG(1, (THIS_FILE, "session_create failed"));
@@ -1182,7 +1298,7 @@ void *cc_originate_b_thread(void *arg_ptr)
         cc_add_msg_header(hdr_pool, &msg_data, "Supported", "100rel");
     }
 
-    /* Route header to SBC (loose-route) — added only if configured */
+    /* Route header(s) to SBC (loose-route) — added only if configured */
     {
         const char *route_host = cc_cfg_sbc_host();
         int route_port = cc_cfg_sbc_port();
@@ -1196,6 +1312,19 @@ void *cc_originate_b_thread(void *arg_ptr)
                 cc_add_msg_header(hdr_pool, &msg_data, "Route", route_buf);
                 PJ_LOG(3, (THIS_FILE,
                            "[B-LEG-HDR] Route=%s", route_buf));
+            }
+        }
+
+        /* Optional second Route — directs Kamailio to a specific next SBC */
+        const char *route2 = cc_cfg_sbc_route2();
+        if (route2 && route2[0] != '\0' && hdr_pool) {
+            char route2_buf[256];
+            int rlen = snprintf(route2_buf, sizeof(route2_buf),
+                                "<%s>", route2);
+            if (rlen > 0 && (size_t)rlen < sizeof(route2_buf)) {
+                cc_add_msg_header(hdr_pool, &msg_data, "Route", route2_buf);
+                PJ_LOG(3, (THIS_FILE,
+                           "[B-LEG-HDR] Route2=%s", route2_buf));
             }
         }
     }
@@ -1486,6 +1615,237 @@ static void spawn_update_b_retry(cc_session_t *session, pjsua_call_id call_b)
     pthread_detach(t);
 }
 
+/* ── A-leg UPDATE 491 retry ──────────────────────────────────────────────── */
+
+typedef struct {
+    cc_session_t  *session;
+    pjsua_call_id  call_a;
+} update_a_retry_arg_t;
+
+static void *update_a_retry_thread(void *arg_ptr)
+{
+    update_a_retry_arg_t *arg = (update_a_retry_arg_t *)arg_ptr;
+    cc_session_t *session = arg->session;
+    pjsua_call_id call_a = arg->call_a;
+    pj_thread_desc desc;
+    pj_thread_t *this_thread = NULL;
+
+    free(arg);
+
+    pj_bzero(desc, sizeof(desc));
+    if (pj_thread_register("cc_upd_a_retry", desc, &this_thread) != PJ_SUCCESS) {
+        CC_SESSION_LOCK(session);
+        session->update_a_retry_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        cc_session_release_reason(session, "update-a-retry-register-failed");
+        return NULL;
+    }
+
+    cc_sleep_ms(3000);
+
+    CC_SESSION_LOCK(session);
+    int skip = session->torn_down ||
+               session->media_bypassed ||
+               session->update_a_acked ||
+               session->call_a != call_a;
+    session->update_a_retry_pending = 0;
+    CC_SESSION_UNLOCK(session);
+
+    if (!skip) {
+        PJ_LOG(3, (THIS_FILE, "[BYPASS] retrying A-leg UPDATE after 491"));
+        leg_a_send_update_bypass(call_a, session);
+    }
+
+    cc_session_maybe_finalize(session);
+    cc_session_release_reason(session, "update-a-retry-complete");
+    return NULL;
+}
+
+static void spawn_update_a_retry(cc_session_t *session, pjsua_call_id call_a)
+{
+    update_a_retry_arg_t *arg;
+    pthread_t t;
+
+    CC_SESSION_LOCK(session);
+    if (session->update_a_retry_pending ||
+        session->media_bypassed ||
+        session->update_a_acked ||
+        session->torn_down)
+    {
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+    session->update_a_retry_pending = 1;
+    CC_SESSION_UNLOCK(session);
+
+    if (!cc_session_acquire_reason(session, "update-a-retry-worker")) {
+        CC_SESSION_LOCK(session);
+        session->update_a_retry_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+
+    arg = malloc(sizeof(*arg));
+    if (!arg) {
+        CC_SESSION_LOCK(session);
+        session->update_a_retry_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        cc_session_release_reason(session, "update-a-retry-alloc-failed");
+        return;
+    }
+    arg->session = session;
+    arg->call_a  = call_a;
+
+    if (pthread_create(&t, NULL, update_a_retry_thread, arg) != 0) {
+        free(arg);
+        CC_SESSION_LOCK(session);
+        session->update_a_retry_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        cc_session_release_reason(session, "update-a-retry-create-failed");
+        return;
+    }
+    pthread_detach(t);
+}
+
+/* ── UPDATE 200 OK timeout watchdog ─────────────────────────────────────── */
+/*
+ * If either UPDATE 200 OK does not arrive within CC_UPDATE_ACK_TIMEOUT_MS,
+ * fall back to local bridge so the call is not left in a broken state.
+ * This covers: SBC drops UPDATE silently, network loss, non-200 that PJSUA
+ * does not surface as a media-state callback.
+ */
+#define CC_UPDATE_ACK_TIMEOUT_MS  8000
+#define CC_UPDATE_ACK_POLL_MS       100
+
+typedef struct {
+    cc_session_t  *session;
+    pjsua_call_id  call_a;
+    pjsua_call_id  call_b;
+} update_ack_watchdog_arg_t;
+
+static void *update_ack_watchdog_thread(void *arg_ptr)
+{
+    update_ack_watchdog_arg_t *arg = (update_ack_watchdog_arg_t *)arg_ptr;
+    cc_session_t  *session = arg->session;
+    pjsua_call_id  call_a  = arg->call_a;
+    pjsua_call_id  call_b  = arg->call_b;
+    pj_thread_desc desc;
+    pj_thread_t   *th = NULL;
+    int waited_ms = 0;
+
+    free(arg);
+    pj_bzero(desc, sizeof(desc));
+    pj_thread_register("cc_upd_ack_wd", desc, &th);
+
+    while (waited_ms < CC_UPDATE_ACK_TIMEOUT_MS) {
+        int done, torn;
+        CC_SESSION_LOCK(session);
+        done = session->media_bypassed ||
+               session->torn_down ||
+               session->call_a != call_a ||
+               session->call_b != call_b;
+        torn = session->torn_down ||
+               session->call_a != call_a ||
+               session->call_b != call_b;
+        CC_SESSION_UNLOCK(session);
+
+        if (torn) goto done; /* call ended — no action needed */
+        if (done) goto done; /* bypass completed normally */
+
+        cc_sleep_ms(CC_UPDATE_ACK_POLL_MS);
+        waited_ms += CC_UPDATE_ACK_POLL_MS;
+    }
+
+    /* Timeout — check if bypass still incomplete */
+    {
+        int need_fallback = 0;
+        CC_SESSION_LOCK(session);
+        if (!session->media_bypassed &&
+            !session->torn_down &&
+            session->accepted &&
+            session->call_a == call_a &&
+            session->call_b == call_b)
+        {
+            int a_ok = session->update_a_acked;
+            int b_ok = session->update_b_acked;
+            PJ_LOG(2, (THIS_FILE,
+                       "[UPDATE-WD] UPDATE 200 OK timeout after %dms "
+                       "(a_acked=%d b_acked=%d) — falling back to local bridge",
+                       CC_UPDATE_ACK_TIMEOUT_MS, a_ok, b_ok));
+            /* Reset all bypass state so hold/resume works via local_bridge path */
+            session->update_a_sent          = 0;
+            session->update_b_sent          = 0;
+            session->update_a_acked         = 0;
+            session->update_b_acked         = 0;
+            session->update_a_pending       = 0;
+            session->update_b_pending       = 0;
+            session->update_a_retry_pending = 0;
+            session->update_b_retry_pending = 0;
+            need_fallback = 1;
+        }
+        CC_SESSION_UNLOCK(session);
+
+        if (need_fallback)
+            cc_bridge_calls(call_a, call_b);
+    }
+
+done:
+    CC_SESSION_LOCK(session);
+    session->update_ack_watchdog_started = 0;
+    CC_SESSION_UNLOCK(session);
+    cc_session_maybe_finalize(session);
+    cc_session_release_reason(session, "update-ack-watchdog-complete");
+    return NULL;
+}
+
+static void spawn_update_ack_watchdog(cc_session_t *session,
+                                      pjsua_call_id call_a,
+                                      pjsua_call_id call_b)
+{
+    update_ack_watchdog_arg_t *arg;
+    pthread_t t;
+
+    CC_SESSION_LOCK(session);
+    if (session->update_ack_watchdog_started || session->torn_down) {
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+    session->update_ack_watchdog_started = 1;
+    CC_SESSION_UNLOCK(session);
+
+    if (!cc_session_acquire_reason(session, "update-ack-watchdog-worker")) {
+        CC_SESSION_LOCK(session);
+        session->update_ack_watchdog_started = 0;
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+
+    arg = malloc(sizeof(*arg));
+    if (!arg) {
+        CC_SESSION_LOCK(session);
+        session->update_ack_watchdog_started = 0;
+        CC_SESSION_UNLOCK(session);
+        cc_session_release_reason(session, "update-ack-watchdog-alloc-failed");
+        return;
+    }
+    arg->session = session;
+    arg->call_a  = call_a;
+    arg->call_b  = call_b;
+
+    if (pthread_create(&t, NULL, update_ack_watchdog_thread, arg) != 0) {
+        free(arg);
+        CC_SESSION_LOCK(session);
+        session->update_ack_watchdog_started = 0;
+        CC_SESSION_UNLOCK(session);
+        cc_session_release_reason(session, "update-ack-watchdog-create-failed");
+        return;
+    }
+    pthread_detach(t);
+    PJ_LOG(3, (THIS_FILE,
+               "[UPDATE-WD] watchdog started — fallback to bridge if no 200 OK in %dms",
+               CC_UPDATE_ACK_TIMEOUT_MS));
+}
+
 void cc_on_call_media_state(pjsua_call_id call_id)
 {
     cc_session_t *session;
@@ -1559,13 +1919,15 @@ void cc_on_call_media_state(pjsua_call_id call_id)
                             do_resume = 1;
                             resume_call_a = call_a;
                             resume_call_b = call_b;
-                            session->media_bypassed = 0;
-                            session->update_a_sent  = 0;
-                            session->update_b_sent  = 0;
-                            session->update_a_acked = 0;
-                            session->update_b_acked = 0;
-                            session->update_b_retry_pending = 0;
-                            session->b_reinvite_active = 0;
+                            session->media_bypassed          = 0;
+                            session->update_a_sent           = 0;
+                            session->update_b_sent           = 0;
+                            session->update_a_acked          = 0;
+                            session->update_b_acked          = 0;
+                            session->update_b_retry_pending  = 0;
+                            session->update_a_retry_pending  = 0;
+                            session->update_ack_watchdog_started = 0;
+                            session->b_reinvite_active       = 0;
                         }
                     }
                 }
@@ -1585,13 +1947,15 @@ void cc_on_call_media_state(pjsua_call_id call_id)
                             do_resume = 2;
                             resume_call_a = call_a;
                             resume_call_b = call_b;
-                            session->media_bypassed = 0;
-                            session->update_a_sent  = 0;
-                            session->update_b_sent  = 0;
-                            session->update_a_acked = 0;
-                            session->update_b_acked = 0;
-                            session->update_b_retry_pending = 0;
-                            session->b_reinvite_active = 0;
+                            session->media_bypassed          = 0;
+                            session->update_a_sent           = 0;
+                            session->update_b_sent           = 0;
+                            session->update_a_acked          = 0;
+                            session->update_b_acked          = 0;
+                            session->update_b_retry_pending  = 0;
+                            session->update_a_retry_pending  = 0;
+                            session->update_ack_watchdog_started = 0;
+                            session->b_reinvite_active       = 0;
                         }
                     }
                 }
@@ -1604,6 +1968,7 @@ void cc_on_call_media_state(pjsua_call_id call_id)
                        "[BYPASS] both UPDATE 200 OKs received — silencing B2BUA conf slots"));
             cc_silence_call(call_a);
             cc_silence_call(call_b);
+            cc_spawn_bypass_rtp_watchdog(session, call_a, call_b);
         }
 
         /* A acked but B hasn't — 491 on B-leg; retry after delay */
@@ -1628,6 +1993,45 @@ void cc_on_call_media_state(pjsua_call_id call_id)
             }
         }
 
+        /* B acked but A hasn't — 491 on A-leg; retry after delay */
+        {
+            int need_retry = 0;
+            CC_SESSION_LOCK(session);
+            if (!session->media_bypassed &&
+                !session->torn_down &&
+                session->accepted &&
+                session->update_b_acked &&
+                session->update_a_sent &&
+                !session->update_a_acked &&
+                !session->update_a_retry_pending)
+            {
+                need_retry = 1;
+            }
+            CC_SESSION_UNLOCK(session);
+            if (need_retry) {
+                PJ_LOG(3, (THIS_FILE,
+                           "[BYPASS] B UPDATE acked but A UPDATE not acked — spawning 491 retry"));
+                spawn_update_a_retry(session, call_a);
+            }
+        }
+
+        /* Spawn UPDATE ack timeout watchdog once both UPDATEs are sent */
+        {
+            int need_watchdog = 0;
+            CC_SESSION_LOCK(session);
+            if (!session->media_bypassed &&
+                !session->torn_down &&
+                session->accepted &&
+                session->update_a_sent &&
+                session->update_b_sent &&
+                !session->update_ack_watchdog_started)
+            {
+                need_watchdog = 1;
+            }
+            CC_SESSION_UNLOCK(session);
+            if (need_watchdog)
+                spawn_update_ack_watchdog(session, call_a, call_b);
+        }
         if (do_hold == 1) {
             /* B put the call on hold — play MOH to A */
             pjsua_player_id moh_pid = PJSUA_INVALID_ID;

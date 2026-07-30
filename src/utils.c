@@ -454,6 +454,47 @@ pj_status_t cc_normalize_msisdn(const char *input,
     return PJ_SUCCESS;
 }
 
+pj_status_t cc_validate_b_number(const char *normalized)
+{
+    const char *prefixes;
+    size_t len;
+
+    if (!normalized || normalized[0] == '\0')
+        return PJ_EINVAL;
+
+    len = strlen(normalized);
+
+    if (len == 10)
+        return PJ_SUCCESS;
+
+    if (len < 10)
+        return PJ_EINVAL;
+
+    /* len > 10: check if a known prefix can be stripped to leave 10 digits */
+    prefixes = cc_cfg_b_number_prefixes();
+    {
+        const char *p = prefixes;
+        while (p && *p) {
+            const char *comma = strchr(p, ',');
+            size_t seg_len = comma ? (size_t)(comma - p) : strlen(p);
+
+            if (seg_len > 0 &&
+                seg_len < len &&
+                strncmp(normalized, p, seg_len) == 0 &&
+                (len - seg_len) == 10)
+            {
+                return PJ_SUCCESS;
+            }
+
+            p += seg_len;
+            if (*p == ',')
+                p++;
+        }
+    }
+
+    return PJ_EINVAL;
+}
+
 pj_status_t cc_extract_b_number(const pj_str_t *local_uri,
                                  char *b_number, pj_size_t b_number_len)
 {
@@ -1255,6 +1296,176 @@ void cc_silence_call(pjsua_call_id call_id)
     PJ_LOG(3, (THIS_FILE,
                "[BYPASS] call %d (slot %d) silenced — B2BUA exited RTP path",
                call_id, slot));
+}
+
+/*
+ * Watchdog: after both UPDATE 200 OKs, poll for incoming RTP on both legs.
+ * If neither leg receives RTP within CC_BYPASS_RTP_WATCHDOG_MS, the MGWs
+ * cannot reach each other directly — fall back to local bridge.
+ */
+#define CC_BYPASS_RTP_WATCHDOG_MS  2500
+#define CC_BYPASS_RTP_POLL_MS        50
+
+typedef struct {
+    cc_session_t  *session;
+    pjsua_call_id  call_a;
+    pjsua_call_id  call_b;
+} bypass_watchdog_arg_t;
+
+static void *cc_bypass_rtp_watchdog_thread(void *opaque)
+{
+    bypass_watchdog_arg_t *arg = (bypass_watchdog_arg_t *)opaque;
+    cc_session_t  *session = arg->session;
+    pjsua_call_id  call_a  = arg->call_a;
+    pjsua_call_id  call_b  = arg->call_b;
+    pj_thread_desc desc;
+    pj_thread_t   *th = NULL;
+    int waited_ms = 0;
+    int rtp_ok = 0;
+
+    free(arg);
+    pj_bzero(desc, sizeof(desc));
+    pj_thread_register("cc_bypass_wd", desc, &th);
+
+    while (waited_ms < CC_BYPASS_RTP_WATCHDOG_MS) {
+        cc_rtp_ep_t ep_a, ep_b;
+        int torn;
+
+        CC_SESSION_LOCK(session);
+        torn = session->torn_down ||
+               session->call_a != call_a ||
+               session->call_b != call_b;
+        CC_SESSION_UNLOCK(session);
+        if (torn) {
+            rtp_ok = 1; /* call ended — no fallback needed */
+            break;
+        }
+
+        /* Check if either leg is receiving RTP from the peer MGW.
+         * src_rtp_name is updated live by PJSUA as packets arrive. */
+        if (cc_get_call_remote_rtp(call_a, &ep_a) == PJ_SUCCESS &&
+            ep_a.port != 0 &&
+            cc_get_call_remote_rtp(call_b, &ep_b) == PJ_SUCCESS &&
+            ep_b.port != 0)
+        {
+            /* Both legs still have their pre-bypass MGW endpoints.
+             * We need to detect NEW packets arriving after bypass.
+             * Strategy: compare against the endpoints we redirected to.
+             * After bypass, A should receive from B's MGW and vice versa.
+             * If src_rtp still shows the old B2BUA-side source, no direct
+             * RTP has arrived yet. We simply wait for any packet activity
+             * — if src_rtp_name stops updating (no new packets), PJSUA
+             * keeps the last seen value. So we poll for a non-zero port
+             * on both legs after the silence, which is always true.
+             * Instead, check packet counts via stream stats. */
+            pjsua_stream_stat stat_a, stat_b;
+            if (pjsua_call_get_stream_stat(call_a, 0, &stat_a) == PJ_SUCCESS &&
+                pjsua_call_get_stream_stat(call_b, 0, &stat_b) == PJ_SUCCESS)
+            {
+                /* rx.pkt counts all received RTP packets on each leg.
+                 * After bypass, if MGWs talk directly the count keeps rising.
+                 * We snapshot at entry and check if it grew. */
+                static unsigned long pkt_a_start = 0, pkt_b_start = 0;
+                static int snapped = 0;
+                if (!snapped) {
+                    pkt_a_start = stat_a.rtcp.rx.pkt;
+                    pkt_b_start = stat_b.rtcp.rx.pkt;
+                    snapped = 1;
+                } else if (stat_a.rtcp.rx.pkt > pkt_a_start + 2 &&
+                           stat_b.rtcp.rx.pkt > pkt_b_start + 2)
+                {
+                    PJ_LOG(3, (THIS_FILE,
+                               "[BYPASS-WD] RTP flowing on both legs after bypass — OK"));
+                    rtp_ok = 1;
+                    break;
+                }
+            }
+        }
+
+        cc_sleep_ms(CC_BYPASS_RTP_POLL_MS);
+        waited_ms += CC_BYPASS_RTP_POLL_MS;
+    }
+
+    if (!rtp_ok) {
+        int do_fallback = 0;
+        CC_SESSION_LOCK(session);
+        if (!session->torn_down &&
+            session->accepted &&
+            session->media_bypassed &&
+            session->call_a == call_a &&
+            session->call_b == call_b)
+        {
+            /* Reset bypass flags so hold/resume logic still works */
+            session->media_bypassed   = 0;
+            session->update_a_sent    = 0;
+            session->update_b_sent    = 0;
+            session->update_a_acked   = 0;
+            session->update_b_acked   = 0;
+            do_fallback = 1;
+        }
+        CC_SESSION_UNLOCK(session);
+
+        if (do_fallback) {
+            PJ_LOG(2, (THIS_FILE,
+                       "[BYPASS-WD] no direct RTP after %dms — falling back to local bridge",
+                       CC_BYPASS_RTP_WATCHDOG_MS));
+            cc_bridge_calls(call_a, call_b);
+        }
+    }
+
+    cc_session_maybe_finalize(session);
+    cc_session_release_reason(session, "bypass-watchdog-complete");
+    return NULL;
+}
+
+void cc_spawn_bypass_rtp_watchdog(cc_session_t *session,
+                                   pjsua_call_id call_a,
+                                   pjsua_call_id call_b)
+{
+    bypass_watchdog_arg_t *arg;
+    pthread_t t;
+
+    CC_SESSION_LOCK(session);
+    if (session->bypass_rtp_watchdog_started ||
+        session->torn_down)
+    {
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+    session->bypass_rtp_watchdog_started = 1;
+    CC_SESSION_UNLOCK(session);
+
+    if (!cc_session_acquire_reason(session, "bypass-watchdog-worker")) {
+        CC_SESSION_LOCK(session);
+        session->bypass_rtp_watchdog_started = 0;
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+
+    arg = malloc(sizeof(*arg));
+    if (!arg) {
+        cc_session_release_reason(session, "bypass-watchdog-alloc-failed");
+        CC_SESSION_LOCK(session);
+        session->bypass_rtp_watchdog_started = 0;
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+    arg->session = session;
+    arg->call_a  = call_a;
+    arg->call_b  = call_b;
+
+    if (pthread_create(&t, NULL, cc_bypass_rtp_watchdog_thread, arg) != 0) {
+        free(arg);
+        cc_session_release_reason(session, "bypass-watchdog-create-failed");
+        CC_SESSION_LOCK(session);
+        session->bypass_rtp_watchdog_started = 0;
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+    pthread_detach(t);
+    PJ_LOG(3, (THIS_FILE,
+               "[BYPASS-WD] watchdog started — will fallback to bridge if no direct RTP in %dms",
+               CC_BYPASS_RTP_WATCHDOG_MS));
 }
 
 

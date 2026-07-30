@@ -108,7 +108,10 @@ typedef struct cc_session {
     int                 update_a_acked;  /* A-leg UPDATE 200 OK received      */
     int                 update_b_acked;  /* B-leg UPDATE 200 OK received      */
     int                 update_b_retry_pending; /* retry thread spawned for 491 */
+    int                 update_a_retry_pending; /* retry thread spawned for A-leg 491 */
+    int                 update_ack_watchdog_started; /* 200 OK timeout watchdog spawned */
     int                 media_bypassed;  /* conf slots silenced after bypass  */
+    int                 bypass_rtp_watchdog_started; /* fallback watchdog spawned */
     int                 b_reinvite_active; /* SBC re-INVITE in progress on B-leg; block UPDATE */
     int                 b_on_hold;       /* 1 while B-leg is on hold (sendonly) */
     pjsua_player_id     hold_player_a;   /* MOH player on A during B hold     */

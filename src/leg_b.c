@@ -650,7 +650,17 @@ void leg_b_send_update_bypass(pjsua_call_id call_id, cc_session_t *session)
 
     PJ_LOG(3, (THIS_FILE, "[B] Sending basic SIP UPDATE"));
 
-    status = pjsua_call_update(call_id, 0, &msg_data);
+    /* Retry up to 2s if dialog has a pending transaction (mirrors A-leg) */
+    {
+        int retry_ms = 0;
+        do {
+            status = pjsua_call_update(call_id, 0, &msg_data);
+            if (status == PJ_SUCCESS || retry_ms >= 2000)
+                break;
+            cc_sleep_ms(100);
+            retry_ms += 100;
+        } while (1);
+    }
 
     if (status == PJ_SUCCESS) {
         CC_SESSION_LOCK(session);

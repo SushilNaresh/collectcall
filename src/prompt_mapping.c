@@ -29,7 +29,8 @@ static cc_prompt_entry_t g_prompts[CC_PROMPT_COUNT] = {
     { CC_PROMPT_FUNDLESS, "FUNDLESS", "wav/0.1.wav", "" },
     { CC_PROMPT_DIAL_TONE, "DIAL_TONE", "wav/dial_tone.wav", "" },
     { CC_PROMPT_MOH, "MOH_PROMPT", "wav/4.wav", "" },
-    { CC_PROMPT_B_CONNECTED, "B_CONNECTED_PROMPT", "wav/4.1.wav", "" }
+    { CC_PROMPT_B_CONNECTED, "B_CONNECTED_PROMPT", "wav/4.1.wav", "" },
+    { CC_PROMPT_INCOMPLETE_NUMBER, "INCOMPLETE_NUMBER", "wav/4.2.wav", "" }
 };
 
 static void set_fallback_paths(void)

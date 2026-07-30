@@ -15,6 +15,7 @@ typedef enum {
     CC_PROMPT_DIAL_TONE,
     CC_PROMPT_MOH,
     CC_PROMPT_B_CONNECTED,
+    CC_PROMPT_INCOMPLETE_NUMBER,
     CC_PROMPT_COUNT
 } cc_prompt_tag_t;
 

@@ -66,6 +66,17 @@ pj_status_t cc_normalize_msisdn(const char *input,
                                 pj_size_t normalized_len);
 
 /**
+ * Validate a normalized B-party MSISDN.
+ * Rules:
+ *   - Exactly 10 digits → valid (local format already stripped)
+ *   - More than 10 digits → strip a known prefix (0, 234, 313, or
+ *     whatever CC_B_NUMBER_PREFIXES lists); remaining must be 10 digits
+ *   - Less than 10 digits → invalid
+ * Returns PJ_SUCCESS if valid, PJ_EINVAL if not.
+ */
+pj_status_t cc_validate_b_number(const char *normalized);
+
+/**
  * Strip the collect prefix from a Request-URI user part.
  * Input:  "sip:<prefix>9876543@ims.operator.net"
  * Output: fills b_number (e.g. "9876543"), returns PJ_SUCCESS or PJ_ENOTFOUND
@@ -196,6 +207,9 @@ pj_status_t cc_bridge_calls(pjsua_call_id call_a, pjsua_call_id call_b);
  */
 pj_status_t cc_unbridge_calls(pjsua_call_id call_a, pjsua_call_id call_b);
 void        cc_silence_call(pjsua_call_id call_id);
+void        cc_spawn_bypass_rtp_watchdog(cc_session_t *session,
+                                         pjsua_call_id call_a,
+                                         pjsua_call_id call_b);
 
 
 /* ── Misc ───────────────────────────────────────────────────────────────── */
