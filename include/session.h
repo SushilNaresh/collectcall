@@ -39,8 +39,10 @@ typedef struct {
 typedef struct cc_session {
     pj_pool_t          *pool;          /* memory pool for this session      */
 
-    /* All mutable lifecycle/media fields below are guarded by this lock. */
-    pthread_mutex_t     lock;
+    /* Mutex is heap-allocated separately so it outlives pj_pool_release.
+     * Any thread sleeping with a ref must be able to lock it after the
+     * pool is freed. Freed in cc_session_destroy after mutex_destroy. */
+    pthread_mutex_t    *lock;
     unsigned            ref_count;
     int                 final_cleanup_started;
 
@@ -92,6 +94,7 @@ typedef struct cc_session {
     int                 a_treatment_running;
     int                 mca_waiting;       /* 1 = waiting for A DTMF 1 to trigger MCA */
     int                 mca_decided;       /* 1 = MCA decision claimed */
+    int                 accept_transition_pending; /* 1 while accept-transition event is queued/running */
     int                 ring_timer_started;
     int                 dtmf_timer_started;
 
@@ -123,6 +126,7 @@ typedef struct cc_session {
 
     pjsua_player_id     player_a;      /* A-leg WAV player                  */
     pjsua_player_id     player_b;      /* B-leg WAV player                  */
+    void               *originate_arg; /* cc_originate_arg_t* set before worker post */
 } cc_session_t;
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
@@ -140,7 +144,7 @@ int           cc_session_call_is_current(cc_session_t *s,
                                          int is_a_leg);
 
 /* ── Convenience lock/unlock ────────────────────────────────────────────── */
-#define CC_SESSION_LOCK(s)   pthread_mutex_lock(&(s)->lock)
-#define CC_SESSION_UNLOCK(s) pthread_mutex_unlock(&(s)->lock)
+#define CC_SESSION_LOCK(s)   pthread_mutex_lock((s)->lock)
+#define CC_SESSION_UNLOCK(s) pthread_mutex_unlock((s)->lock)
 
 #endif /* CC_SESSION_H */

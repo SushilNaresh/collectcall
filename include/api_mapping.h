@@ -22,4 +22,8 @@ void cc_map_end_call_result(const char *internal_status,
 
 void cc_send_end_call_udp(cc_session_t *session);
 
+/* Persistent socket lifecycle — call at startup/shutdown */
+int  cc_endcall_udp_init(void);
+void cc_endcall_udp_destroy(void);
+
 #endif /* CC_API_MAPPING_H */

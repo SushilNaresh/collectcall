@@ -19,6 +19,49 @@
 
 #define THIS_FILE "api_mapping.c"
 
+/* ── Persistent end-call UDP socket ─────────────────────────────────────── */
+
+static int                g_end_sockfd    = -1;
+static struct sockaddr_in g_end_server_addr;
+
+int cc_endcall_udp_init(void)
+{
+    const char *host = cc_cfg_endcall_host();
+    int         port = cc_cfg_endcall_port();
+
+#if !CC_CALL_END_UDP_ENABLE
+    return 0;
+#endif
+
+    g_end_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_end_sockfd < 0) {
+        PJ_LOG(1, (THIS_FILE, "[END-UDP] socket() failed: %s", strerror(errno)));
+        return -1;
+    }
+
+    memset(&g_end_server_addr, 0, sizeof(g_end_server_addr));
+    g_end_server_addr.sin_family = AF_INET;
+    g_end_server_addr.sin_port   = htons(port);
+    if (inet_pton(AF_INET, host, &g_end_server_addr.sin_addr) <= 0) {
+        PJ_LOG(1, (THIS_FILE, "[END-UDP] invalid host: %s", host));
+        close(g_end_sockfd);
+        g_end_sockfd = -1;
+        return -1;
+    }
+
+    PJ_LOG(3, (THIS_FILE, "[END-UDP] persistent socket ready host=%s port=%d",
+               host, port));
+    return 0;
+}
+
+void cc_endcall_udp_destroy(void)
+{
+    if (g_end_sockfd >= 0) {
+        close(g_end_sockfd);
+        g_end_sockfd = -1;
+    }
+}
+
 static const char *safe_str(const char *s)
 {
     return s ? s : "";
@@ -209,6 +252,21 @@ void cc_map_end_call_result(const char *internal_status,
         } else if (strcmp(internal_reason, "NORMAL_CLEARING") == 0) {
             status = "COMPLETED";
             reason = CC_END_API_COMPLETED_REASON;
+        } else if (strcmp(internal_reason, "SPONSOR_BALANCE_FAIL") == 0) {
+            status = "CANCELLED";
+            reason = "SPONSOR_BALANCE_FAIL";
+        } else if (strcmp(internal_reason, "CALLER_BLACKLISTED") == 0) {
+            status = "CANCELLED";
+            reason = "CALLER_BLACKLISTED";
+        } else if (strcmp(internal_reason, "SPONSOR_DND_ACTIVE") == 0) {
+            status = "CANCELLED";
+            reason = "SPONSOR_DND_ACTIVE";
+        } else if (strcmp(internal_reason, "SPONSOR_ROAMING") == 0) {
+            status = "CANCELLED";
+            reason = "SPONSOR_ROAMING";
+        } else if (strcmp(internal_reason, "API_FAILURE") == 0) {
+            status = "FAILED";
+            reason = "API_FAILURE";
         }
     }
 
@@ -241,8 +299,6 @@ void cc_send_end_call_udp(cc_session_t *session)
     time_t end_ts;
     long duration;
     int payload_len;
-    int sockfd;
-    struct sockaddr_in server_addr;
     ssize_t sent;
     const char *api_status;
     const char *api_reason;
@@ -370,30 +426,8 @@ void cc_send_end_call_udp(cc_session_t *session)
                endcall_port,
                payload));
 
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[END-UDP] send failed: socket(): %s",
-                   strerror(errno)));
-        return;
-    }
-
-    if (bind_end_local_port_if_enabled(sockfd) != 0) {
-        close(sockfd);
-        return;
-    }
-
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(endcall_port);
-    if (inet_pton(AF_INET,
-                  endcall_host,
-                  &server_addr.sin_addr) <= 0)
-    {
-        PJ_LOG(1, (THIS_FILE,
-                   "[END-UDP] send failed: invalid host %s",
-                   endcall_host));
-        close(sockfd);
+    if (g_end_sockfd < 0) {
+        PJ_LOG(1, (THIS_FILE, "[END-UDP] socket not initialised"));
         return;
     }
 
@@ -401,12 +435,12 @@ void cc_send_end_call_udp(cc_session_t *session)
         int attempt;
         int max_attempts = 3;
         for (attempt = 1; attempt <= max_attempts; attempt++) {
-            sent = sendto(sockfd,
+            sent = sendto(g_end_sockfd,
                           payload,
                           (size_t)payload_len,
                           0,
-                          (struct sockaddr *)&server_addr,
-                          sizeof(server_addr));
+                          (struct sockaddr *)&g_end_server_addr,
+                          sizeof(g_end_server_addr));
             if (sent == payload_len) {
                 PJ_LOG(3, (THIS_FILE,
                            "[END-UDP] sent ok bytes=%ld attempt=%d",
@@ -428,6 +462,4 @@ void cc_send_end_call_udp(cc_session_t *session)
             }
         }
     }
-
-    close(sockfd);
 }

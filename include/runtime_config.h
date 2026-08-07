@@ -58,5 +58,9 @@ int         cc_cfg_is_fundless_prefix(const char *prefix);
 int cc_cfg_validation_timeout_ms(void);
 int cc_cfg_b_dtmf_timeout_sec(void);
 const char *cc_cfg_b_number_prefixes(void);
+int cc_cfg_rtp_port_start(void);
+int cc_cfg_rtp_port_count(void);
+int cc_cfg_max_calls(void);
+int cc_cfg_log_level(void);
 
 #endif /* CC_RUNTIME_CONFIG_H */

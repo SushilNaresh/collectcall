@@ -120,4 +120,10 @@ void leg_b_start_ring_timer(cc_session_t *session);
  */
 void leg_b_start_dtmf_timer(cc_session_t *session);
 
+/**
+ * Called by worker on DTMF timer expiry — triggers ELIGIBILITY_TIMEOUT reject.
+ */
+void leg_b_on_dtmf_timeout(pjsua_call_id call_b, cc_session_t *session);
+
+
 #endif /* CC_HANDLERS_H */

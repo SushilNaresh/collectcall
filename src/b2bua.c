@@ -1,9 +1,10 @@
 /*
- * b2bua.c — Global PJSUA callbacks + B-leg origination thread
+ * b2bua.c — Global PJSUA callbacks + B-leg origination
  *
- * PJSUA uses a single global pjsua_callback struct.  Each callback
+ * PJSUA uses a single global pjsua_callback struct. Each callback
  * resolves which session the call belongs to via call user_data, then
  * dispatches to the appropriate leg handler.
+ * Async work (UPDATE retries, ack watchdog) posted to worker pool.
  *
  * Call user_data layout:
  *   Leg-A:  pointer to cc_session_t, with session->call_a == this call_id
@@ -13,9 +14,10 @@
 #include "handlers.h"
 #include "utils.h"
 #include "config.h"
-#include "validation.h"
+#include "validation_async.h"
 #include "api_mapping.h"
 #include "runtime_config.h"
+#include "worker.h"
 
 #include <pjsua-lib/pjsua.h>
 #include <pjsip/sip_msg.h>
@@ -137,6 +139,26 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
                    call_id, status));
         pjsua_call_answer(call_id, PJSIP_SC_SERVICE_UNAVAILABLE, NULL, NULL);
         return;
+    }
+
+    /* Guard against PJSUA slot reuse: if this slot still has a live session
+     * from a previous call (e.g. CC_EV_HANGUP_A_ONLY delayed in timer heap
+     * while PJSUA already recycled the slot), reject the new INVITE.
+     * user_data is set at cc_on_incoming_call and cleared only in
+     * cc_session_invalidate_a (DISCONNECTED callback). PJSUA can assign
+     * the slot to a new INVITE during the window between pjsua_call_hangup()
+     * and the DISCONNECTED callback — this guard catches that window.
+     * The SBC will retry on a different slot immediately. */
+    {
+        cc_session_t *stale = (cc_session_t *)pjsua_call_get_user_data(call_id);
+        if (stale) {
+            PJ_LOG(2, (THIS_FILE,
+                       "[CALL-SLOTS] slot %d still has live session=%p — "
+                       "rejecting new INVITE to avoid slot reuse",
+                       call_id, stale));
+            pjsua_call_answer(call_id, PJSIP_SC_SERVICE_UNAVAILABLE, NULL, NULL);
+            return;
+        }
     }
 
     /* Log active call count and compile-time limit for diagnostics */
@@ -568,14 +590,264 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
     PJ_LOG(3, (THIS_FILE, "A-leg 200 OK sent; waiting for ACK/CONFIRMED before starting B-leg"));
 }
 
+/* ── Async validation callback context ──────────────────────────────────── */
+
+typedef struct {
+    cc_session_t       *session;
+    cc_originate_arg_t *arg;
+    char                original_b[64];
+} vasync_ctx_t;
+
+/* ── Post-validation logic (shared by sync fallback and async callback) ─── */
+
+static void cc_on_validation_result(cc_session_t *session,
+                                     cc_originate_arg_t *arg,
+                                     const char *original_b,
+                                     cc_validation_result_t *result)
+{
+    int vstatus = result->status;
+
+    PJ_LOG(3, (THIS_FILE, "UDP validation result: status=%d reason=%s",
+               vstatus, result->reason));
+
+    if (vstatus != 0) {
+        const char *end_status;
+        const char *end_reason;
+
+        PJ_LOG(2, (THIS_FILE, "UDP validation rejected call: status=%d reason=%s",
+                   vstatus, result->reason));
+
+        CC_SESSION_LOCK(session);
+        if (session->torn_down || session->call_a == PJSUA_INVALID_ID) {
+            CC_SESSION_UNLOCK(session);
+            PJ_LOG(3, (THIS_FILE,
+                       "[VALIDATION] call already torn down after validation, skip B-leg"));
+            free(arg);
+            cc_session_acquire_reason(session, "finalize-guard");
+            cc_session_maybe_finalize(session);
+            cc_session_release_reason(session, "b-origination-ineligible");
+            cc_session_release_reason(session, "finalize-guard");
+            return;
+        }
+        session->torn_down = 1;
+        CC_SESSION_UNLOCK(session);
+
+        end_status = (vstatus < 0 || vstatus == CC_VALIDATION_API_FAILURE)
+                     ? "FAILED" : "CANCELLED";
+        end_reason = result->reason[0] ? result->reason
+                                       : "ELIGIBILITY_TIMEOUT";
+        cc_session_mark_end(session, end_status, end_reason);
+        free(arg);
+
+        {
+            cc_prompt_tag_t prompt_tag;
+            pjsip_status_code sip_code;
+            switch (vstatus) {
+            case CC_VALIDATION_CALLER_BLACKLISTED:
+                prompt_tag = CC_PROMPT_NOT_AVAILABLE_TO_PAY;
+                sip_code   = PJSIP_SC_FORBIDDEN;
+                break;
+            case CC_VALIDATION_SPONSOR_BALANCE_FAIL:
+                prompt_tag = CC_PROMPT_LOW_BALANCE;
+                sip_code   = PJSIP_SC_FORBIDDEN;
+                break;
+            case CC_VALIDATION_SPONSOR_DND_ACTIVE:
+            case CC_VALIDATION_SPONSOR_ROAMING:
+                prompt_tag = CC_PROMPT_NOT_AVAILABLE_TO_PAY;
+                sip_code   = PJSIP_SC_FORBIDDEN;
+                break;
+            default:
+                prompt_tag = CC_PROMPT_NOT_AVAILABLE_TO_PAY;
+                sip_code   = PJSIP_SC_SERVICE_UNAVAILABLE;
+                break;
+            }
+            leg_a_play_prompt_then_hangup(session, prompt_tag, sip_code);
+        }
+
+        cc_session_acquire_reason(session, "finalize-guard");
+        cc_session_maybe_finalize(session);
+        cc_session_release_reason(session, "b-origination-ineligible");
+        cc_session_release_reason(session, "finalize-guard");
+        return;
+    }
+
+    /* Whitelisted check */
+    PJ_LOG(3, (THIS_FILE, "[WHITELIST-CHECK] details='%s' len=%d",
+               result->details, (int)strlen(result->details)));
+    if (result->details[0] != '\0' &&
+        strcasestr(result->details, "IS_WHITELISTED") != NULL)
+    {
+        CC_SESSION_LOCK(session);
+        session->whitelisted = 1;
+        CC_SESSION_UNLOCK(session);
+        PJ_LOG(3, (THIS_FILE, "[WHITELIST] caller whitelisted; B-leg will bridge directly"));
+    }
+
+    {
+        cc_service_key_mode_t sk_mode      = cc_cfg_service_key_mode();
+        const char           *sk_mode_name = cc_cfg_service_key_mode_name();
+        const char           *api_sk       = result->service_key;
+        const char           *placeholder  = cc_cfg_service_key_placeholder();
+        char  service_key[64];
+        int   have_sk = api_sk[0] != '\0';
+        char  keyed_user[128];
+        int   keyed_len;
+
+        if (have_sk) {
+            snprintf(service_key, sizeof(service_key), "%s", api_sk);
+            PJ_LOG(3, (THIS_FILE, "[SERVICEKEY] source=api service_key=%s", service_key));
+        } else {
+            snprintf(service_key, sizeof(service_key), "%s",
+                     placeholder ? placeholder : "");
+            have_sk = service_key[0] != '\0';
+            if (have_sk)
+                PJ_LOG(3, (THIS_FILE,
+                           "[SERVICEKEY] source=placeholder service_key=%s "
+                           "reason=missing_in_eligible_response", service_key));
+        }
+
+        snprintf(arg->service_key,      sizeof(arg->service_key),      "%s", service_key);
+        snprintf(arg->service_key_mode, sizeof(arg->service_key_mode), "%s", sk_mode_name);
+        snprintf(arg->b_dial_number,    sizeof(arg->b_dial_number),    "%s", original_b);
+        snprintf(arg->b_from_user,      sizeof(arg->b_from_user),      "%s",
+                 session->caller_msisdn);
+
+        if (sk_mode != CC_SERVICE_KEY_MODE_DISABLED && have_sk) {
+            keyed_len = snprintf(keyed_user, sizeof(keyed_user), "%s%s",
+                                 service_key, original_b);
+            if (keyed_len < 0 || (size_t)keyed_len >= sizeof(keyed_user)) {
+                keyed_user[0] = '\0';
+                PJ_LOG(1, (THIS_FILE,
+                           "[ERROR] serviceKey+B number too long; using sponsorMsisdn"));
+            }
+            if (keyed_user[0] != '\0') {
+                if (sk_mode == CC_SERVICE_KEY_MODE_FROM_ONLY ||
+                    sk_mode == CC_SERVICE_KEY_MODE_REQUEST_URI_AND_FROM)
+                    snprintf(arg->b_from_user, sizeof(arg->b_from_user),
+                             "%s", keyed_user);
+                if (sk_mode == CC_SERVICE_KEY_MODE_REQUEST_URI ||
+                    sk_mode == CC_SERVICE_KEY_MODE_REQUEST_URI_AND_FROM)
+                    snprintf(arg->b_dial_number, sizeof(arg->b_dial_number),
+                             "%s", keyed_user);
+            }
+        } else if (sk_mode != CC_SERVICE_KEY_MODE_DISABLED && !have_sk) {
+            PJ_LOG(2, (THIS_FILE,
+                       "[B-LEG] service_key_mode=%s requested but service_key empty; "
+                       "using sponsorMsisdn", sk_mode_name));
+        }
+
+        CC_SESSION_LOCK(session);
+        snprintf(session->service_key,    sizeof(session->service_key),
+                 "%s", service_key);
+        snprintf(session->b_dial_number,  sizeof(session->b_dial_number),
+                 "%s", arg->b_dial_number);
+        CC_SESSION_UNLOCK(session);
+
+        PJ_LOG(3, (THIS_FILE,
+                   "[B-LEG] service_key_mode=%s service_key=%s "
+                   "request_user=%s from_user=%s",
+                   sk_mode_name,
+                   have_sk ? service_key : "<none>",
+                   arg->b_dial_number, arg->b_from_user));
+        PJ_LOG(3, (THIS_FILE,
+                   "[B-LEG] original_b_user=%s service_key=%s final_request_user=%s",
+                   original_b, have_sk ? service_key : "<none>",
+                   arg->b_dial_number));
+    }
+
+    PJ_LOG(3, (THIS_FILE, "A-leg confirmed; starting B-leg to %s", arg->b_dial_number));
+
+    CC_SESSION_LOCK(session);
+    if (session->torn_down ||
+        session->call_a == PJSUA_INVALID_ID ||
+        session->final_cleanup_started)
+    {
+        CC_SESSION_UNLOCK(session);
+        PJ_LOG(3, (THIS_FILE,
+                   "[VALIDATION] call already torn down before B worker, skip B-leg"));
+        free(arg);
+        cc_session_acquire_reason(session, "finalize-guard");
+        cc_session_maybe_finalize(session);
+        cc_session_release_reason(session, "b-origination-ineligible");
+        cc_session_release_reason(session, "finalize-guard");
+        return;
+    }
+    session->b_origination_pending = 1;
+    CC_SESSION_UNLOCK(session);
+
+    if (!cc_session_acquire_reason(session, "b-origination-worker")) {
+        PJ_LOG(1, (THIS_FILE, "[ERROR] B-leg worker could not retain session"));
+        CC_SESSION_LOCK(session);
+        session->b_origination_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        free(arg);
+        cc_session_acquire_reason(session, "finalize-guard");
+        cc_session_maybe_finalize(session);
+        cc_session_release_reason(session, "b-origination-ineligible");
+        cc_session_release_reason(session, "finalize-guard");
+        return;
+    }
+
+    CC_SESSION_LOCK(session);
+    session->originate_arg = arg;
+    CC_SESSION_UNLOCK(session);
+
+    {
+        cc_event_t ev;
+        int wait_ms = 0;
+        memset(&ev, 0, sizeof(ev));
+        ev.type    = CC_EV_ORIGINATE_B;
+        ev.session = session;
+        snprintf(ev.reason, sizeof(ev.reason), "b-origination-worker");
+        /* Compute remaining prompt time so B-leg fires exactly when 1.1.wav ends,
+         * regardless of how long validation took. */
+        CC_SESSION_LOCK(session);
+        if (session->a_prompt_duration_ms > 0 && session->a_confirmed_ms > 0) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+            long long elapsed = now_ms - session->a_confirmed_ms;
+            long long remaining = (long long)session->a_prompt_duration_ms - elapsed;
+            if (remaining > 0)
+                wait_ms = (int)remaining;
+        }
+        CC_SESSION_UNLOCK(session);
+        cc_session_release_reason(session, "b-origination-worker");
+        if (cc_worker_post_delayed(&ev, wait_ms) != 0) {
+            PJ_LOG(1, (THIS_FILE, "[ERROR] B-leg worker post failed"));
+            CC_SESSION_LOCK(session);
+            session->b_origination_pending = 0;
+            session->originate_arg = NULL;
+            session->torn_down = 1;
+            pjsua_call_id call_a = session->call_a;
+            CC_SESSION_UNLOCK(session);
+            free(arg);
+            cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
+            if (call_a != PJSUA_INVALID_ID)
+                cc_safe_hangup(call_a, PJSIP_SC_SERVICE_UNAVAILABLE);
+            cc_session_acquire_reason(session, "finalize-guard");
+            cc_session_maybe_finalize(session);
+            cc_session_release_reason(session, "b-origination-ineligible");
+            cc_session_release_reason(session, "finalize-guard");
+        }
+    }
+}
+
+static void vasync_validation_cb(void *cb_arg, cc_validation_result_t *result)
+{
+    vasync_ctx_t *ctx = (vasync_ctx_t *)cb_arg;
+    cc_on_validation_result(ctx->session, ctx->arg, ctx->original_b, result);
+    /* release the ref acquired before cc_udp_validate_async */
+    cc_session_release_reason(ctx->session, "b-origination-validation");
+    free(ctx);
+}
+
 /* ── Start B leg after A-leg ACK/CONFIRMED ───────────────────────────────── */
 
 pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
 {
     cc_originate_arg_t *arg;
     char original_b[64];
-    pthread_t t;
-    int rc;
 
     if (!session)
         return PJSUA_INVALID_ID;
@@ -620,337 +892,91 @@ pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
 
     CC_SESSION_UNLOCK(session);
 
-    /*
-     * UDP validation trigger:
-     * status 0 = allow call
-     * status 1/2/3 or timeout/error = reject/disconnect
-     */
+    /* Async validation — returns immediately; callback fires on worker thread */
     {
         char call_id[128];
         char caller_msisdn[64];
         char time_str[64];
-        cc_validation_result_t validation_result;
-        time_t now;
-        int vstatus;
-
-        memset(&validation_result, 0, sizeof(validation_result));
-
-        now = time(NULL);
-        if (cc_format_nigeria_time(now,
-                                   time_str,
-                                   sizeof(time_str)) != PJ_SUCCESS)
-        {
-            PJ_LOG(1, (THIS_FILE,
-                       "[API-TIME] failed to format initiate timestamp"));
-            time_str[0] = '\0';
-        }
-        PJ_LOG(3, (THIS_FILE,
-                   "[API-TIME] timestamp=%s",
-                   time_str));
-
         const char *initiate_source;
+        vasync_ctx_t *ctx;
+        time_t now = time(NULL);
+
+        if (cc_format_nigeria_time(now, time_str, sizeof(time_str)) != PJ_SUCCESS)
+            time_str[0] = '\0';
+
         CC_SESSION_LOCK(session);
-        snprintf(call_id, sizeof(call_id), "%s", session->call_id);
+        snprintf(call_id,       sizeof(call_id),       "%s", session->call_id);
         snprintf(caller_msisdn, sizeof(caller_msisdn), "%s", session->caller_msisdn);
         initiate_source = session->fundless ? CC_INITIATE_SOURCE_FUNDLESS
                                             : CC_INITIATE_SOURCE_NORMAL;
         CC_SESSION_UNLOCK(session);
 
+        PJ_LOG(3, (THIS_FILE, "[API-TIME] timestamp=%s", time_str));
         PJ_LOG(3, (THIS_FILE,
-                   "[INITIATE-API] callerMsisdn=%s sponsorMsisdn=%s callId=%s source=%s timestamp=%s",
+                   "[INITIATE-API] callerMsisdn=%s sponsorMsisdn=%s callId=%s "
+                   "source=%s timestamp=%s",
                    caller_msisdn, original_b, call_id, initiate_source, time_str));
         PJ_LOG(3, (THIS_FILE, "[API] initiate caller=%s sponsor=%s",
                    caller_msisdn, original_b));
 
-        vstatus = cc_udp_validate_call(caller_msisdn, original_b, call_id,
-                                       initiate_source, time_str,
-                                       &validation_result);
-
-        /*
-         * TODO(load): validation remains synchronous and may block this
-         * callback path for CC_VALIDATION_TIMEOUT_MS.
-         */
-        CC_SESSION_LOCK(session);
-        if (session->torn_down ||
-            session->call_a == PJSUA_INVALID_ID ||
-            session->final_cleanup_started)
-        {
-            CC_SESSION_UNLOCK(session);
-            PJ_LOG(3, (THIS_FILE,
-                       "[VALIDATION] call already torn down after validation, skip B-leg"));
-            free(arg);
-            return PJSUA_INVALID_ID;
-        }
-        CC_SESSION_UNLOCK(session);
-
-        PJ_LOG(3, (THIS_FILE,
-                   "UDP validation result: status=%d reason=%s",
-                   vstatus, validation_result.reason));
-
-        if (vstatus != 0) {
-            const char *end_status;
-            const char *end_reason;
-
-            PJ_LOG(2, (THIS_FILE,
-                       "UDP validation rejected call: status=%d reason=%s",
-                       vstatus, validation_result.reason));
-
-
+        ctx = malloc(sizeof(*ctx));
+        if (!ctx) {
+            PJ_LOG(1, (THIS_FILE, "[ERROR] vasync_ctx malloc failed"));
             CC_SESSION_LOCK(session);
-            if (session->torn_down ||
-                session->call_a == PJSUA_INVALID_ID)
-            {
-                CC_SESSION_UNLOCK(session);
-                PJ_LOG(3, (THIS_FILE,
-                           "[VALIDATION] call already torn down after validation, skip B-leg"));
-                free(arg);
-                return PJSUA_INVALID_ID;
-            }
             session->torn_down = 1;
+            pjsua_call_id call_a = session->call_a;
             CC_SESSION_UNLOCK(session);
-
-            end_status = (vstatus < 0 ||
-                          vstatus == CC_VALIDATION_API_FAILURE)
-                         ? "FAILED" : "CANCELLED";
-            end_reason = validation_result.reason[0]
-                         ? validation_result.reason
-                         : validation_end_reason(vstatus);
-
-            cc_session_mark_end(session,
-                                end_status,
-                                end_reason);
-
             free(arg);
-
-            /*
-             * Play the appropriate rejection prompt to A before hanging up.
-             * The prompt thread will hangup A after playback completes.
-             */
-            {
-                cc_prompt_tag_t prompt_tag;
-                pjsip_status_code sip_code;
-
-                switch (vstatus) {
-                case CC_VALIDATION_CALLER_BLACKLISTED:
-                    prompt_tag = CC_PROMPT_NOT_AVAILABLE_TO_PAY;
-                    sip_code = PJSIP_SC_FORBIDDEN;
-                    break;
-                case CC_VALIDATION_SPONSOR_BALANCE_FAIL:
-                    prompt_tag = CC_PROMPT_LOW_BALANCE;
-                    sip_code = PJSIP_SC_FORBIDDEN;
-                    break;
-                case CC_VALIDATION_SPONSOR_DND_ACTIVE:
-                case CC_VALIDATION_SPONSOR_ROAMING:
-                    prompt_tag = CC_PROMPT_NOT_AVAILABLE_TO_PAY;
-                    sip_code = PJSIP_SC_FORBIDDEN;
-                    break;
-                default:
-                    /* API_FAILURE, ELIGIBILITY_TIMEOUT, SYSTEM_ERROR */
-                    prompt_tag = CC_PROMPT_NOT_AVAILABLE_TO_PAY;
-                    sip_code = PJSIP_SC_SERVICE_UNAVAILABLE;
-                    break;
-                }
-
-                leg_a_play_prompt_then_hangup(session, prompt_tag, sip_code);
-            }
-
+            cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
+            if (call_a != PJSUA_INVALID_ID)
+                cc_safe_hangup(call_a, PJSIP_SC_SERVICE_UNAVAILABLE);
+            cc_session_acquire_reason(session, "finalize-guard");
             cc_session_maybe_finalize(session);
             cc_session_release_reason(session, "b-origination-ineligible");
+            cc_session_release_reason(session, "finalize-guard");
+            return PJSUA_INVALID_ID;
+        }
+        ctx->session = session;
+        ctx->arg     = arg;
+        snprintf(ctx->original_b, sizeof(ctx->original_b), "%s", original_b);
+
+        /* Hold a ref across the async gap; released in vasync_validation_cb */
+        if (!cc_session_acquire_reason(session, "b-origination-validation")) {
+            free(ctx);
+            free(arg);
+            cc_session_acquire_reason(session, "finalize-guard");
+            cc_session_maybe_finalize(session);
+            cc_session_release_reason(session, "b-origination-ineligible");
+            cc_session_release_reason(session, "finalize-guard");
             return PJSUA_INVALID_ID;
         }
 
-        /* Check if caller is whitelisted — skip B-leg collect prompt */
-        PJ_LOG(3, (THIS_FILE,
-                   "[WHITELIST-CHECK] details='%s' len=%d",
-                   validation_result.details,
-                   (int)strlen(validation_result.details)));
-        if (validation_result.details[0] != '\0' &&
-            strcasestr(validation_result.details, "IS_WHITELISTED") != NULL)
+        if (cc_udp_validate_async(caller_msisdn, original_b, call_id,
+                                   initiate_source, time_str,
+                                   vasync_validation_cb, ctx) != 0)
         {
+            PJ_LOG(1, (THIS_FILE, "[ERROR] cc_udp_validate_async failed"));
+            cc_session_release_reason(session, "b-origination-validation");
+            free(ctx);
             CC_SESSION_LOCK(session);
-            session->whitelisted = 1;
+            session->torn_down = 1;
+            pjsua_call_id call_a = session->call_a;
             CC_SESSION_UNLOCK(session);
-            PJ_LOG(3, (THIS_FILE,
-                       "[WHITELIST] caller whitelisted; B-leg will bridge directly"));
-        }
-
-        {
-            cc_service_key_mode_t sk_mode = cc_cfg_service_key_mode();
-            const char *sk_mode_name = cc_cfg_service_key_mode_name();
-            const char *api_service_key = validation_result.service_key;
-            const char *placeholder = cc_cfg_service_key_placeholder();
-            char service_key[64];
-            int have_service_key = api_service_key[0] != '\0';
-            char keyed_user[128];
-            int keyed_len;
-
-            if (have_service_key) {
-                snprintf(service_key,
-                         sizeof(service_key),
-                         "%s",
-                         api_service_key);
-                PJ_LOG(3, (THIS_FILE,
-                           "[SERVICEKEY] source=api service_key=%s",
-                           service_key));
-            } else {
-                snprintf(service_key,
-                         sizeof(service_key),
-                         "%s",
-                         placeholder ? placeholder : "");
-                have_service_key = service_key[0] != '\0';
-                if (have_service_key) {
-                    PJ_LOG(3, (THIS_FILE,
-                               "[SERVICEKEY] source=placeholder service_key=%s reason=missing_in_eligible_response",
-                               service_key));
-                }
-            }
-
-            snprintf(arg->service_key,
-                     sizeof(arg->service_key),
-                     "%s",
-                     service_key);
-            snprintf(arg->service_key_mode,
-                     sizeof(arg->service_key_mode),
-                     "%s",
-                     sk_mode_name);
-            snprintf(arg->b_dial_number,
-                     sizeof(arg->b_dial_number),
-                     "%s",
-                     original_b);
-            snprintf(arg->b_from_user,
-                     sizeof(arg->b_from_user),
-                     "%s",
-                     session->caller_msisdn);
-
-            if (sk_mode != CC_SERVICE_KEY_MODE_DISABLED) {
-                if (have_service_key) {
-                    keyed_len = snprintf(keyed_user,
-                                         sizeof(keyed_user),
-                                         "%s%s",
-                                         service_key,
-                                         original_b);
-                    if (keyed_len < 0 ||
-                        (size_t)keyed_len >= sizeof(keyed_user))
-                    {
-                        keyed_user[0] = '\0';
-                        PJ_LOG(1, (THIS_FILE,
-                                   "[ERROR] serviceKey+B number too long; using sponsorMsisdn"));
-                    }
-
-                    if (keyed_user[0] != '\0') {
-                        snprintf(arg->b_from_user,
-                                 sizeof(arg->b_from_user),
-                                 "%s",
-                                 (sk_mode == CC_SERVICE_KEY_MODE_FROM_ONLY ||
-                                  sk_mode ==
-                                      CC_SERVICE_KEY_MODE_REQUEST_URI_AND_FROM)
-                                     ? keyed_user
-                                     : session->caller_msisdn);
-
-                        if (sk_mode ==
-                                CC_SERVICE_KEY_MODE_REQUEST_URI ||
-                            sk_mode ==
-                            CC_SERVICE_KEY_MODE_REQUEST_URI_AND_FROM)
-                        {
-                            snprintf(arg->b_dial_number,
-                                     sizeof(arg->b_dial_number),
-                                     "%s",
-                                     keyed_user);
-                        }
-                    }
-                } else {
-                    PJ_LOG(2, (THIS_FILE,
-                               "[B-LEG] service_key_mode=%s requested but service_key is empty; using sponsorMsisdn",
-                               sk_mode_name));
-                }
-            }
-
-            CC_SESSION_LOCK(session);
-            snprintf(session->service_key,
-                     sizeof(session->service_key),
-                     "%s",
-                     service_key);
-            snprintf(session->b_dial_number,
-                     sizeof(session->b_dial_number),
-                     "%s",
-                     arg->b_dial_number);
-            CC_SESSION_UNLOCK(session);
-
-            PJ_LOG(3, (THIS_FILE,
-                       "[B-LEG] service_key_mode=%s service_key=%s request_user=%s from_user=%s",
-                       sk_mode_name,
-                       have_service_key ? service_key : "<none>",
-                       arg->b_dial_number,
-                       arg->b_from_user));
-            PJ_LOG(3, (THIS_FILE,
-                       "[B-LEG] original_b_user=%s service_key=%s final_request_user=%s",
-                       original_b,
-                       have_service_key ? service_key : "<none>",
-                       arg->b_dial_number));
+            free(arg);
+            cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
+            if (call_a != PJSUA_INVALID_ID)
+                cc_safe_hangup(call_a, PJSIP_SC_SERVICE_UNAVAILABLE);
+            cc_session_acquire_reason(session, "finalize-guard");
+            cc_session_maybe_finalize(session);
+            cc_session_release_reason(session, "b-origination-ineligible");
+            cc_session_release_reason(session, "finalize-guard");
+            return PJSUA_INVALID_ID;
         }
     }
-
-    PJ_LOG(3, (THIS_FILE,
-               "A-leg confirmed; starting B-leg to %s",
-               arg->b_dial_number));
-
-    CC_SESSION_LOCK(session);
-    if (session->torn_down ||
-        session->call_a == PJSUA_INVALID_ID ||
-        session->final_cleanup_started)
-    {
-        CC_SESSION_UNLOCK(session);
-        PJ_LOG(3, (THIS_FILE,
-                   "[VALIDATION] call already torn down before B worker, skip B-leg"));
-        free(arg);
-        return PJSUA_INVALID_ID;
-    }
-    session->b_origination_pending = 1;
-    CC_SESSION_UNLOCK(session);
-
-    if (!cc_session_acquire_reason(session, "b-origination-worker")) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[ERROR] B-leg worker could not retain session"));
-        CC_SESSION_LOCK(session);
-        session->b_origination_pending = 0;
-        CC_SESSION_UNLOCK(session);
-        free(arg);
-        cc_session_maybe_finalize(session);
-        return PJSUA_INVALID_ID;
-    }
-
-    rc = pthread_create(&t, NULL, cc_originate_b_thread, arg);
-    if (rc != 0) {
-        PJ_LOG(1, (THIS_FILE, "[ERROR] B-leg pthread_create failed: %d", rc));
-        free(arg);
-        CC_SESSION_LOCK(session);
-        session->b_origination_pending = 0;
-        CC_SESSION_UNLOCK(session);
-        cc_session_release_reason(session, "b-origination-create-failed");
-
-        CC_SESSION_LOCK(session);
-        session->torn_down = 1;
-        pjsua_call_id call_a = session->call_a;
-        CC_SESSION_UNLOCK(session);
-
-        cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
-
-        if (call_a != PJSUA_INVALID_ID)
-            cc_safe_hangup(call_a, PJSIP_SC_SERVICE_UNAVAILABLE);
-        cc_session_maybe_finalize(session);
-        return PJSUA_INVALID_ID;
-    }
-
-    rc = pthread_detach(t);
-    if (rc != 0) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[ERROR] B-leg pthread_detach failed: %d", rc));
-    }
-
-    return PJSUA_INVALID_ID;
+    return PJSUA_INVALID_ID; /* result handled in vasync_validation_cb */
 }
 
-/* ── Originate B leg ─────────────────────────────────────────────────────── */
+/* ── Originate B leg ─────────────────────────────────────────────────────────────── */
 
 void *cc_originate_b_thread(void *arg_ptr)
 {
@@ -970,8 +996,6 @@ void *cc_originate_b_thread(void *arg_ptr)
         session->b_origination_pending = 0;
         CC_SESSION_UNLOCK(session);
         free(arg);
-        cc_session_maybe_finalize(session);
-        cc_session_release_reason(session, "b-origination-register-failed");
         return NULL;
     }
 
@@ -1022,8 +1046,6 @@ void *cc_originate_b_thread(void *arg_ptr)
         CC_SESSION_UNLOCK(session);
         cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
         leg_a_play_unavailable_then_hangup(session);
-        cc_session_maybe_finalize(session);
-        cc_session_release_reason(session, "b-origination-uri-failed");
         return NULL;
     }
 
@@ -1036,53 +1058,12 @@ void *cc_originate_b_thread(void *arg_ptr)
         CC_SESSION_UNLOCK(session);
         PJ_LOG(3, (THIS_FILE,
                    "[TIMER] skipped stale action: B-leg origination"));
-        cc_session_maybe_finalize(session);
-        cc_session_release_reason(session, "b-origination-stale");
         return NULL;
     }
     CC_SESSION_UNLOCK(session);
 
-    /* Wait for A's one-shot waiting prompt to finish before ringing B.
-     * This ensures B does not ring while A is still hearing the prompt. */
-    {
-        int prompt_ms;
-        CC_SESSION_LOCK(session);
-        prompt_ms = session->a_prompt_duration_ms;
-        CC_SESSION_UNLOCK(session);
-
-        if (prompt_ms > 0) {
-            int waited_ms = 0;
-            const int max_wait_ms = prompt_ms + 1000; /* cap: prompt + 1s slack */
-            PJ_LOG(3, (THIS_FILE,
-                       "[B-LEG] waiting %dms for A prompt to finish before originating B",
-                       prompt_ms));
-            while (waited_ms < max_wait_ms) {
-                int done;
-                cc_sleep_ms(50);
-                waited_ms += 50;
-                CC_SESSION_LOCK(session);
-                done = session->torn_down ||
-                       session->call_a == PJSUA_INVALID_ID ||
-                       session->final_cleanup_started;
-                CC_SESSION_UNLOCK(session);
-                if (done) {
-                    PJ_LOG(3, (THIS_FILE,
-                               "[B-LEG] A prompt wait aborted: call torn down"));
-                    CC_SESSION_LOCK(session);
-                    session->b_origination_pending = 0;
-                    CC_SESSION_UNLOCK(session);
-                    cc_session_maybe_finalize(session);
-                    cc_session_release_reason(session, "b-origination-stale");
-                    return NULL;
-                }
-                if (waited_ms >= prompt_ms)
-                    break;
-            }
-            PJ_LOG(3, (THIS_FILE,
-                       "[B-LEG] A prompt wait done after %dms; originating B",
-                       waited_ms));
-        }
-    }
+    /* A-prompt wait is now handled by cc_worker_post_delayed at the call site.
+     * Worker arrives here only after the prompt duration has elapsed. */
 
     /* Start MOH on A-leg while B is ringing — all callers.
      * Clear player_a first: 1.1.wav finished naturally (one-shot) so
@@ -1105,7 +1086,7 @@ void *cc_originate_b_thread(void *arg_ptr)
 
         if (call_a != PJSUA_INVALID_ID) {
             const char *moh_path = cc_prompt_get_path(CC_PROMPT_MOH);
-            pjsua_player_id moh_pid = cc_start_wav(call_a, moh_path, PJ_FALSE);
+            pjsua_player_id moh_pid = cc_start_wav(call_a, moh_path, PJ_TRUE);
             if (moh_pid != PJSUA_INVALID_ID) {
                 CC_SESSION_LOCK(session);
                 if (session->call_a == call_a &&
@@ -1114,6 +1095,7 @@ void *cc_originate_b_thread(void *arg_ptr)
                     session->player_a == PJSUA_INVALID_ID)
                 {
                     session->player_a = moh_pid;
+                    session->a_prompt_duration_ms = 0; /* looping — no deferral needed */
                     PJ_LOG(3, (THIS_FILE,
                                "[VOICE] MOH started on A-leg player=%d path=%s",
                                moh_pid, moh_path));
@@ -1171,7 +1153,6 @@ void *cc_originate_b_thread(void *arg_ptr)
     int pani_copied = 0;
     int pani_static = 0;
     int pai_copied = 0;
-    int p_early_media_added = 0;
 
     if (hdr_pool) {
         pj_list_init(&msg_data.hdr_list);
@@ -1228,10 +1209,7 @@ void *cc_originate_b_thread(void *arg_ptr)
 #endif
 
         /* P-Early-Media: Supported — required by IMS/SBC for early media */
-        p_early_media_added = cc_add_msg_header(hdr_pool,
-                                                &msg_data,
-                                                "P-Early-Media",
-                                                "Supported");
+        cc_add_msg_header(hdr_pool, &msg_data, "P-Early-Media", "Supported");
 
         /* Build PAI from caller MSISDN + local host (no '+' prefix per network spec) */
         {
@@ -1343,8 +1321,6 @@ void *cc_originate_b_thread(void *arg_ptr)
         CC_SESSION_UNLOCK(session);
         cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
         leg_a_play_unavailable_then_hangup(session);
-        cc_session_maybe_finalize(session);
-        cc_session_release_reason(session, "b-origination-failed");
         return NULL;
     }
 
@@ -1372,8 +1348,6 @@ void *cc_originate_b_thread(void *arg_ptr)
                 pjsua_call_set_user_data(call_b, NULL);
             if (pjsua_call_is_active(call_b))
                 cc_safe_hangup(call_b, PJSIP_SC_OK);
-            cc_session_maybe_finalize(session);
-            cc_session_release_reason(session, "b-origination-late-stale");
             return NULL;
         }
     }
@@ -1385,7 +1359,6 @@ void *cc_originate_b_thread(void *arg_ptr)
     leg_b_start_ring_timer(session);
 
     PJ_LOG(3, (THIS_FILE, "B leg call_id=%d started", call_b));
-    cc_session_release_reason(session, "b-origination-complete");
     return NULL;
 }
 
@@ -1524,55 +1497,10 @@ void cc_on_call_state(pjsua_call_id call_id, pjsip_event *e)
     }
 }
 
-typedef struct {
-    cc_session_t  *session;
-    pjsua_call_id  call_b;
-} update_b_retry_arg_t;
-
-static void *update_b_retry_thread(void *arg_ptr)
-{
-    update_b_retry_arg_t *arg = (update_b_retry_arg_t *)arg_ptr;
-    cc_session_t *session = arg->session;
-    pjsua_call_id call_b = arg->call_b;
-    pj_thread_desc desc;
-    pj_thread_t *this_thread = NULL;
-
-    free(arg);
-
-    pj_bzero(desc, sizeof(desc));
-    if (pj_thread_register("cc_upd_b_retry", desc, &this_thread) != PJ_SUCCESS) {
-        CC_SESSION_LOCK(session);
-        session->update_b_retry_pending = 0;
-        CC_SESSION_UNLOCK(session);
-        cc_session_release_reason(session, "update-b-retry-register-failed");
-        return NULL;
-    }
-
-    /* Wait up to 3s for the SBC's pending transaction to clear, then retry */
-    cc_sleep_ms(3000);
-
-    CC_SESSION_LOCK(session);
-    int skip = session->torn_down ||
-               session->media_bypassed ||
-               session->update_b_acked ||
-               session->call_b != call_b;
-    session->update_b_retry_pending = 0;
-    CC_SESSION_UNLOCK(session);
-
-    if (!skip) {
-        PJ_LOG(3, (THIS_FILE, "[BYPASS] retrying B-leg UPDATE after 491"));
-        leg_b_send_update_bypass(call_b, session);
-    }
-
-    cc_session_maybe_finalize(session);
-    cc_session_release_reason(session, "update-b-retry-complete");
-    return NULL;
-}
 
 static void spawn_update_b_retry(cc_session_t *session, pjsua_call_id call_b)
 {
-    update_b_retry_arg_t *arg;
-    pthread_t t;
+    cc_event_t ev;
 
     CC_SESSION_LOCK(session);
     if (session->update_b_retry_pending ||
@@ -1586,85 +1514,25 @@ static void spawn_update_b_retry(cc_session_t *session, pjsua_call_id call_b)
     session->update_b_retry_pending = 1;
     CC_SESSION_UNLOCK(session);
 
-    if (!cc_session_acquire_reason(session, "update-b-retry-worker")) {
-        CC_SESSION_LOCK(session);
-        session->update_b_retry_pending = 0;
-        CC_SESSION_UNLOCK(session);
-        return;
-    }
+    memset(&ev, 0, sizeof(ev));
+    ev.type    = CC_EV_UPDATE_B_RETRY;
+    ev.session = session;
+    ev.call_b  = call_b;
+    snprintf(ev.reason, sizeof(ev.reason), "update-b-retry-worker");
 
-    arg = malloc(sizeof(*arg));
-    if (!arg) {
+    if (cc_worker_post(&ev) != 0) {
         CC_SESSION_LOCK(session);
         session->update_b_retry_pending = 0;
         CC_SESSION_UNLOCK(session);
-        cc_session_release_reason(session, "update-b-retry-alloc-failed");
-        return;
     }
-    arg->session = session;
-    arg->call_b  = call_b;
-
-    if (pthread_create(&t, NULL, update_b_retry_thread, arg) != 0) {
-        free(arg);
-        CC_SESSION_LOCK(session);
-        session->update_b_retry_pending = 0;
-        CC_SESSION_UNLOCK(session);
-        cc_session_release_reason(session, "update-b-retry-create-failed");
-        return;
-    }
-    pthread_detach(t);
 }
 
 /* ── A-leg UPDATE 491 retry ──────────────────────────────────────────────── */
 
-typedef struct {
-    cc_session_t  *session;
-    pjsua_call_id  call_a;
-} update_a_retry_arg_t;
-
-static void *update_a_retry_thread(void *arg_ptr)
-{
-    update_a_retry_arg_t *arg = (update_a_retry_arg_t *)arg_ptr;
-    cc_session_t *session = arg->session;
-    pjsua_call_id call_a = arg->call_a;
-    pj_thread_desc desc;
-    pj_thread_t *this_thread = NULL;
-
-    free(arg);
-
-    pj_bzero(desc, sizeof(desc));
-    if (pj_thread_register("cc_upd_a_retry", desc, &this_thread) != PJ_SUCCESS) {
-        CC_SESSION_LOCK(session);
-        session->update_a_retry_pending = 0;
-        CC_SESSION_UNLOCK(session);
-        cc_session_release_reason(session, "update-a-retry-register-failed");
-        return NULL;
-    }
-
-    cc_sleep_ms(3000);
-
-    CC_SESSION_LOCK(session);
-    int skip = session->torn_down ||
-               session->media_bypassed ||
-               session->update_a_acked ||
-               session->call_a != call_a;
-    session->update_a_retry_pending = 0;
-    CC_SESSION_UNLOCK(session);
-
-    if (!skip) {
-        PJ_LOG(3, (THIS_FILE, "[BYPASS] retrying A-leg UPDATE after 491"));
-        leg_a_send_update_bypass(call_a, session);
-    }
-
-    cc_session_maybe_finalize(session);
-    cc_session_release_reason(session, "update-a-retry-complete");
-    return NULL;
-}
 
 static void spawn_update_a_retry(cc_session_t *session, pjsua_call_id call_a)
 {
-    update_a_retry_arg_t *arg;
-    pthread_t t;
+    cc_event_t ev;
 
     CC_SESSION_LOCK(session);
     if (session->update_a_retry_pending ||
@@ -1678,33 +1546,17 @@ static void spawn_update_a_retry(cc_session_t *session, pjsua_call_id call_a)
     session->update_a_retry_pending = 1;
     CC_SESSION_UNLOCK(session);
 
-    if (!cc_session_acquire_reason(session, "update-a-retry-worker")) {
-        CC_SESSION_LOCK(session);
-        session->update_a_retry_pending = 0;
-        CC_SESSION_UNLOCK(session);
-        return;
-    }
+    memset(&ev, 0, sizeof(ev));
+    ev.type    = CC_EV_UPDATE_A_RETRY;
+    ev.session = session;
+    ev.call_a  = call_a;
+    snprintf(ev.reason, sizeof(ev.reason), "update-a-retry-worker");
 
-    arg = malloc(sizeof(*arg));
-    if (!arg) {
+    if (cc_worker_post(&ev) != 0) {
         CC_SESSION_LOCK(session);
         session->update_a_retry_pending = 0;
         CC_SESSION_UNLOCK(session);
-        cc_session_release_reason(session, "update-a-retry-alloc-failed");
-        return;
     }
-    arg->session = session;
-    arg->call_a  = call_a;
-
-    if (pthread_create(&t, NULL, update_a_retry_thread, arg) != 0) {
-        free(arg);
-        CC_SESSION_LOCK(session);
-        session->update_a_retry_pending = 0;
-        CC_SESSION_UNLOCK(session);
-        cc_session_release_reason(session, "update-a-retry-create-failed");
-        return;
-    }
-    pthread_detach(t);
 }
 
 /* ── UPDATE 200 OK timeout watchdog ─────────────────────────────────────── */
@@ -1717,93 +1569,12 @@ static void spawn_update_a_retry(cc_session_t *session, pjsua_call_id call_a)
 #define CC_UPDATE_ACK_TIMEOUT_MS  8000
 #define CC_UPDATE_ACK_POLL_MS       100
 
-typedef struct {
-    cc_session_t  *session;
-    pjsua_call_id  call_a;
-    pjsua_call_id  call_b;
-} update_ack_watchdog_arg_t;
-
-static void *update_ack_watchdog_thread(void *arg_ptr)
-{
-    update_ack_watchdog_arg_t *arg = (update_ack_watchdog_arg_t *)arg_ptr;
-    cc_session_t  *session = arg->session;
-    pjsua_call_id  call_a  = arg->call_a;
-    pjsua_call_id  call_b  = arg->call_b;
-    pj_thread_desc desc;
-    pj_thread_t   *th = NULL;
-    int waited_ms = 0;
-
-    free(arg);
-    pj_bzero(desc, sizeof(desc));
-    pj_thread_register("cc_upd_ack_wd", desc, &th);
-
-    while (waited_ms < CC_UPDATE_ACK_TIMEOUT_MS) {
-        int done, torn;
-        CC_SESSION_LOCK(session);
-        done = session->media_bypassed ||
-               session->torn_down ||
-               session->call_a != call_a ||
-               session->call_b != call_b;
-        torn = session->torn_down ||
-               session->call_a != call_a ||
-               session->call_b != call_b;
-        CC_SESSION_UNLOCK(session);
-
-        if (torn) goto done; /* call ended — no action needed */
-        if (done) goto done; /* bypass completed normally */
-
-        cc_sleep_ms(CC_UPDATE_ACK_POLL_MS);
-        waited_ms += CC_UPDATE_ACK_POLL_MS;
-    }
-
-    /* Timeout — check if bypass still incomplete */
-    {
-        int need_fallback = 0;
-        CC_SESSION_LOCK(session);
-        if (!session->media_bypassed &&
-            !session->torn_down &&
-            session->accepted &&
-            session->call_a == call_a &&
-            session->call_b == call_b)
-        {
-            int a_ok = session->update_a_acked;
-            int b_ok = session->update_b_acked;
-            PJ_LOG(2, (THIS_FILE,
-                       "[UPDATE-WD] UPDATE 200 OK timeout after %dms "
-                       "(a_acked=%d b_acked=%d) — falling back to local bridge",
-                       CC_UPDATE_ACK_TIMEOUT_MS, a_ok, b_ok));
-            /* Reset all bypass state so hold/resume works via local_bridge path */
-            session->update_a_sent          = 0;
-            session->update_b_sent          = 0;
-            session->update_a_acked         = 0;
-            session->update_b_acked         = 0;
-            session->update_a_pending       = 0;
-            session->update_b_pending       = 0;
-            session->update_a_retry_pending = 0;
-            session->update_b_retry_pending = 0;
-            need_fallback = 1;
-        }
-        CC_SESSION_UNLOCK(session);
-
-        if (need_fallback)
-            cc_bridge_calls(call_a, call_b);
-    }
-
-done:
-    CC_SESSION_LOCK(session);
-    session->update_ack_watchdog_started = 0;
-    CC_SESSION_UNLOCK(session);
-    cc_session_maybe_finalize(session);
-    cc_session_release_reason(session, "update-ack-watchdog-complete");
-    return NULL;
-}
 
 static void spawn_update_ack_watchdog(cc_session_t *session,
                                       pjsua_call_id call_a,
                                       pjsua_call_id call_b)
 {
-    update_ack_watchdog_arg_t *arg;
-    pthread_t t;
+    cc_event_t ev;
 
     CC_SESSION_LOCK(session);
     if (session->update_ack_watchdog_started || session->torn_down) {
@@ -1813,36 +1584,21 @@ static void spawn_update_ack_watchdog(cc_session_t *session,
     session->update_ack_watchdog_started = 1;
     CC_SESSION_UNLOCK(session);
 
-    if (!cc_session_acquire_reason(session, "update-ack-watchdog-worker")) {
-        CC_SESSION_LOCK(session);
-        session->update_ack_watchdog_started = 0;
-        CC_SESSION_UNLOCK(session);
-        return;
-    }
+    memset(&ev, 0, sizeof(ev));
+    ev.type    = CC_EV_UPDATE_ACK_WATCHDOG;
+    ev.session = session;
+    ev.call_a  = call_a;
+    ev.call_b  = call_b;
+    snprintf(ev.reason, sizeof(ev.reason), "update-ack-watchdog-worker");
 
-    arg = malloc(sizeof(*arg));
-    if (!arg) {
+    if (cc_worker_post(&ev) != 0) {
         CC_SESSION_LOCK(session);
         session->update_ack_watchdog_started = 0;
         CC_SESSION_UNLOCK(session);
-        cc_session_release_reason(session, "update-ack-watchdog-alloc-failed");
         return;
     }
-    arg->session = session;
-    arg->call_a  = call_a;
-    arg->call_b  = call_b;
-
-    if (pthread_create(&t, NULL, update_ack_watchdog_thread, arg) != 0) {
-        free(arg);
-        CC_SESSION_LOCK(session);
-        session->update_ack_watchdog_started = 0;
-        CC_SESSION_UNLOCK(session);
-        cc_session_release_reason(session, "update-ack-watchdog-create-failed");
-        return;
-    }
-    pthread_detach(t);
     PJ_LOG(3, (THIS_FILE,
-               "[UPDATE-WD] watchdog started — fallback to bridge if no 200 OK in %dms",
+               "[UPDATE-WD] watchdog posted — fallback to bridge if no 200 OK in %dms",
                CC_UPDATE_ACK_TIMEOUT_MS));
 }
 

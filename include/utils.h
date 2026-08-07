@@ -1,6 +1,7 @@
 #ifndef CC_UTILS_H
 #define CC_UTILS_H
 
+#include <pthread.h>
 #include <pjsua-lib/pjsua.h>
 #include <pjmedia/sdp.h>
 #include "session.h"
@@ -227,5 +228,13 @@ pj_status_t cc_safe_hangup(pjsua_call_id call_id, pjsip_status_code code);
 
 /** Portable millisecond sleep. */
 void cc_sleep_ms(int ms);
+
+/**
+ * pthread_create wrapper that sets a reduced stack size (128 KB).
+ * All per-call threads use this to keep memory footprint manageable
+ * at high session counts. 128 KB gives ~9x headroom over measured
+ * peak stack usage (~14 KB) across all thread functions.
+ */
+int cc_pthread_create(pthread_t *t, void *(*fn)(void *), void *arg);
 
 #endif /* CC_UTILS_H */

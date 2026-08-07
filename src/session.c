@@ -79,7 +79,13 @@ cc_session_t *cc_session_create(pj_pool_factory *pf)
     s->reinvite_a_pending = 0;
     s->reinvite_b_pending = 0;
 
-    if (pthread_mutex_init(&s->lock, NULL) != 0) {
+    s->lock = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
+    if (!s->lock) {
+        pj_pool_release(pool);
+        return NULL;
+    }
+    if (pthread_mutex_init(s->lock, NULL) != 0) {
+        free(s->lock);
         pj_pool_release(pool);
         return NULL;
     }
@@ -91,10 +97,13 @@ cc_session_t *cc_session_create(pj_pool_factory *pf)
 
 void cc_session_destroy(cc_session_t *s)
 {
+    pthread_mutex_t *lock;
     if (!s) return;
     PJ_LOG(3, ("session", "[SESSION] destroyed session=%p", s));
-    pthread_mutex_destroy(&s->lock);
+    lock = s->lock;
     pj_pool_release(s->pool);   /* frees s itself (pool-allocated) */
+    pthread_mutex_destroy(lock);
+    free(lock);
 }
 
 int cc_session_acquire(cc_session_t *s)
@@ -136,20 +145,32 @@ void cc_session_release_reason(cc_session_t *s, const char *reason)
 {
     int destroy = 0;
     unsigned refs = 0;
+    pthread_mutex_t *lock;
 
     if (!s)
         return;
 
-    CC_SESSION_LOCK(s);
+    /* s->lock is pool-allocated and freed by pj_pool_release inside
+     * cc_session_destroy.  Read it into a local BEFORE locking so that
+     * if another thread already destroyed the session the heap mutex
+     * pointer itself (malloc'd separately) is still valid to lock.
+     * All fields of s (including ref_count) are only touched while the
+     * mutex is held, so once we hold it we know whether s is still live
+     * by checking ref_count > 0. */
+    lock = s->lock;
+    if (!lock)
+        return;
+
+    pthread_mutex_lock(lock);
     if (s->ref_count == 0) {
-        PJ_LOG(1, ("session",
-                   "[ERROR] session=%p release with zero references", s));
-    } else {
-        s->ref_count--;
-        refs = s->ref_count;
-        destroy = (s->ref_count == 0);
+        /* Session already destroyed by another thread — nothing to do. */
+        pthread_mutex_unlock(lock);
+        return;
     }
-    CC_SESSION_UNLOCK(s);
+    s->ref_count--;
+    refs    = s->ref_count;
+    destroy = (refs == 0);
+    pthread_mutex_unlock(lock);
 
     PJ_LOG(4, ("session",
                "[SESSION] release reason=%s session=%p refs=%u",
@@ -171,7 +192,11 @@ void cc_session_maybe_finalize(cc_session_t *s)
     if (!s->final_cleanup_started &&
         s->call_a == PJSUA_INVALID_ID &&
         s->call_b == PJSUA_INVALID_ID &&
-        !s->b_origination_pending)
+        !s->b_origination_pending &&
+        !s->accept_transition_pending &&
+        !s->a_treatment_running &&
+        !s->ring_timer_started &&
+        !s->dtmf_timer_started)
     {
         s->final_cleanup_started = 1;
         refs = s->ref_count;

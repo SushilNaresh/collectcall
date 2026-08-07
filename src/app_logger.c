@@ -192,11 +192,14 @@ void cc_app_logger_writer(int level, const char *data, int len)
     if (!data || len <= 0)
         return;
 
+    int needs_nl = (data[len - 1] != '\n');
+
     pthread_mutex_lock(&g_log_lock);
 
 #if CC_APP_LOG_ENABLE
     if (g_log_file) {
         fwrite(data, 1, (size_t)len, g_log_file);
+        if (needs_nl) fputc('\n', g_log_file);
 #if CC_APP_LOG_FLUSH_ALWAYS
         fflush(g_log_file);
 #endif
@@ -205,6 +208,7 @@ void cc_app_logger_writer(int level, const char *data, int len)
 
 #if CC_APP_LOG_TO_CONSOLE
     fwrite(data, 1, (size_t)len, stdout);
+    if (needs_nl) fputc('\n', stdout);
 #if CC_APP_LOG_FLUSH_ALWAYS
     fflush(stdout);
 #endif

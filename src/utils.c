@@ -1,10 +1,14 @@
 /*
  * utils.c — SDP, SIP header, URI and media helpers
+ * RTP bypass watchdog posted to worker pool.
  */
 #include "utils.h"
 #include "config.h"
+#include <pthread.h>
+#include <limits.h>
 #include "api_mapping.h"
 #include "runtime_config.h"
+#include "worker.h"
 
 #include <pjsua-lib/pjsua.h>
 #include <pjmedia/sdp.h>
@@ -1030,6 +1034,23 @@ pjsua_player_id cc_start_wav(pjsua_call_id call_id,
     if (!loop)
         flags |= PJMEDIA_FILE_NO_LOOP;
 
+    /* Validate call state before touching PJSUA player machinery */
+    status = pjsua_call_get_info(call_id, &ci);
+    if (status != PJ_SUCCESS ||
+        ci.state < PJSIP_INV_STATE_EARLY ||
+        ci.state >= PJSIP_INV_STATE_DISCONNECTED ||
+        ci.media_cnt == 0 ||
+        ci.media[0].status != PJSUA_CALL_MEDIA_ACTIVE)
+    {
+        PJ_LOG(2, (THIS_FILE,
+                   "[VOICE] cc_start_wav: call %d not ready (state=%d media=%d) — skip",
+                   call_id,
+                   status == PJ_SUCCESS ? (int)ci.state : -1,
+                   status == PJ_SUCCESS && ci.media_cnt > 0
+                       ? (int)ci.media[0].status : -1));
+        return PJSUA_INVALID_ID;
+    }
+
     path = pj_str((char *)wav_path);
     status = pjsua_player_create(&path, flags, &player_id);
     if (status != PJ_SUCCESS) {
@@ -1038,10 +1059,9 @@ pjsua_player_id cc_start_wav(pjsua_call_id call_id,
         return PJSUA_INVALID_ID;
     }
 
-    /* Connect player to call's conference port */
-    status = pjsua_call_get_info(call_id, &ci);
-    if (status == PJ_SUCCESS && ci.media_cnt > 0 &&
-        ci.media[0].status == PJSUA_CALL_MEDIA_ACTIVE) {
+    /* Connect player to call's conference port — re-use ci from above */
+    if (ci.media_cnt > 0 && ci.media[0].status == PJSUA_CALL_MEDIA_ACTIVE &&
+        ci.media[0].stream.aud.conf_slot >= 0) {
         pjsua_conf_port_id player_port = pjsua_player_get_conf_port(player_id);
         status = pjsua_conf_connect(player_port,
                                     ci.media[0].stream.aud.conf_slot);
@@ -1063,17 +1083,7 @@ pjsua_player_id cc_start_wav(pjsua_call_id call_id,
     } else {
         PJ_LOG(2, (THIS_FILE, "Call %d media not active — player not connected",
                    call_id));
-    }
-
-    if (status != PJ_SUCCESS || ci.media_cnt == 0 ||
-        ci.media[0].status != PJSUA_CALL_MEDIA_ACTIVE)
-    {
-        status = pjsua_player_destroy(player_id);
-        if (status != PJ_SUCCESS) {
-            PJ_LOG(1, (THIS_FILE,
-                       "[VOICE] failed destroying unconnected player=%d status=%d",
-                       player_id, status));
-        }
+        pjsua_player_destroy(player_id);
         return PJSUA_INVALID_ID;
     }
 
@@ -1082,23 +1092,21 @@ pjsua_player_id cc_start_wav(pjsua_call_id call_id,
 
 void cc_stop_wav(pjsua_player_id player_id, pjsua_call_id call_id)
 {
-    pjsua_call_info ci;
     pj_status_t status;
+    (void)call_id;  /* pjsua_player_destroy handles conf disconnect internally */
+
     if (player_id == PJSUA_INVALID_ID) return;
 
-    /* Disconnect from call's conference port */
-    if (call_id != PJSUA_INVALID_ID &&
-        pjsua_call_get_info(call_id, &ci) == PJ_SUCCESS &&
-        ci.media_cnt > 0) {
-        pjsua_conf_port_id pp = pjsua_player_get_conf_port(player_id);
-        status = pjsua_conf_disconnect(pp, ci.media[0].stream.aud.conf_slot);
-        if (status != PJ_SUCCESS) {
-            PJ_LOG(2, (THIS_FILE,
-                       "[VOICE] player disconnect failed player=%d call=%d status=%d",
-                       player_id, call_id, status));
-        }
-    }
-
+    /* pjsua_player_destroy internally calls pjmedia_conf_remove_port which
+     * disconnects all connections. Do NOT call pjsua_conf_disconnect first —
+     * that zeroes transmitter_cnt and causes op_disconnect_ports to assert
+     * when pjmedia_conf_remove_port tries to disconnect the same connection.
+     *
+     * Do NOT guard on pjsua_player_get_conf_port() == PJSUA_INVALID_ID:
+     * a conf port of INVALID_ID means the port was already removed from the
+     * conference (e.g. call ended), but the player object still exists and
+     * still occupies a slot in the player pool. Skipping destroy here leaks
+     * the slot and eventually exhausts the pool (pjsua_player_create asserts). */
     status = pjsua_player_destroy(player_id);
     if (status == PJ_SUCCESS) {
         PJ_LOG(4, (THIS_FILE, "WAV player %d destroyed", player_id));
@@ -1306,165 +1314,36 @@ void cc_silence_call(pjsua_call_id call_id)
 #define CC_BYPASS_RTP_WATCHDOG_MS  2500
 #define CC_BYPASS_RTP_POLL_MS        50
 
-typedef struct {
-    cc_session_t  *session;
-    pjsua_call_id  call_a;
-    pjsua_call_id  call_b;
-} bypass_watchdog_arg_t;
-
-static void *cc_bypass_rtp_watchdog_thread(void *opaque)
-{
-    bypass_watchdog_arg_t *arg = (bypass_watchdog_arg_t *)opaque;
-    cc_session_t  *session = arg->session;
-    pjsua_call_id  call_a  = arg->call_a;
-    pjsua_call_id  call_b  = arg->call_b;
-    pj_thread_desc desc;
-    pj_thread_t   *th = NULL;
-    int waited_ms = 0;
-    int rtp_ok = 0;
-
-    free(arg);
-    pj_bzero(desc, sizeof(desc));
-    pj_thread_register("cc_bypass_wd", desc, &th);
-
-    while (waited_ms < CC_BYPASS_RTP_WATCHDOG_MS) {
-        cc_rtp_ep_t ep_a, ep_b;
-        int torn;
-
-        CC_SESSION_LOCK(session);
-        torn = session->torn_down ||
-               session->call_a != call_a ||
-               session->call_b != call_b;
-        CC_SESSION_UNLOCK(session);
-        if (torn) {
-            rtp_ok = 1; /* call ended — no fallback needed */
-            break;
-        }
-
-        /* Check if either leg is receiving RTP from the peer MGW.
-         * src_rtp_name is updated live by PJSUA as packets arrive. */
-        if (cc_get_call_remote_rtp(call_a, &ep_a) == PJ_SUCCESS &&
-            ep_a.port != 0 &&
-            cc_get_call_remote_rtp(call_b, &ep_b) == PJ_SUCCESS &&
-            ep_b.port != 0)
-        {
-            /* Both legs still have their pre-bypass MGW endpoints.
-             * We need to detect NEW packets arriving after bypass.
-             * Strategy: compare against the endpoints we redirected to.
-             * After bypass, A should receive from B's MGW and vice versa.
-             * If src_rtp still shows the old B2BUA-side source, no direct
-             * RTP has arrived yet. We simply wait for any packet activity
-             * — if src_rtp_name stops updating (no new packets), PJSUA
-             * keeps the last seen value. So we poll for a non-zero port
-             * on both legs after the silence, which is always true.
-             * Instead, check packet counts via stream stats. */
-            pjsua_stream_stat stat_a, stat_b;
-            if (pjsua_call_get_stream_stat(call_a, 0, &stat_a) == PJ_SUCCESS &&
-                pjsua_call_get_stream_stat(call_b, 0, &stat_b) == PJ_SUCCESS)
-            {
-                /* rx.pkt counts all received RTP packets on each leg.
-                 * After bypass, if MGWs talk directly the count keeps rising.
-                 * We snapshot at entry and check if it grew. */
-                static unsigned long pkt_a_start = 0, pkt_b_start = 0;
-                static int snapped = 0;
-                if (!snapped) {
-                    pkt_a_start = stat_a.rtcp.rx.pkt;
-                    pkt_b_start = stat_b.rtcp.rx.pkt;
-                    snapped = 1;
-                } else if (stat_a.rtcp.rx.pkt > pkt_a_start + 2 &&
-                           stat_b.rtcp.rx.pkt > pkt_b_start + 2)
-                {
-                    PJ_LOG(3, (THIS_FILE,
-                               "[BYPASS-WD] RTP flowing on both legs after bypass — OK"));
-                    rtp_ok = 1;
-                    break;
-                }
-            }
-        }
-
-        cc_sleep_ms(CC_BYPASS_RTP_POLL_MS);
-        waited_ms += CC_BYPASS_RTP_POLL_MS;
-    }
-
-    if (!rtp_ok) {
-        int do_fallback = 0;
-        CC_SESSION_LOCK(session);
-        if (!session->torn_down &&
-            session->accepted &&
-            session->media_bypassed &&
-            session->call_a == call_a &&
-            session->call_b == call_b)
-        {
-            /* Reset bypass flags so hold/resume logic still works */
-            session->media_bypassed   = 0;
-            session->update_a_sent    = 0;
-            session->update_b_sent    = 0;
-            session->update_a_acked   = 0;
-            session->update_b_acked   = 0;
-            do_fallback = 1;
-        }
-        CC_SESSION_UNLOCK(session);
-
-        if (do_fallback) {
-            PJ_LOG(2, (THIS_FILE,
-                       "[BYPASS-WD] no direct RTP after %dms — falling back to local bridge",
-                       CC_BYPASS_RTP_WATCHDOG_MS));
-            cc_bridge_calls(call_a, call_b);
-        }
-    }
-
-    cc_session_maybe_finalize(session);
-    cc_session_release_reason(session, "bypass-watchdog-complete");
-    return NULL;
-}
 
 void cc_spawn_bypass_rtp_watchdog(cc_session_t *session,
                                    pjsua_call_id call_a,
                                    pjsua_call_id call_b)
 {
-    bypass_watchdog_arg_t *arg;
-    pthread_t t;
+    cc_event_t ev;
 
     CC_SESSION_LOCK(session);
-    if (session->bypass_rtp_watchdog_started ||
-        session->torn_down)
-    {
+    if (session->bypass_rtp_watchdog_started || session->torn_down) {
         CC_SESSION_UNLOCK(session);
         return;
     }
     session->bypass_rtp_watchdog_started = 1;
     CC_SESSION_UNLOCK(session);
 
-    if (!cc_session_acquire_reason(session, "bypass-watchdog-worker")) {
-        CC_SESSION_LOCK(session);
-        session->bypass_rtp_watchdog_started = 0;
-        CC_SESSION_UNLOCK(session);
-        return;
-    }
+    memset(&ev, 0, sizeof(ev));
+    ev.type    = CC_EV_BYPASS_RTP_WATCHDOG;
+    ev.session = session;
+    ev.call_a  = call_a;
+    ev.call_b  = call_b;
+    snprintf(ev.reason, sizeof(ev.reason), "bypass-watchdog-worker");
 
-    arg = malloc(sizeof(*arg));
-    if (!arg) {
-        cc_session_release_reason(session, "bypass-watchdog-alloc-failed");
+    if (cc_worker_post(&ev) != 0) {
         CC_SESSION_LOCK(session);
         session->bypass_rtp_watchdog_started = 0;
         CC_SESSION_UNLOCK(session);
         return;
     }
-    arg->session = session;
-    arg->call_a  = call_a;
-    arg->call_b  = call_b;
-
-    if (pthread_create(&t, NULL, cc_bypass_rtp_watchdog_thread, arg) != 0) {
-        free(arg);
-        cc_session_release_reason(session, "bypass-watchdog-create-failed");
-        CC_SESSION_LOCK(session);
-        session->bypass_rtp_watchdog_started = 0;
-        CC_SESSION_UNLOCK(session);
-        return;
-    }
-    pthread_detach(t);
     PJ_LOG(3, (THIS_FILE,
-               "[BYPASS-WD] watchdog started — will fallback to bridge if no direct RTP in %dms",
+               "[BYPASS-WD] watchdog posted — fallback to bridge if no direct RTP in %dms",
                CC_BYPASS_RTP_WATCHDOG_MS));
 }
 
@@ -1598,4 +1477,17 @@ void cc_sleep_ms(int ms)
     ts.tv_sec  = ms / 1000;
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
+}
+
+int cc_pthread_create(pthread_t *t, void *(*fn)(void *), void *arg)
+{
+    pthread_attr_t attr;
+    size_t stack = 128 * 1024;
+    if (stack < (size_t)PTHREAD_STACK_MIN)
+        stack = (size_t)PTHREAD_STACK_MIN;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, stack);
+    int rc = pthread_create(t, &attr, fn, arg);
+    pthread_attr_destroy(&attr);
+    return rc;
 }

@@ -366,3 +366,72 @@ const char *cc_cfg_b_number_prefixes(void)
     const char *value = env_nonempty("CC_B_NUMBER_PREFIXES");
     return value ? value : "0,234,313";
 }
+
+int cc_cfg_rtp_port_start(void)
+{
+    const char *value = env_nonempty("CC_RTP_PORT_START");
+    char *end = NULL;
+    long parsed;
+
+    if (!value)
+        return CC_RTP_PORT_START;
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 1024 || parsed > 65000)
+        return CC_RTP_PORT_START;
+
+    return (int)parsed;
+}
+
+int cc_cfg_rtp_port_count(void)
+{
+    const char *value = env_nonempty("CC_RTP_PORT_COUNT");
+    char *end = NULL;
+    long parsed;
+
+    if (!value)
+        return CC_RTP_PORT_COUNT;
+
+    parsed = strtol(value, &end, 10);
+    /* must be even (RTP+RTCP pairs), at least 2, at most 49000 */
+    if (end == value || *end != '\0' || parsed < 2 || parsed > 49000)
+        return CC_RTP_PORT_COUNT;
+
+    /* round down to even so every port has an RTCP partner */
+    if (parsed % 2 != 0)
+        parsed--;
+
+    return (int)parsed;
+}
+
+int cc_cfg_max_calls(void)
+{
+    const char *value = env_nonempty("CC_MAX_CALLS");
+    char *end = NULL;
+    long parsed;
+
+    if (!value)
+        return CC_MAX_CALLS;
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 2 || parsed > PJSUA_MAX_CALLS)
+        return CC_MAX_CALLS;
+
+    return (int)parsed;
+}
+
+int cc_cfg_log_level(void)
+{
+    const char *value = env_nonempty("CC_LOG_LEVEL");
+    char *end = NULL;
+    long parsed;
+
+    if (!value)
+        return CC_LOG_LEVEL;
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 0 || parsed > 6)
+        return CC_LOG_LEVEL;
+
+    return (int)parsed;
+}

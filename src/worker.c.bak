@@ -1,0 +1,889 @@
+/*
+ * worker.c — Fixed worker thread pool replacing all per-call pthreads
+ *
+ * CC_WORKER_POOL_SIZE (8) worker threads share a single MPSC ring queue
+ * of CC_WORKER_QUEUE_SIZE (4096) slots. Each slot holds a cc_event_t.
+ *
+ * All blocking work that previously ran in dedicated per-call threads
+ * (sleep loops, RTP polls, WAV waits, timer countdowns) now runs inside
+ * a worker thread from this pool. PJSUA callbacks post events and return
+ * immediately — they never block.
+ *
+ * Thread count: fixed 8 regardless of session count.
+ * Previously: up to 11 threads × 4096 sessions = 45,056 threads.
+ *
+ * Events processed here (one per former pthread):
+ *   CC_EV_ORIGINATE_B          — was cc_originate_b_thread
+ *   CC_EV_WAV_HANGUP_A         — was wav_then_hangup_thread
+ *   CC_EV_MCA_WAIT             — was mca_wait_thread
+ *   CC_EV_B_PROMPT_START       — was cc_b_prompt_start_thread
+ *   CC_EV_B_PROMPT_DONE        — was cc_b_prompt_done_thread
+ *   CC_EV_ACCEPT_TRANSITION    — was accept_transition_thread
+ *   CC_EV_RING_TIMER           — was timer_thread (is_ring=1)
+ *   CC_EV_DTMF_TIMER           — was timer_thread (is_ring=0)
+ *   CC_EV_UPDATE_A_RETRY       — was update_a_retry_thread
+ *   CC_EV_UPDATE_B_RETRY       — was update_b_retry_thread
+ *   CC_EV_UPDATE_ACK_WATCHDOG  — was update_ack_watchdog_thread
+ *   CC_EV_BYPASS_RTP_WATCHDOG  — was cc_bypass_rtp_watchdog_thread
+ *   CC_EV_VASYNC_CB             — async validation callback from dispatcher
+ */
+
+#include "worker.h"
+#include "handlers.h"
+#include "b2bua.h"
+#include "utils.h"
+#include "config.h"
+#include "prompt_mapping.h"
+#include "runtime_config.h"
+#include "validation_async.h"
+
+#include <pjsua-lib/pjsua.h>
+#include <pj/log.h>
+
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <stdio.h>
+
+#define THIS_FILE "worker.c"
+
+/* ── MPSC ring queue ─────────────────────────────────────────────────────── */
+/*
+ * Multiple producers (PJSUA callback threads) write to the ring.
+ * Multiple consumers (worker threads) read from it.
+ * Each slot has an atomic sequence number for lock-free coordination.
+ */
+
+typedef struct {
+    cc_event_t          ev;
+    _Atomic unsigned    seq;   /* sequence number for this slot */
+} cc_ring_slot_t;
+
+typedef struct {
+    cc_ring_slot_t      slots[CC_WORKER_QUEUE_SIZE];
+    _Atomic unsigned    head;  /* next slot to write (producers) */
+    _Atomic unsigned    tail;  /* next slot to read  (consumers) */
+    char                _pad[64];
+} cc_ring_t;
+
+static cc_ring_t g_ring;
+
+static void ring_init(void)
+{
+    unsigned i;
+    memset(&g_ring, 0, sizeof(g_ring));
+    for (i = 0; i < CC_WORKER_QUEUE_SIZE; i++)
+        atomic_store_explicit(&g_ring.slots[i].seq, i, memory_order_relaxed);
+    atomic_store_explicit(&g_ring.head, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_ring.tail, 0, memory_order_relaxed);
+}
+
+/* Returns 0 on success, -1 if queue full */
+static int ring_push(const cc_event_t *ev)
+{
+    unsigned head, seq;
+    cc_ring_slot_t *slot;
+
+    for (;;) {
+        head = atomic_load_explicit(&g_ring.head, memory_order_relaxed);
+        slot = &g_ring.slots[head & (CC_WORKER_QUEUE_SIZE - 1)];
+        seq  = atomic_load_explicit(&slot->seq, memory_order_acquire);
+
+        if (seq == head) {
+            if (atomic_compare_exchange_weak_explicit(
+                    &g_ring.head, &head, head + 1,
+                    memory_order_relaxed, memory_order_relaxed))
+            {
+                slot->ev = *ev;
+                atomic_store_explicit(&slot->seq, head + 1,
+                                      memory_order_release);
+                return 0;
+            }
+        } else if ((int)(seq - head) < 0) {
+            return -1; /* queue full */
+        }
+        /* another producer won the CAS — retry */
+    }
+}
+
+/* Returns 1 if an event was popped, 0 if queue empty */
+static int ring_pop(cc_event_t *ev)
+{
+    unsigned tail, seq;
+    cc_ring_slot_t *slot;
+
+    for (;;) {
+        tail = atomic_load_explicit(&g_ring.tail, memory_order_relaxed);
+        slot = &g_ring.slots[tail & (CC_WORKER_QUEUE_SIZE - 1)];
+        seq  = atomic_load_explicit(&slot->seq, memory_order_acquire);
+
+        if (seq == tail + 1) {
+            if (atomic_compare_exchange_weak_explicit(
+                    &g_ring.tail, &tail, tail + 1,
+                    memory_order_relaxed, memory_order_relaxed))
+            {
+                *ev = slot->ev;
+                atomic_store_explicit(&slot->seq,
+                                      tail + CC_WORKER_QUEUE_SIZE,
+                                      memory_order_release);
+                return 1;
+            }
+        } else if (seq == tail) {
+            return 0; /* queue empty */
+        }
+        /* another consumer won the CAS — retry */
+    }
+}
+
+/* ── Worker pool ─────────────────────────────────────────────────────────── */
+
+static pthread_t        g_workers[CC_WORKER_POOL_SIZE];
+static volatile int     g_running = 0;
+
+/* forward declaration */
+static void process_event(cc_event_t *ev);
+
+static void *worker_thread(void *arg)
+{
+    pj_thread_desc  desc;
+    pj_thread_t    *pj_thread = NULL;
+    char            name[32];
+    int             idx = (int)(intptr_t)arg;
+
+    snprintf(name, sizeof(name), "cc_worker_%d", idx);
+    pj_bzero(desc, sizeof(desc));
+    if (pj_thread_register(name, desc, &pj_thread) != PJ_SUCCESS) {
+        PJ_LOG(1, (THIS_FILE, "[WORKER] pj_thread_register failed idx=%d", idx));
+        return NULL;
+    }
+
+    PJ_LOG(3, (THIS_FILE, "[WORKER] thread %d started", idx));
+
+    while (g_running) {
+        cc_event_t ev;
+        if (ring_pop(&ev)) {
+            process_event(&ev);
+        } else {
+            /* nothing in queue — yield briefly */
+            struct timespec ts = { 0, 1000000L }; /* 1 ms */
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    /* drain remaining events on shutdown */
+    {
+        cc_event_t ev;
+        while (ring_pop(&ev))
+            process_event(&ev);
+    }
+
+    PJ_LOG(3, (THIS_FILE, "[WORKER] thread %d stopped", idx));
+    return NULL;
+}
+
+int cc_worker_start(void)
+{
+    int i;
+    pthread_attr_t attr;
+
+    ring_init();
+    g_running = 1;
+
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024); /* 256 KB per worker */
+
+    for (i = 0; i < CC_WORKER_POOL_SIZE; i++) {
+        if (pthread_create(&g_workers[i], &attr,
+                           worker_thread, (void *)(intptr_t)i) != 0)
+        {
+            PJ_LOG(1, (THIS_FILE,
+                       "[WORKER] failed to create worker thread %d", i));
+            pthread_attr_destroy(&attr);
+            return -1;
+        }
+    }
+
+    pthread_attr_destroy(&attr);
+    PJ_LOG(3, (THIS_FILE,
+               "[WORKER] pool started: %d threads, queue=%d slots",
+               CC_WORKER_POOL_SIZE, CC_WORKER_QUEUE_SIZE));
+    return 0;
+}
+
+void cc_worker_stop(void)
+{
+    int i;
+    g_running = 0;
+    for (i = 0; i < CC_WORKER_POOL_SIZE; i++)
+        pthread_join(g_workers[i], NULL);
+    PJ_LOG(3, (THIS_FILE, "[WORKER] pool stopped"));
+}
+
+/* ── Public post API ─────────────────────────────────────────────────────── */
+
+int cc_worker_post(cc_event_t *ev)
+{
+    if (!ev)
+        return -1;
+
+    if (ev->reason[0] == '\0')
+        snprintf(ev->reason, sizeof(ev->reason), "worker-ev-%d", ev->type);
+
+    if (ev->session) {
+        if (!cc_session_acquire_reason(ev->session, ev->reason))
+            return -1;
+    }
+
+    if (ring_push(ev) != 0) {
+        if (ev->session)
+            cc_session_release_reason(ev->session, ev->reason);
+        PJ_LOG(1, (THIS_FILE,
+                   "[WORKER] queue full — event type=%d dropped", ev->type));
+        return -1;
+    }
+
+    return 0;
+}
+
+/* ── Helper: WAV player duration ─────────────────────────────────────────── */
+
+static int worker_player_duration_ms(pjsua_player_id pid)
+{
+    pjmedia_port *port = NULL;
+    pj_ssize_t data_len;
+    const pjmedia_port_info *info;
+    int bps, dur;
+
+    if (pid == PJSUA_INVALID_ID) return 4000;
+    if (pjsua_player_get_port(pid, &port) != PJ_SUCCESS || !port) return 4000;
+    data_len = pjmedia_wav_player_get_len(port);
+    if (data_len <= 0) return 4000;
+    info = &port->info;
+    bps  = (info->fmt.det.aud.bits_per_sample / 8) *
+            info->fmt.det.aud.channel_count;
+    if (bps <= 0 || info->fmt.det.aud.clock_rate == 0) return 4000;
+    dur = (int)((long long)data_len * 1000 /
+                (info->fmt.det.aud.clock_rate * bps));
+    return dur > 0 ? dur : 4000;
+}
+
+/* ── Event handlers ──────────────────────────────────────────────────────── */
+
+/* CC_EV_ORIGINATE_B — was cc_originate_b_thread */
+static void ev_originate_b(cc_event_t *ev)
+{
+    cc_session_t       *session = ev->session;
+    cc_originate_arg_t *arg;
+
+    CC_SESSION_LOCK(session);
+    arg = (cc_originate_arg_t *)session->originate_arg;
+    session->originate_arg = NULL;
+    CC_SESSION_UNLOCK(session);
+
+    if (!arg) {
+        PJ_LOG(1, (THIS_FILE, "[WORKER] ev_originate_b: arg is NULL"));
+        CC_SESSION_LOCK(session);
+        session->b_origination_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        cc_session_maybe_finalize(session);
+        return;
+    }
+
+    /* Run the origination logic directly (same body as cc_originate_b_thread) */
+    cc_originate_b_thread(arg);
+}
+
+/* CC_EV_WAV_HANGUP_A — was wav_then_hangup_thread */
+static void ev_wav_hangup_a(cc_event_t *ev)
+{
+    cc_session_t      *s       = ev->session;
+    const char        *wav_path = ev->wav_path;
+    pjsip_status_code  code    = (pjsip_status_code)ev->sip_code;
+    pjsua_call_id      call_a;
+
+    CC_SESSION_LOCK(s);
+    call_a = s->call_a;
+    CC_SESSION_UNLOCK(s);
+
+    if (cc_session_call_is_current(s, call_a, 1)) {
+        pjsua_player_id pid = cc_start_wav(call_a, wav_path, PJ_FALSE);
+        int wait_ms = worker_player_duration_ms(pid);
+        cc_sleep_ms(wait_ms);
+        cc_stop_wav(pid, PJSUA_INVALID_ID);
+        if (cc_session_call_is_current(s, call_a, 1))
+            cc_safe_hangup(call_a, code);
+    }
+
+    CC_SESSION_LOCK(s);
+    s->a_treatment_running = 0;
+    CC_SESSION_UNLOCK(s);
+    cc_session_maybe_finalize(s);
+}
+
+/* CC_EV_MCA_WAIT — was mca_wait_thread */
+static void ev_mca_wait(cc_event_t *ev)
+{
+    cc_session_t   *s         = ev->session;
+    pjsua_call_id   call_a    = ev->call_a;
+    cc_prompt_tag_t prompt_tag = (cc_prompt_tag_t)ev->prompt_tag;
+    int remaining_ms, decided;
+
+    if (!cc_session_call_is_current(s, call_a, 1)) {
+        CC_SESSION_LOCK(s);
+        s->a_treatment_running = 0;
+        s->mca_waiting = 0;
+        CC_SESSION_UNLOCK(s);
+        cc_session_maybe_finalize(s);
+        return;
+    }
+
+    /* Play prompt loop to A while waiting for DTMF */
+    {
+        const char *path = cc_prompt_get_path(prompt_tag);
+        pjsua_player_id pid = cc_start_wav(call_a, path, PJ_FALSE);
+        CC_SESSION_LOCK(s);
+        if (pid != PJSUA_INVALID_ID && s->call_a == call_a &&
+            s->player_a == PJSUA_INVALID_ID)
+            s->player_a = pid;
+        CC_SESSION_UNLOCK(s);
+    }
+
+    remaining_ms = cc_cfg_b_dtmf_timeout_sec() * 1000;
+    decided = 0;
+    while (remaining_ms > 0) {
+        int slice = remaining_ms > 100 ? 100 : remaining_ms;
+        cc_sleep_ms(slice);
+        remaining_ms -= slice;
+        CC_SESSION_LOCK(s);
+        decided = s->mca_decided;
+        CC_SESSION_UNLOCK(s);
+        if (decided) break;
+        if (!cc_session_call_is_current(s, call_a, 1)) {
+            decided = -1;
+            break;
+        }
+    }
+
+    /* Stop looping prompt */
+    {
+        pjsua_player_id pid = PJSUA_INVALID_ID;
+        CC_SESSION_LOCK(s);
+        if (s->player_a != PJSUA_INVALID_ID) {
+            pid = s->player_a;
+            s->player_a = PJSUA_INVALID_ID;
+        }
+        s->mca_waiting = 0;
+        CC_SESSION_UNLOCK(s);
+        if (pid != PJSUA_INVALID_ID)
+            cc_stop_wav(pid, PJSUA_INVALID_ID);
+    }
+
+    if (decided == 1) {
+        cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_MCA");
+        if (cc_session_call_is_current(s, call_a, 1)) {
+            const char *path = cc_prompt_get_path(CC_PROMPT_MCA_SENT);
+            pjsua_player_id pid = cc_start_wav(call_a, path, PJ_FALSE);
+            int w = worker_player_duration_ms(pid);
+            int cap = cc_cfg_free_period_ms();
+            cc_sleep_ms(w > cap ? cap : w);
+            cc_stop_wav(pid, PJSUA_INVALID_ID);
+            if (cc_session_call_is_current(s, call_a, 1))
+                cc_safe_hangup(call_a, PJSIP_SC_OK);
+        }
+    } else if (decided == 2) {
+        cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_NoMCA");
+        if (cc_session_call_is_current(s, call_a, 1)) {
+            const char *path = cc_prompt_get_path(CC_PROMPT_MCA_NOT_SENT);
+            pjsua_player_id pid = cc_start_wav(call_a, path, PJ_FALSE);
+            int w = worker_player_duration_ms(pid);
+            int cap = cc_cfg_free_period_ms();
+            cc_sleep_ms(w > cap ? cap : w);
+            cc_stop_wav(pid, PJSUA_INVALID_ID);
+            if (cc_session_call_is_current(s, call_a, 1))
+                cc_safe_hangup(call_a, PJSIP_SC_OK);
+        }
+    } else if (decided == 0) {
+        cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_NoMCA");
+        if (cc_session_call_is_current(s, call_a, 1))
+            cc_safe_hangup(call_a, PJSIP_SC_TEMPORARILY_UNAVAILABLE);
+    } else {
+        cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_NoMCA");
+    }
+
+    CC_SESSION_LOCK(s);
+    s->a_treatment_running = 0;
+    CC_SESSION_UNLOCK(s);
+    cc_session_maybe_finalize(s);
+}
+
+/* CC_EV_B_PROMPT_START — was cc_b_prompt_start_thread */
+static void ev_b_prompt_start(cc_event_t *ev)
+{
+    cc_session_t  *session = ev->session;
+    pjsua_call_id  call_id = ev->call_b;
+    pjsua_player_id pid;
+    int keep_player = 0;
+    const char *path;
+
+    /* Poll until CONFIRMED (max 30s) */
+    {
+        int wait_ms = 0, aborted = 0;
+        while (wait_ms < 30000) {
+            pjsua_call_info ci;
+            if (pjsua_call_get_info(call_id, &ci) == PJ_SUCCESS &&
+                ci.state == PJSIP_INV_STATE_CONFIRMED)
+                break;
+            cc_sleep_ms(100);
+            wait_ms += 100;
+            CC_SESSION_LOCK(session);
+            aborted = session->accepted || session->torn_down ||
+                      session->call_b != call_id;
+            CC_SESSION_UNLOCK(session);
+            if (aborted) goto bps_done;
+        }
+        CC_SESSION_LOCK(session);
+        aborted = session->accepted || session->torn_down ||
+                  session->call_b != call_id;
+        CC_SESSION_UNLOCK(session);
+        if (aborted) goto bps_done;
+    }
+
+    /* Poll until B RTP ready (max 3s) */
+    {
+        cc_rtp_ep_t rtp;
+        int rtp_ms = 0, aborted = 0;
+        while (rtp_ms < 3000) {
+            if (cc_get_call_remote_rtp(call_id, &rtp) == PJ_SUCCESS &&
+                rtp.port != 0)
+                break;
+            cc_sleep_ms(100);
+            rtp_ms += 100;
+            CC_SESSION_LOCK(session);
+            aborted = session->accepted || session->torn_down ||
+                      session->call_b != call_id;
+            CC_SESSION_UNLOCK(session);
+            if (aborted) goto bps_done;
+        }
+    }
+
+    path = cc_prompt_get_path(CC_PROMPT_COLLECT_PROMPT);
+    CC_SESSION_LOCK(session);
+    if (session->b_prompt_start_ts == 0)
+        session->b_prompt_start_ts = time(NULL);
+    CC_SESSION_UNLOCK(session);
+
+    pid = cc_start_wav(call_id, path, PJ_FALSE);
+
+    CC_SESSION_LOCK(session);
+    if (pid != PJSUA_INVALID_ID && !session->accepted &&
+        !session->torn_down && session->call_b == call_id &&
+        session->player_b == PJSUA_INVALID_ID)
+    {
+        session->player_b = pid;
+        keep_player = 1;
+    }
+    session->b_prompt_starting = 0;
+    CC_SESSION_UNLOCK(session);
+
+    if (keep_player) {
+        int prompt_ms = worker_player_duration_ms(pid);
+        CC_SESSION_LOCK(session);
+        session->b_collect_done = 0;
+        CC_SESSION_UNLOCK(session);
+
+        /* Post b_prompt_done event */
+        {
+            cc_event_t done_ev;
+            memset(&done_ev, 0, sizeof(done_ev));
+            done_ev.type      = CC_EV_B_PROMPT_DONE;
+            done_ev.session   = session;
+            done_ev.call_b    = call_id;
+            done_ev.prompt_ms = prompt_ms;
+            snprintf(done_ev.reason, sizeof(done_ev.reason), "b-prompt-done");
+            if (cc_worker_post(&done_ev) != 0) {
+                CC_SESSION_LOCK(session);
+                session->b_collect_done = 1;
+                CC_SESSION_UNLOCK(session);
+            }
+        }
+        leg_b_start_dtmf_timer(session);
+    } else if (pid != PJSUA_INVALID_ID) {
+        cc_stop_wav(pid, PJSUA_INVALID_ID);
+    }
+
+    cc_session_maybe_finalize(session);
+    return;
+
+bps_done:
+    CC_SESSION_LOCK(session);
+    session->b_prompt_starting = 0;
+    CC_SESSION_UNLOCK(session);
+    cc_session_maybe_finalize(session);
+}
+
+/* CC_EV_B_PROMPT_DONE — was cc_b_prompt_done_thread */
+static void ev_b_prompt_done(cc_event_t *ev)
+{
+    cc_session_t *s       = ev->session;
+    int           wait_ms = ev->prompt_ms;
+    int           remaining = wait_ms;
+    int           rtp_checked = 0;
+
+    while (remaining > 0) {
+        int slice = remaining > 100 ? 100 : remaining;
+        cc_sleep_ms(slice);
+        remaining -= slice;
+
+        if (!rtp_checked && (wait_ms - remaining) >= 1000) {
+            rtp_checked = 1;
+            pjsua_call_id cid;
+            CC_SESSION_LOCK(s);
+            cid = s->call_b;
+            CC_SESSION_UNLOCK(s);
+            if (cid != PJSUA_INVALID_ID)
+                cc_log_call_rtp_info(cid, "B-rtp-1s");
+        }
+
+        int done;
+        CC_SESSION_LOCK(s);
+        done = s->torn_down || s->final_cleanup_started;
+        CC_SESSION_UNLOCK(s);
+        if (done) {
+            CC_SESSION_LOCK(s);
+            s->b_collect_done = 1;
+            CC_SESSION_UNLOCK(s);
+            cc_session_maybe_finalize(s);
+            return;
+        }
+    }
+
+    CC_SESSION_LOCK(s);
+    s->b_collect_done = 1;
+    CC_SESSION_UNLOCK(s);
+    PJ_LOG(3, (THIS_FILE, "[WORKER] B collect prompt finished"));
+    cc_session_maybe_finalize(s);
+}
+
+/* CC_EV_ACCEPT_TRANSITION — was accept_transition_thread */
+static void ev_accept_transition(cc_event_t *ev)
+{
+    cc_session_t  *session     = ev->session;
+    pjsua_call_id  call_a      = ev->call_a;
+    pjsua_call_id  call_b      = ev->call_b;
+    int            delay_ms    = ev->delay_ms;
+
+    /* Wait for collect prompt to finish OR free period to expire */
+    {
+        long long b_confirmed_ms;
+        int free_period;
+        CC_SESSION_LOCK(session);
+        b_confirmed_ms = session->b_confirmed_ms;
+        free_period    = session->free_period_ms > 0
+                         ? session->free_period_ms
+                         : cc_cfg_free_period_ms();
+        CC_SESSION_UNLOCK(session);
+
+        for (;;) {
+            int done;
+            CC_SESSION_LOCK(session);
+            done = session->b_collect_done || session->torn_down;
+            CC_SESSION_UNLOCK(session);
+            if (done) break;
+
+            if (b_confirmed_ms > 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                long long now_ms = (long long)ts.tv_sec * 1000 +
+                                   ts.tv_nsec / 1000000;
+                if ((now_ms - b_confirmed_ms) >= free_period) {
+                    pjsua_player_id player_b = PJSUA_INVALID_ID;
+                    CC_SESSION_LOCK(session);
+                    if (session->player_b != PJSUA_INVALID_ID) {
+                        player_b = session->player_b;
+                        session->player_b = PJSUA_INVALID_ID;
+                    }
+                    session->b_collect_done = 1;
+                    CC_SESSION_UNLOCK(session);
+                    if (player_b != PJSUA_INVALID_ID)
+                        cc_stop_wav(player_b, PJSUA_INVALID_ID);
+                    break;
+                }
+            }
+
+            cc_sleep_ms(50);
+        }
+    }
+
+    run_accept_transition(session, call_a, call_b, delay_ms);
+
+    CC_SESSION_LOCK(session);
+    session->accept_transition_pending = 0;
+    CC_SESSION_UNLOCK(session);
+
+    cc_session_maybe_finalize(session);
+}
+
+/* CC_EV_RING_TIMER / CC_EV_DTMF_TIMER — was timer_thread */
+static void ev_timer(cc_event_t *ev, int is_ring)
+{
+    cc_session_t  *s        = ev->session;
+    int            timeout  = ev->timeout_sec;
+    pjsua_call_id  call_b   = ev->call_b;
+    int remaining_ms = timeout * 1000;
+    int done = 0;
+
+    while (remaining_ms > 0) {
+        int slice = remaining_ms > 100 ? 100 : remaining_ms;
+        cc_sleep_ms(slice);
+        remaining_ms -= slice;
+        CC_SESSION_LOCK(s);
+        done = s->accepted || s->torn_down ||
+               s->call_b != call_b || s->final_cleanup_started;
+        CC_SESSION_UNLOCK(s);
+        if (done) break;
+    }
+
+    CC_SESSION_LOCK(s);
+    done = s->accepted || s->torn_down ||
+           s->call_b != call_b || s->final_cleanup_started;
+    CC_SESSION_UNLOCK(s);
+
+    if (!done && cc_session_call_is_current(s, call_b, 0)) {
+        if (is_ring) {
+            PJ_LOG(2, (THIS_FILE, "[WORKER] ring timeout %ds — NO_ANSWER", timeout));
+            CC_SESSION_LOCK(s);
+            if (!s->accepted && !s->torn_down && s->call_b == call_b) {
+                s->decision_completed = 1;
+                s->decision_digit = '\0';
+                s->torn_down = 1;
+            } else {
+                done = 1;
+            }
+            CC_SESSION_UNLOCK(s);
+            if (!done) {
+                cc_session_mark_end(s, "FAILED", "NO_ANSWER");
+                if (cc_session_call_is_current(s, call_b, 0))
+                    cc_safe_hangup(call_b, PJSIP_SC_REQUEST_TIMEOUT);
+                leg_a_play_prompt_then_hangup(s,
+                    CC_PROMPT_NOT_AVAILABLE_TO_PAY,
+                    PJSIP_SC_TEMPORARILY_UNAVAILABLE);
+            }
+        } else {
+            PJ_LOG(2, (THIS_FILE, "[WORKER] DTMF timeout %ds — ELIGIBILITY_TIMEOUT", timeout));
+            /* call on_reject_mapped via leg_b public path */
+            leg_b_on_dtmf_timeout(call_b, s);
+        }
+    }
+
+    CC_SESSION_LOCK(s);
+    if (is_ring)
+        s->ring_timer_started = 0;
+    else
+        s->dtmf_timer_started = 0;
+    CC_SESSION_UNLOCK(s);
+
+    cc_session_maybe_finalize(s);
+}
+
+/* CC_EV_UPDATE_A_RETRY — was update_a_retry_thread */
+static void ev_update_a_retry(cc_event_t *ev)
+{
+    cc_session_t  *s      = ev->session;
+    pjsua_call_id  call_a = ev->call_a;
+    int skip;
+
+    cc_sleep_ms(3000);
+
+    CC_SESSION_LOCK(s);
+    skip = s->torn_down || s->media_bypassed ||
+           s->update_a_acked || s->call_a != call_a;
+    s->update_a_retry_pending = 0;
+    CC_SESSION_UNLOCK(s);
+
+    if (!skip) {
+        PJ_LOG(3, (THIS_FILE, "[WORKER] retrying A-leg UPDATE after 491"));
+        leg_a_send_update_bypass(call_a, s);
+    }
+
+    cc_session_maybe_finalize(s);
+}
+
+/* CC_EV_UPDATE_B_RETRY — was update_b_retry_thread */
+static void ev_update_b_retry(cc_event_t *ev)
+{
+    cc_session_t  *s      = ev->session;
+    pjsua_call_id  call_b = ev->call_b;
+    int skip;
+
+    cc_sleep_ms(3000);
+
+    CC_SESSION_LOCK(s);
+    skip = s->torn_down || s->media_bypassed ||
+           s->update_b_acked || s->call_b != call_b;
+    s->update_b_retry_pending = 0;
+    CC_SESSION_UNLOCK(s);
+
+    if (!skip) {
+        PJ_LOG(3, (THIS_FILE, "[WORKER] retrying B-leg UPDATE after 491"));
+        leg_b_send_update_bypass(call_b, s);
+    }
+
+    cc_session_maybe_finalize(s);
+}
+
+/* CC_EV_UPDATE_ACK_WATCHDOG — was update_ack_watchdog_thread */
+#define CC_UPDATE_ACK_TIMEOUT_MS  8000
+#define CC_UPDATE_ACK_POLL_MS       100
+
+static void ev_update_ack_watchdog(cc_event_t *ev)
+{
+    cc_session_t  *s      = ev->session;
+    pjsua_call_id  call_a = ev->call_a;
+    pjsua_call_id  call_b = ev->call_b;
+    int waited_ms = 0;
+
+    while (waited_ms < CC_UPDATE_ACK_TIMEOUT_MS) {
+        int done, torn;
+        CC_SESSION_LOCK(s);
+        torn = s->torn_down || s->call_a != call_a || s->call_b != call_b;
+        done = s->media_bypassed || torn;
+        CC_SESSION_UNLOCK(s);
+        if (torn) goto wd_done;
+        if (done) goto wd_done;
+        cc_sleep_ms(CC_UPDATE_ACK_POLL_MS);
+        waited_ms += CC_UPDATE_ACK_POLL_MS;
+    }
+
+    {
+        int need_fallback = 0;
+        CC_SESSION_LOCK(s);
+        if (!s->media_bypassed && !s->torn_down && s->accepted &&
+            s->call_a == call_a && s->call_b == call_b)
+        {
+            PJ_LOG(2, (THIS_FILE,
+                       "[WORKER] UPDATE ack timeout %dms — fallback to bridge",
+                       CC_UPDATE_ACK_TIMEOUT_MS));
+            s->update_a_sent = s->update_b_sent = 0;
+            s->update_a_acked = s->update_b_acked = 0;
+            s->update_a_pending = s->update_b_pending = 0;
+            s->update_a_retry_pending = s->update_b_retry_pending = 0;
+            need_fallback = 1;
+        }
+        CC_SESSION_UNLOCK(s);
+        if (need_fallback)
+            cc_bridge_calls(call_a, call_b);
+    }
+
+wd_done:
+    CC_SESSION_LOCK(s);
+    s->update_ack_watchdog_started = 0;
+    CC_SESSION_UNLOCK(s);
+    cc_session_maybe_finalize(s);
+}
+
+/* CC_EV_BYPASS_RTP_WATCHDOG — was cc_bypass_rtp_watchdog_thread */
+#define CC_BYPASS_RTP_WATCHDOG_MS  2500
+#define CC_BYPASS_RTP_POLL_MS        50
+
+static void ev_bypass_rtp_watchdog(cc_event_t *ev)
+{
+    cc_session_t  *s      = ev->session;
+    pjsua_call_id  call_a = ev->call_a;
+    pjsua_call_id  call_b = ev->call_b;
+    int waited_ms = 0, rtp_ok = 0;
+    unsigned long pkt_a_start = 0, pkt_b_start = 0;
+    int snapped = 0;
+
+    while (waited_ms < CC_BYPASS_RTP_WATCHDOG_MS) {
+        int torn;
+        CC_SESSION_LOCK(s);
+        torn = s->torn_down || s->call_a != call_a || s->call_b != call_b;
+        CC_SESSION_UNLOCK(s);
+        if (torn) { rtp_ok = 1; break; }
+
+        {
+            pjsua_stream_stat sa, sb;
+            if (pjsua_call_get_stream_stat(call_a, 0, &sa) == PJ_SUCCESS &&
+                pjsua_call_get_stream_stat(call_b, 0, &sb) == PJ_SUCCESS)
+            {
+                if (!snapped) {
+                    pkt_a_start = sa.rtcp.rx.pkt;
+                    pkt_b_start = sb.rtcp.rx.pkt;
+                    snapped = 1;
+                } else if (sa.rtcp.rx.pkt > pkt_a_start + 2 &&
+                           sb.rtcp.rx.pkt > pkt_b_start + 2)
+                {
+                    PJ_LOG(3, (THIS_FILE, "[WORKER] bypass RTP flowing — OK"));
+                    rtp_ok = 1;
+                    break;
+                }
+            }
+        }
+
+        cc_sleep_ms(CC_BYPASS_RTP_POLL_MS);
+        waited_ms += CC_BYPASS_RTP_POLL_MS;
+    }
+
+    if (!rtp_ok) {
+        int do_fallback = 0;
+        CC_SESSION_LOCK(s);
+        if (!s->torn_down && s->accepted && s->media_bypassed &&
+            s->call_a == call_a && s->call_b == call_b)
+        {
+            s->media_bypassed = s->update_a_sent = s->update_b_sent = 0;
+            s->update_a_acked = s->update_b_acked = 0;
+            do_fallback = 1;
+        }
+        CC_SESSION_UNLOCK(s);
+        if (do_fallback) {
+            PJ_LOG(2, (THIS_FILE,
+                       "[WORKER] no direct RTP after %dms — fallback to bridge",
+                       CC_BYPASS_RTP_WATCHDOG_MS));
+            cc_bridge_calls(call_a, call_b);
+        }
+    }
+
+    CC_SESSION_LOCK(s);
+    s->bypass_rtp_watchdog_started = 0;
+    CC_SESSION_UNLOCK(s);
+    cc_session_maybe_finalize(s);
+}
+
+/* ── Central dispatcher ──────────────────────────────────────────────────── */
+
+static void process_event(cc_event_t *ev)
+{
+    switch (ev->type) {
+    case CC_EV_ORIGINATE_B:         ev_originate_b(ev);              break;
+    case CC_EV_WAV_HANGUP_A:        ev_wav_hangup_a(ev);             break;
+    case CC_EV_MCA_WAIT:            ev_mca_wait(ev);                 break;
+    case CC_EV_B_PROMPT_START:      ev_b_prompt_start(ev);           break;
+    case CC_EV_B_PROMPT_DONE:       ev_b_prompt_done(ev);            break;
+    case CC_EV_ACCEPT_TRANSITION:   ev_accept_transition(ev);        break;
+    case CC_EV_RING_TIMER:          ev_timer(ev, 1);                 break;
+    case CC_EV_DTMF_TIMER:          ev_timer(ev, 0);                 break;
+    case CC_EV_UPDATE_A_RETRY:      ev_update_a_retry(ev);           break;
+    case CC_EV_UPDATE_B_RETRY:      ev_update_b_retry(ev);           break;
+    case CC_EV_UPDATE_ACK_WATCHDOG: ev_update_ack_watchdog(ev);      break;
+    case CC_EV_BYPASS_RTP_WATCHDOG: ev_bypass_rtp_watchdog(ev);      break;
+    case CC_EV_VASYNC_CB:
+        /* session is NULL — skip session release */
+        if (ev->data) {
+            vasync_cb_event_t *e = (vasync_cb_event_t *)ev->data;
+            e->cb(e->cb_arg, &e->result);
+            free(e);
+        }
+        return;
+    default:
+        PJ_LOG(1, (THIS_FILE, "[WORKER] unknown event type=%d", ev->type));
+        if (ev->session)
+            cc_session_maybe_finalize(ev->session);
+        break;
+    }
+    if (ev->session)
+        cc_session_release_reason(ev->session, ev->reason);
+    if (ev->session)
+        cc_session_maybe_finalize(ev->session);
+}

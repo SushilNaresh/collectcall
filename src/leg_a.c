@@ -3,6 +3,7 @@
  *
  * A's leg is answered first. B-leg is started only after A-leg reaches
  * CONFIRMED state, which means A has sent ACK for 200 OK.
+ * Blocking work (WAV+hangup, MCA wait) posted to worker pool.
  */
 #include "handlers.h"
 #include "b2bua.h"
@@ -10,6 +11,7 @@
 #include "config.h"
 #include "prompt_mapping.h"
 #include "runtime_config.h"
+#include "worker.h"
 
 #include <pjsua-lib/pjsua.h>
 #include <pjsip/sip_util.h>
@@ -52,21 +54,28 @@ static int cc_player_duration_ms(pjsua_player_id pid)
     return duration_ms > 0 ? duration_ms : 4000;
 }
 
-static void stop_a_waiting_prompt_before_treatment(cc_session_t *session,
-                                                   const char *reason)
+/*
+ * Atomically take the waiting-prompt player and compute remaining play time.
+ * Does NOT sleep — the caller (worker event) does the deferral sleep.
+ * Returns the player id (PJSUA_INVALID_ID if none) and sets *remaining_ms_out.
+ */
+static pjsua_player_id take_a_waiting_prompt(cc_session_t *session,
+                                              int *remaining_ms_out,
+                                              const char *reason)
 {
     pjsua_player_id player_a = PJSUA_INVALID_ID;
     int remaining_ms = 0;
 
-    if (!session)
-        return;
+    if (!session) {
+        *remaining_ms_out = 0;
+        return PJSUA_INVALID_ID;
+    }
 
     CC_SESSION_LOCK(session);
     if (session->player_a != PJSUA_INVALID_ID) {
         player_a = session->player_a;
         session->player_a = PJSUA_INVALID_ID;
 
-        /* Compute how much of the waiting prompt is still left to play */
         if (session->a_prompt_duration_ms > 0 && session->a_confirmed_ms > 0) {
             struct timespec ts;
             clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -80,18 +89,13 @@ static void stop_a_waiting_prompt_before_treatment(cc_session_t *session,
     }
     CC_SESSION_UNLOCK(session);
 
-    if (player_a != PJSUA_INVALID_ID) {
-        if (remaining_ms > 0) {
-            PJ_LOG(3, (THIS_FILE,
-                       "[VOICE] A waiting prompt still playing; waiting %dms before treatment: %s",
-                       remaining_ms, reason ? reason : "unknown"));
-            cc_sleep_ms(remaining_ms);
-        }
+    if (player_a != PJSUA_INVALID_ID && remaining_ms > 0)
         PJ_LOG(3, (THIS_FILE,
-                   "[VOICE] Stop A waiting prompt before treatment: %s",
-                   reason ? reason : "unknown"));
-        cc_stop_wav(player_a, PJSUA_INVALID_ID);
-    }
+                   "[VOICE] A waiting prompt still playing; waiting %dms before treatment: %s",
+                   remaining_ms, reason ? reason : "unknown"));
+
+    *remaining_ms_out = remaining_ms;
+    return player_a;
 }
 
 /* ── State callback ──────────────────────────────────────────────────────── */
@@ -183,8 +187,6 @@ pjsua_call_id leg_a_on_call_state(pjsua_call_id call_id,
             if (cc_session_call_is_current(session, b, 0))
                 cc_safe_hangup(b, PJSIP_SC_OK);
         }
-
-        cc_session_maybe_finalize(session);
     }
 
     return deferred_hangup;
@@ -493,82 +495,14 @@ void leg_a_send_reinvite_bypass(cc_session_t *session)
     }
 }
 
-typedef struct {
-    cc_session_t       *session;
-    const char         *wav_path;
-    pjsip_status_code   code;
-    pjsua_call_id       expected_call_a;
-} wav_hangup_arg_t;
-
-static void *wav_then_hangup_thread(void *arg)
-{
-    wav_hangup_arg_t *a = (wav_hangup_arg_t *)arg;
-    cc_session_t     *s = a->session;
-    pj_thread_desc desc;
-    pj_thread_t *this_thread = NULL;
-    pj_status_t thread_status;
-
-    pj_bzero(desc, sizeof(desc));
-    thread_status = pj_thread_register("cc_wav_hang", desc, &this_thread);
-    if (thread_status != PJ_SUCCESS) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[ERROR] WAV PJ thread registration failed: %d",
-                   thread_status));
-        CC_SESSION_LOCK(s);
-        s->a_treatment_running = 0;
-        CC_SESSION_UNLOCK(s);
-        free(a);
-        cc_session_maybe_finalize(s);
-        cc_session_release_reason(s, "wav-register-failed");
-        return NULL;
-    }
-
-    pjsua_call_id     call_a = a->expected_call_a;
-
-    if (cc_session_call_is_current(s, call_a, 1)) {
-        PJ_LOG(3, (THIS_FILE,
-                   "[VOICE] Play A treatment prompt then hangup: %s",
-                   a->wav_path));
-        pjsua_player_id pid = cc_start_wav(call_a, a->wav_path, PJ_FALSE);
-        int wait_ms = cc_player_duration_ms(pid);
-        PJ_LOG(3, (THIS_FILE,
-                   "[VOICE] prompt duration wait=%dms", wait_ms));
-        cc_sleep_ms(wait_ms);
-        cc_stop_wav(pid, PJSUA_INVALID_ID);
-
-        if (cc_session_call_is_current(s, call_a, 1)) {
-            cc_safe_hangup(call_a, a->code);
-        } else {
-            PJ_LOG(3, (THIS_FILE,
-                       "[WAV] skipped stale treatment call=%d", call_a));
-        }
-    } else {
-        PJ_LOG(3, (THIS_FILE,
-                   "[WAV] skipped stale treatment call=%d", call_a));
-    }
-
-    CC_SESSION_LOCK(s);
-    s->a_treatment_running = 0;
-    CC_SESSION_UNLOCK(s);
-    free(a);
-    cc_session_maybe_finalize(s);
-    cc_session_release_reason(s, "wav-treatment-complete");
-    return NULL;
-}
-
 static void spawn_wav_hangup(cc_session_t *session,
                               const char *wav_path,
-                              pjsip_status_code code)
+                              pjsip_status_code code,
+                              pjsua_player_id player_a,
+                              int wait_ms)
 {
-    wav_hangup_arg_t *arg = malloc(sizeof(*arg));
+    cc_event_t ev;
     pjsua_call_id call_a;
-    pthread_t t;
-    int rc;
-
-    if (!arg) {
-        PJ_LOG(1, (THIS_FILE, "[ERROR] WAV treatment allocation failed"));
-        return;
-    }
 
     CC_SESSION_LOCK(session);
     if (session->a_treatment_running ||
@@ -576,269 +510,88 @@ static void spawn_wav_hangup(cc_session_t *session,
     {
         CC_SESSION_UNLOCK(session);
         PJ_LOG(3, (THIS_FILE, "[WAV] skipped stale treatment"));
-        free(arg);
+        if (player_a != PJSUA_INVALID_ID)
+            cc_stop_wav(player_a, PJSUA_INVALID_ID);
         return;
     }
     session->a_treatment_running = 1;
     call_a = session->call_a;
     CC_SESSION_UNLOCK(session);
 
-    if (!cc_session_acquire_reason(session, "wav-treatment-worker")) {
+    memset(&ev, 0, sizeof(ev));
+    ev.type       = CC_EV_WAV_HANGUP_A;
+    ev.session    = session;
+    ev.call_a     = call_a;
+    ev.wav_path   = wav_path;
+    ev.sip_code   = (int)code;
+    ev.player_a   = player_a;
+    ev.wait_ms    = wait_ms;
+    snprintf(ev.reason, sizeof(ev.reason), "wav-treatment-worker");
+
+    /* wait_ms > 0: deferral via timer queue (1 timer thread, no per-call threads)
+     * wait_ms == 0: post directly to worker pool */
+    if (cc_worker_post_delayed(&ev, wait_ms) != 0) {
         CC_SESSION_LOCK(session);
         session->a_treatment_running = 0;
         CC_SESSION_UNLOCK(session);
-        PJ_LOG(3, (THIS_FILE, "[WAV] skipped stale treatment"));
-        free(arg);
-        return;
-    }
-
-    arg->session  = session;
-    arg->wav_path = wav_path;
-    arg->code     = code;
-    arg->expected_call_a = call_a;
-
-    rc = pthread_create(&t, NULL, wav_then_hangup_thread, arg);
-    if (rc != 0) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[ERROR] WAV treatment pthread_create failed: %d", rc));
-        CC_SESSION_LOCK(session);
-        session->a_treatment_running = 0;
-        CC_SESSION_UNLOCK(session);
-        free(arg);
-        cc_session_release_reason(session, "wav-create-failed");
-        return;
-    }
-
-    rc = pthread_detach(t);
-    if (rc != 0) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[ERROR] WAV treatment pthread_detach failed: %d", rc));
+        if (player_a != PJSUA_INVALID_ID)
+            cc_stop_wav(player_a, PJSUA_INVALID_ID);
+        PJ_LOG(1, (THIS_FILE, "[ERROR] WAV treatment worker post failed"));
     }
 }
 
 void leg_a_play_rejected_then_hangup(cc_session_t *session)
 {
-    const char *rejected_path;
-
-    stop_a_waiting_prompt_before_treatment(session, "rejected");
-
-    rejected_path = cc_prompt_get_path(CC_PROMPT_REJECTED);
-
+    int wait_ms = 0;
+    pjsua_player_id player_a = take_a_waiting_prompt(session, &wait_ms, "rejected");
+    const char *rejected_path = cc_prompt_get_path(CC_PROMPT_REJECTED);
     PJ_LOG(3, (THIS_FILE,
                "[VOICE] Play A rejected prompt then hangup: %s",
                rejected_path));
-    spawn_wav_hangup(session, rejected_path, PJSIP_SC_DECLINE);
+    spawn_wav_hangup(session, rejected_path, PJSIP_SC_DECLINE, player_a, wait_ms);
 }
 
 void leg_a_play_unavailable_then_hangup(cc_session_t *session)
 {
-    const char *unavailable_path;
-
-    stop_a_waiting_prompt_before_treatment(session, "unavailable");
-
-    unavailable_path = cc_prompt_get_path(CC_PROMPT_UNAVAILABLE);
-
+    int wait_ms = 0;
+    pjsua_player_id player_a = take_a_waiting_prompt(session, &wait_ms, "unavailable");
+    const char *unavailable_path = cc_prompt_get_path(CC_PROMPT_UNAVAILABLE);
     PJ_LOG(3, (THIS_FILE,
                "[VOICE] Play A unavailable prompt then hangup: %s",
                unavailable_path));
     spawn_wav_hangup(session, unavailable_path,
-                     PJSIP_SC_TEMPORARILY_UNAVAILABLE);
+                     PJSIP_SC_TEMPORARILY_UNAVAILABLE, player_a, wait_ms);
 }
 
 void leg_a_play_prompt_then_hangup(cc_session_t *session,
                                    cc_prompt_tag_t tag,
                                    pjsip_status_code code)
 {
-    const char *path;
+    int wait_ms = 0;
     const char *tag_name = cc_prompt_tag_name(tag);
-
-    stop_a_waiting_prompt_before_treatment(session, tag_name);
-
-    path = cc_prompt_get_path(tag);
-
+    pjsua_player_id player_a = take_a_waiting_prompt(session, &wait_ms, tag_name);
+    const char *path = cc_prompt_get_path(tag);
     PJ_LOG(3, (THIS_FILE,
                "[VOICE] Play A prompt=%s then hangup: %s",
                tag_name, path));
-    spawn_wav_hangup(session, path, code);
+    spawn_wav_hangup(session, path, code, player_a, wait_ms);
 }
 
 /* ── MCA flow: play UNAVAILABLE, wait for A DTMF 1, then MCA API ─────────── */
 
-typedef struct {
-    cc_session_t   *session;
-    pjsua_call_id   expected_call_a;
-    cc_prompt_tag_t prompt_tag;
-} mca_wait_arg_t;
-
-static void *mca_wait_thread(void *arg)
-{
-    mca_wait_arg_t *a = (mca_wait_arg_t *)arg;
-    cc_session_t   *s = a->session;
-    pjsua_call_id   call_a = a->expected_call_a;
-    cc_prompt_tag_t prompt_tag = a->prompt_tag;
-    pj_thread_desc desc;
-    pj_thread_t *this_thread = NULL;
-    pj_status_t thread_status;
-
-    pj_bzero(desc, sizeof(desc));
-    thread_status = pj_thread_register("cc_mca_wait", desc, &this_thread);
-    if (thread_status != PJ_SUCCESS) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[ERROR] MCA wait PJ thread registration failed: %d",
-                   thread_status));
-        CC_SESSION_LOCK(s);
-        s->a_treatment_running = 0;
-        s->mca_waiting = 0;
-        CC_SESSION_UNLOCK(s);
-        free(a);
-        cc_session_maybe_finalize(s);
-        cc_session_release_reason(s, "mca-wait-register-failed");
-        return NULL;
-    }
-
-    free(a);
-
-    if (!cc_session_call_is_current(s, call_a, 1)) {
-        PJ_LOG(3, (THIS_FILE, "[MCA] skipped stale call=%d", call_a));
-        CC_SESSION_LOCK(s);
-        s->a_treatment_running = 0;
-        s->mca_waiting = 0;
-        CC_SESSION_UNLOCK(s);
-        cc_session_maybe_finalize(s);
-        cc_session_release_reason(s, "mca-wait-stale");
-        return NULL;
-    }
-
-    /* Play the specified prompt (loop) so A hears it while waiting for DTMF */
-    const char *prompt_path = cc_prompt_get_path(prompt_tag);
-    PJ_LOG(3, (THIS_FILE,
-               "[VOICE] Play A prompt (loop) for MCA wait: %s",
-               prompt_path));
-    pjsua_player_id pid = cc_start_wav(call_a, prompt_path, PJ_FALSE);
-
-    CC_SESSION_LOCK(s);
-    if (pid != PJSUA_INVALID_ID &&
-        s->call_a == call_a &&
-        s->player_a == PJSUA_INVALID_ID)
-    {
-        s->player_a = pid;
-    }
-    CC_SESSION_UNLOCK(s);
-
-    /* Wait for DTMF 1 with timeout */
-    int remaining_ms = cc_cfg_b_dtmf_timeout_sec() * 1000;
-    int decided = 0;
-
-    while (remaining_ms > 0) {
-        int slice_ms = remaining_ms > 100 ? 100 : remaining_ms;
-        cc_sleep_ms(slice_ms);
-        remaining_ms -= slice_ms;
-
-        CC_SESSION_LOCK(s);
-        decided = s->mca_decided;
-        CC_SESSION_UNLOCK(s);
-
-        if (decided)
-            break;
-
-        if (!cc_session_call_is_current(s, call_a, 1)) {
-            decided = -1;  /* A disconnected during MCA wait */
-            break;
-        }
-    }
-
-    /* Stop the looping prompt */
-    pjsua_player_id player_a = PJSUA_INVALID_ID;
-    CC_SESSION_LOCK(s);
-    if (s->player_a != PJSUA_INVALID_ID) {
-        player_a = s->player_a;
-        s->player_a = PJSUA_INVALID_ID;
-    }
-    s->mca_waiting = 0;
-    CC_SESSION_UNLOCK(s);
-
-    if (player_a != PJSUA_INVALID_ID)
-        cc_stop_wav(player_a, PJSUA_INVALID_ID);
-
-    if (decided == 1) {
-        /* A pressed 1 — send MCA via end-call API */
-        PJ_LOG(3, (THIS_FILE, "[MCA] A pressed 1 — sending MCA notification"));
-        cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_MCA");
-
-        if (cc_session_call_is_current(s, call_a, 1)) {
-            const char *mca_path = cc_prompt_get_path(CC_PROMPT_MCA_SENT);
-            PJ_LOG(3, (THIS_FILE,
-                       "[VOICE] Play A MCA_SENT prompt: %s", mca_path));
-            pjsua_player_id mca_pid = cc_start_wav(call_a, mca_path, PJ_FALSE);
-            int mca_wait_ms = cc_player_duration_ms(mca_pid);
-            int mca_cap = cc_cfg_free_period_ms();
-            if (mca_wait_ms > mca_cap)
-                mca_wait_ms = mca_cap;
-            PJ_LOG(3, (THIS_FILE,
-                       "[VOICE] MCA_SENT prompt duration wait=%dms", mca_wait_ms));
-            cc_sleep_ms(mca_wait_ms);
-            cc_stop_wav(mca_pid, PJSUA_INVALID_ID);
-
-            if (cc_session_call_is_current(s, call_a, 1))
-                cc_safe_hangup(call_a, PJSIP_SC_OK);
-        }
-    } else if (decided == 2) {
-        /* A pressed other key — no MCA */
-        PJ_LOG(3, (THIS_FILE, "[MCA] A pressed other key — no MCA"));
-        cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_NoMCA");
-
-        if (cc_session_call_is_current(s, call_a, 1)) {
-            const char *not_sent_path = cc_prompt_get_path(CC_PROMPT_MCA_NOT_SENT);
-            PJ_LOG(3, (THIS_FILE,
-                       "[VOICE] Play A MCA_NOT_SENT prompt: %s", not_sent_path));
-            pjsua_player_id ns_pid = cc_start_wav(call_a, not_sent_path, PJ_FALSE);
-            int ns_wait_ms = cc_player_duration_ms(ns_pid);
-            int ns_cap = cc_cfg_free_period_ms();
-            if (ns_wait_ms > ns_cap)
-                ns_wait_ms = ns_cap;
-            PJ_LOG(3, (THIS_FILE,
-                       "[VOICE] MCA_NOT_SENT prompt duration wait=%dms", ns_wait_ms));
-            cc_sleep_ms(ns_wait_ms);
-            cc_stop_wav(ns_pid, PJSUA_INVALID_ID);
-
-            if (cc_session_call_is_current(s, call_a, 1))
-                cc_safe_hangup(call_a, PJSIP_SC_OK);
-        }
-    } else if (decided == 0) {
-        /* DTMF timeout — no MCA */
-        PJ_LOG(3, (THIS_FILE, "[MCA] DTMF timeout — no MCA"));
-        cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_NoMCA");
-        if (cc_session_call_is_current(s, call_a, 1))
-            cc_safe_hangup(call_a, PJSIP_SC_TEMPORARILY_UNAVAILABLE);
-    } else {
-        /* decided == -1: A disconnected during MCA wait */
-        PJ_LOG(2, (THIS_FILE, "[MCA] A disconnected during wait — no MCA"));
-        cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_NoMCA");
-        PJ_LOG(2, (THIS_FILE, "[MCA] mark_end complete"));
-    }
-
-    CC_SESSION_LOCK(s);
-    s->a_treatment_running = 0;
-    CC_SESSION_UNLOCK(s);
-
-    cc_session_maybe_finalize(s);
-    cc_session_release_reason(s, "mca-wait-complete");
-    return NULL;
-}
-
 void leg_a_play_mca_wait(cc_session_t *session, cc_prompt_tag_t prompt_tag)
 {
-    mca_wait_arg_t *arg;
+    cc_event_t ev;
     pjsua_call_id call_a;
-    pthread_t t;
-    int rc;
+    int wait_ms = 0;
+    pjsua_player_id player_a = take_a_waiting_prompt(session, &wait_ms, "mca-wait");
 
-    stop_a_waiting_prompt_before_treatment(session, "mca-wait");
-
-    arg = malloc(sizeof(*arg));
-    if (!arg) {
-        PJ_LOG(1, (THIS_FILE, "[ERROR] MCA wait allocation failed"));
-        return;
+    /* Stop the waiting prompt now (no sleep — MCA wait loop handles timing) */
+    if (player_a != PJSUA_INVALID_ID) {
+        if (wait_ms > 0)
+            cc_sleep_ms(wait_ms);
+        PJ_LOG(3, (THIS_FILE, "[VOICE] Stop A waiting prompt before treatment: mca-wait"));
+        cc_stop_wav(player_a, PJSUA_INVALID_ID);
     }
 
     CC_SESSION_LOCK(session);
@@ -847,7 +600,6 @@ void leg_a_play_mca_wait(cc_session_t *session, cc_prompt_tag_t prompt_tag)
     {
         CC_SESSION_UNLOCK(session);
         PJ_LOG(3, (THIS_FILE, "[MCA] skipped: treatment running or no A-leg"));
-        free(arg);
         return;
     }
     session->a_treatment_running = 1;
@@ -856,33 +608,20 @@ void leg_a_play_mca_wait(cc_session_t *session, cc_prompt_tag_t prompt_tag)
     call_a = session->call_a;
     CC_SESSION_UNLOCK(session);
 
-    if (!cc_session_acquire_reason(session, "mca-wait-worker")) {
+    memset(&ev, 0, sizeof(ev));
+    ev.type       = CC_EV_MCA_WAIT;
+    ev.session    = session;
+    ev.call_a     = call_a;
+    ev.prompt_tag = (int)prompt_tag;
+    snprintf(ev.reason, sizeof(ev.reason), "mca-wait-worker");
+
+    if (cc_worker_post(&ev) != 0) {
         CC_SESSION_LOCK(session);
         session->a_treatment_running = 0;
         session->mca_waiting = 0;
         CC_SESSION_UNLOCK(session);
-        free(arg);
-        return;
+        PJ_LOG(1, (THIS_FILE, "[ERROR] MCA wait worker post failed"));
     }
-
-    arg->session = session;
-    arg->expected_call_a = call_a;
-    arg->prompt_tag = prompt_tag;
-
-    rc = pthread_create(&t, NULL, mca_wait_thread, arg);
-    if (rc != 0) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[ERROR] MCA wait pthread_create failed: %d", rc));
-        CC_SESSION_LOCK(session);
-        session->a_treatment_running = 0;
-        session->mca_waiting = 0;
-        CC_SESSION_UNLOCK(session);
-        free(arg);
-        cc_session_release_reason(session, "mca-wait-create-failed");
-        return;
-    }
-
-    pthread_detach(t);
 }
 
 /* ── A-leg DTMF handler for MCA decision ─────────────────────────────────── */

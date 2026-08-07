@@ -6,7 +6,9 @@
  *   - UDP + TCP SIP transports
  *   - No SIP REGISTER (inline B2BUA, routed by IMS core)
  *   - pjsua_callback wired to global cc_* handlers
+ *   - Worker pool started after pjsua_start(), stopped before pjsua_destroy()
  */
+#include "api_mapping.h"
 #include "b2bua.h"
 #include "app_logger.h"
 #include "config.h"
@@ -15,6 +17,8 @@
 #include "prompt_mapping.h"
 #include "runtime_config.h"
 #include "utils.h"
+#include "worker.h"
+#include "validation_async.h"
 
 #include <pjsua-lib/pjsua.h>
 #include <pjsip/sip_endpoint.h>
@@ -100,7 +104,7 @@ int main(void)
 
     /* ── 2. Configure ────────────────────────────────────────────── */
     pjsua_config_default(&ua_cfg);
-    ua_cfg.max_calls = CC_MAX_CALLS;
+    ua_cfg.max_calls = cc_cfg_max_calls();
     ua_cfg.user_agent = pj_str((char *)cc_cfg_user_agent());
 
     /* Wire global callbacks */
@@ -118,7 +122,7 @@ int main(void)
     ua_cfg.cb.on_dtmf_digit2      = cc_on_dtmf_digit2;
 
     pjsua_logging_config_default(&log_cfg);
-    log_cfg.level         = CC_LOG_LEVEL;
+    log_cfg.level         = cc_cfg_log_level();
     log_cfg.console_level = 0;
     log_cfg.cb            = &cc_app_logger_writer;
 
@@ -126,11 +130,16 @@ int main(void)
 	/* Bypass test: allow silence suppression so PJSUA does not keep forcing RTP to VM */
         med_cfg.no_vad      = PJ_FALSE;
 
-	med_cfg.clock_rate  = CC_CLOCK_RATE;    /* 8 kHz G.711             */
+	med_cfg.clock_rate     = CC_CLOCK_RATE;
 	med_cfg.snd_clock_rate = CC_CLOCK_RATE;
 
+	/* Allow enough conference bridge slots for all call legs.
+	 * Each session has 2 legs (A + B), each needing one slot; add 4 for WAV players.
+	 * With CC_MAX_CALLS=8192 legs this is 8192*2+4 = 16388 slots. */
+	med_cfg.max_media_ports = (unsigned)(cc_cfg_max_calls() * 2 + 4);
+
 	/* RTP start port must be configurable for production firewall/operator setup. */
-	/*med_cfg.port = CC_RTP_PORT_START; // not available in this installed PJSUA verison */
+	/*med_cfg.port = CC_RTP_PORT_START; // not available in this installed PJSUA version */
 
     status = pjsua_init(&ua_cfg, &log_cfg, &med_cfg);
     if (status != PJ_SUCCESS) {
@@ -179,9 +188,9 @@ int main(void)
                cc_cfg_default_country_code()));
     PJ_LOG(3, (THIS_FILE,
                "[CONFIG] RTP range=%d-%d count=%d",
-               CC_RTP_PORT_START,
-               CC_RTP_PORT_START + CC_RTP_PORT_COUNT - 1,
-               CC_RTP_PORT_COUNT));
+               cc_cfg_rtp_port_start(),
+               cc_cfg_rtp_port_start() + cc_cfg_rtp_port_count() - 1,
+               cc_cfg_rtp_port_count()));
     PJ_LOG(3, (THIS_FILE,
                "[CONFIG] validation=%s:%d timeout_ms=%d",
                cc_cfg_validation_host(),
@@ -211,11 +220,14 @@ int main(void)
                "[CONFIG] b_dtmf_timeout_sec=%d",
                cc_cfg_b_dtmf_timeout_sec()));
     PJ_LOG(3, (THIS_FILE,
-               "[CONFIG] max_call_legs=%d",
-               CC_MAX_CALLS));
+               "[CONFIG] max_call_legs=%d max_sessions=%d",
+               cc_cfg_max_calls(), cc_cfg_max_calls() / 2));
     PJ_LOG(3, (THIS_FILE,
                "[CONFIG] media_mode=%s",
                cc_cfg_media_mode_name()));
+    PJ_LOG(3, (THIS_FILE,
+               "[CONFIG] max_media_ports=%d",
+               cc_cfg_max_calls() * 2 + 4));
 
     /* ── 3. UDP transport ────────────────────────────────────────── */
     cc_prompt_mapping_load("wav/wav_mapping.conf");
@@ -319,8 +331,8 @@ int main(void)
     acc_cfg.use_rfc5626  = 0;              /* disable ;ob in Contact */
 
     /* Configured RTP port range */
-    acc_cfg.rtp_cfg.port = CC_RTP_PORT_START;
-    acc_cfg.rtp_cfg.port_range = CC_RTP_PORT_COUNT;
+    acc_cfg.rtp_cfg.port       = cc_cfg_rtp_port_start();
+    acc_cfg.rtp_cfg.port_range = cc_cfg_rtp_port_count();
     acc_cfg.rtp_cfg.randomize_port = PJ_FALSE;
 
 
@@ -338,6 +350,32 @@ int main(void)
     PJ_LOG(3, (THIS_FILE,
                "Collect Call B2BUA ready (acc_id=%d) — waiting for calls...",
                g_acc_id));
+
+    if (cc_worker_start() != 0) {
+        PJ_LOG(1, (THIS_FILE, "[ERROR] worker pool start failed"));
+        pjsua_destroy();
+        cc_app_logger_close();
+        return 1;
+    }
+    PJ_LOG(3, (THIS_FILE, "[WORKER] pool started (%d threads)",
+               CC_WORKER_POOL_SIZE));
+
+    if (cc_vasync_init() != 0) {
+        PJ_LOG(1, (THIS_FILE, "[ERROR] async validation init failed"));
+        cc_worker_stop();
+        pjsua_destroy();
+        cc_app_logger_close();
+        return 1;
+    }
+
+    if (cc_endcall_udp_init() != 0) {
+        PJ_LOG(1, (THIS_FILE, "[ERROR] end-call UDP socket init failed"));
+        cc_vasync_destroy();
+        cc_worker_stop();
+        pjsua_destroy();
+        cc_app_logger_close();
+        return 1;
+    }
 
 #if CC_OPTIONS_ENABLE
 #if CC_OPTIONS_PERIODIC_ENABLE
@@ -436,6 +474,9 @@ int main(void)
 #if CC_OPTIONS_ENABLE
     cc_options_stop_periodic();
 #endif
+    cc_vasync_destroy();
+    cc_endcall_udp_destroy();
+    cc_worker_stop();
     pjsua_destroy();
     cc_app_logger_close();
     return 0;

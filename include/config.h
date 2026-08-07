@@ -15,7 +15,7 @@
 #define CC_COLLECT_PREFIX           "1800"
 #define CC_SIP_DOMAIN               "10.20.10.119:5070"
 #define CC_LOCAL_HOST               "10.20.10.119"
-#define CC_LOCAL_SIP_PORT           6060
+#define CC_LOCAL_SIP_PORT           15060
 
 #define CC_USER_AGENT               "CollectCall"
 
@@ -82,8 +82,8 @@
 #define CC_END_API_COMPLETED_REASON_CONFIRMED 0
 
 /* ── RTP port range ────────────────────────────────────────────────────── */
-#define CC_RTP_PORT_START            6000
-#define CC_RTP_PORT_COUNT            400
+#define CC_RTP_PORT_START            16000
+#define CC_RTP_PORT_COUNT            16384
 
 /* Forward P-headers on INVITE. Keep UPDATE forwarding disabled unless required. */
 #define CC_COPY_P_HEADERS_IN_UPDATE  0
@@ -134,10 +134,13 @@ static const char *CC_FWD_HEADERS[] = {
 /*
  * PJSUA counts call legs, not complete collect-call sessions.
  * A connected collect call normally consumes two legs (A + B), so
- * CC_MAX_CALLS=200 is theoretically about 100 paired sessions. The RTP
- * port range must also be sized for both media legs plus operating margin.
+ * CC_MAX_CALLS=8192 supports ~4,096 paired sessions per process/IP.
+ * True ceiling is RTP port exhaustion: 16000–32767 = 16,768 ports
+ * ÷ 4 ports/session (RTP+RTCP × 2 legs) = 4,192 sessions max per IP.
+ * CC_RTP_PORT_COUNT=16384 covers this range.
+ * Requires PJSUA recompile with PJSUA_MAX_CALLS=8192 (set in Makefile).
  */
-#define CC_MAX_CALLS                200
+#define CC_MAX_CALLS                8192
 #define CC_LOG_LEVEL                4
 #define CC_CLOCK_RATE               8000   /* G.711 narrowband */
 #define CC_POOL_INIT_SIZE           4000
