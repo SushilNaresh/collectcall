@@ -207,7 +207,7 @@ static void *worker_thread(void *arg)
  * O(log n) insert/remove. Zero per-call threads.
  */
 
-#define CC_TIMER_HEAP_MAX  4096
+#define CC_TIMER_HEAP_MAX  16384  /* 100 CPS x 60s hold = 6000 sessions x ~2 timers each */
 
 typedef struct {
     long long   fire_at_ms;   /* CLOCK_MONOTONIC deadline */
@@ -308,44 +308,20 @@ static void *timer_thread_fn(void *arg)
             ev.player_a = PJSUA_INVALID_ID;
         }
 
-        /* Post to worker pool — cc_worker_post acquires its own ref.
-         * On success: release the timer's ref (worker owns it now).
-         * On failure: release the timer's ref and clean up. */
+        /* Post to worker pool — cc_worker_post acquires its own ref for the
+         * worker's copy of the event.  The timer held its own ref (ev.reason)
+         * while the event sat in the heap; that timer ref must be released
+         * here regardless of whether the post succeeded.
+         * On failure also clear a_treatment_running so maybe_finalize can run. */
         int posted = (cc_worker_post(&ev) == 0);
         if (!posted && ev.session) {
-            CC_SESSION_LOCK(ev.session);
-            ev.session->a_treatment_running = 0;
-            CC_SESSION_UNLOCK(ev.session);
-        }
-        if (ev.session) {
-            cc_session_t    *s    = ev.session;
-            pthread_mutex_t *lock = s->lock;   /* capture before any release can free s */
-            unsigned refs;
-            int destroy;
-
-            cc_session_acquire_reason(s, "timer-fire-guard");
-            cc_session_maybe_finalize(s);
-
-            /* Release both ev.reason and timer-fire-guard inside one locked
-             * block — same reasoning as process_event: cc_session_release_reason
-             * for ev.reason could call cc_session_destroy and free s, making
-             * any subsequent read of s->ref_count a UAF. */
+            pthread_mutex_t *lock = ev.session->lock;
             pthread_mutex_lock(lock);
-            refs = s->ref_count;
-            if (refs > 0) { refs--; s->ref_count = refs; }  /* ev.reason */
-            if (refs > 0) { refs--; s->ref_count = refs; }  /* timer-fire-guard */
-            destroy = (refs == 0);
+            ev.session->a_treatment_running = 0;
             pthread_mutex_unlock(lock);
-
-            PJ_LOG(4, ("session",
-                       "[SESSION] release reason=%s session=%p refs=%u",
-                       ev.reason, s, refs > 0 ? refs + 1 : 0));
-            PJ_LOG(4, ("session",
-                       "[SESSION] release reason=timer-fire-guard session=%p refs=%u",
-                       s, refs));
-            if (destroy)
-                cc_session_destroy(s);
         }
+        if (ev.session)
+            cc_session_release_reason(ev.session, ev.reason);
 
         pthread_mutex_lock(&g_timer_mutex);
     }
@@ -537,11 +513,26 @@ static void ev_wav_hangup_a(cc_event_t *ev)
             cc_stop_wav(pid, PJSUA_INVALID_ID);
             if (cc_session_call_is_current(s, call_a, 1))
                 cc_safe_hangup(call_a, code);
+            /* HANGUP_A_ONLY will not run — clear treatment flag now */
+            pthread_mutex_t *lock = s->lock;
+            pthread_mutex_lock(lock);
+            s->a_treatment_running = 0;
+            pthread_mutex_unlock(lock);
         }
-        /* a_treatment_running stays set — HANGUP_A_ONLY clears it via process_event */
+        /* a_treatment_running stays set when post succeeded —
+         * HANGUP_A_ONLY is the terminal event and clears it via process_event */
         return;
     }
-    /* a_treatment_running cleared by process_event after maybe_finalize */
+    /* Stale path: call already gone, HANGUP_A_ONLY was never posted.
+     * Clear a_treatment_running here so maybe_finalize can proceed.
+     * process_event tail must NOT clear it for WAV_HANGUP_A (it would
+     * race with an already-queued HANGUP_A_ONLY on the non-stale path). */
+    {
+        pthread_mutex_t *lock = s->lock;
+        pthread_mutex_lock(lock);
+        s->a_treatment_running = 0;
+        pthread_mutex_unlock(lock);
+    }
 }
 
 /* CC_EV_HANGUP_A_ONLY — fires after treatment WAV duration expires */
@@ -1461,46 +1452,29 @@ static void process_event(cc_event_t *ev)
     /* Clear a_treatment_running before maybe_finalize so the session can be
      * finalized if both legs are gone. Must happen while we still hold the
      * worker's ref (release_reason comes after), so the session is alive. */
-    if (ev->session &&
-        (ev->type == CC_EV_WAV_HANGUP_A || ev->type == CC_EV_MCA_WAIT ||
-         ev->type == CC_EV_HANGUP_A_ONLY)) {
-        CC_SESSION_LOCK(ev->session);
-        ev->session->a_treatment_running = 0;
-        CC_SESSION_UNLOCK(ev->session);
-    }
-    /* Acquire a local guard ref so the session pointer stays valid across
-     * both maybe_finalize and release_reason regardless of which one drops
-     * ref_count to 0 and triggers cc_session_destroy. */
     if (ev->session) {
         cc_session_t    *s    = ev->session;
-        pthread_mutex_t *lock = s->lock;   /* capture before any release can free s */
-        unsigned refs;
-        int destroy;
+        pthread_mutex_t *lock = s->lock;  /* heap-allocated; outlives pool */
 
-        cc_session_acquire_reason(s, "process-event-guard");
+        /* Clear a_treatment_running and run maybe_finalize while the worker
+         * ref still keeps s alive — safe to touch s->lock here. */
+        /* CC_EV_WAV_HANGUP_A must NOT clear a_treatment_running here:
+         * it posts CC_EV_HANGUP_A_ONLY which is the real terminal event.
+         * Clearing here would allow maybe_finalize to destroy the session
+         * while HANGUP_A_ONLY is still queued, causing a destroyed-mutex
+         * crash at line 1447 when HANGUP_A_ONLY reaches process_event.
+         * Only the true terminal treatment events clear the flag. */
+        if (ev->type == CC_EV_HANGUP_A_ONLY || ev->type == CC_EV_MCA_WAIT) {
+            pthread_mutex_lock(lock);
+            s->a_treatment_running = 0;
+            pthread_mutex_unlock(lock);
+        }
+
         cc_session_maybe_finalize(s);
 
-        /* Release both ev->reason and process-event-guard inside a single
-         * locked block so s is never read after pj_pool_release frees it.
-         * cc_session_release_reason is NOT used here — it would read s->lock
-         * and s->ref_count after s may already be freed by cc_session_destroy
-         * triggered by the first decrement. */
-        pthread_mutex_lock(lock);
-        refs = s->ref_count;
-        /* Decrement ev->reason ref */
-        if (refs > 0) { refs--; s->ref_count = refs; }
-        /* Decrement process-event-guard ref */
-        if (refs > 0) { refs--; s->ref_count = refs; }
-        destroy = (refs == 0);
-        pthread_mutex_unlock(lock);
-
-        PJ_LOG(4, ("session",
-                   "[SESSION] release reason=%s session=%p refs=%u",
-                   ev->reason, s, refs > 0 ? refs + 1 : 0));
-        PJ_LOG(4, ("session",
-                   "[SESSION] release reason=process-event-guard session=%p refs=%u",
-                   s, refs));
-        if (destroy)
-            cc_session_destroy(s);
+        /* release_reason drops the worker ref.  If ref_count hits 0 it calls
+         * cc_session_destroy which calls pthread_mutex_destroy(lock)+free(lock).
+         * After this point s and lock must not be touched. */
+        cc_session_release_reason(s, ev->reason);
     }
 }

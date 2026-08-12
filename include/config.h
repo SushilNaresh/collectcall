@@ -28,10 +28,11 @@
 /* Application-generated PJLIB/PJSIP log file. */
 #define CC_APP_LOG_ENABLE           1
 #define CC_APP_LOG_DIR              "logs"
-#define CC_APP_LOG_TO_CONSOLE       1
-#define CC_APP_LOG_FLUSH_ALWAYS     1
+#define CC_APP_LOG_TO_CONSOLE       0    /* disable at >50 CPS — console I/O is a bottleneck */
+#define CC_APP_LOG_FLUSH_ALWAYS     0    /* disable at >50 CPS — let OS buffer; rotate handles loss */
 #define CC_APP_LOG_FILE_MODE        0640
 #define CC_APP_LOG_PREFIX           "collect_call"
+#define CC_APP_LOG_MAX_SIZE_MB      100   /* rotate log file after this many MB; 0 = no limit */
 
 /* ── SIP OPTIONS health check ────────────────────────────────────────── */
 #define CC_OPTIONS_ENABLE           0
@@ -82,8 +83,20 @@
 #define CC_END_API_COMPLETED_REASON_CONFIRMED 0
 
 /* ── RTP port range ────────────────────────────────────────────────────── */
+/*
+ * Stay below Linux ephemeral range (default 32768–60999) to avoid
+ * collision with OS-assigned sockets in TIME_WAIT.
+ * 4 ports per session (RTP+RTCP × A+B legs):
+ *   50 CPS × 60s hold  = 3,000 sessions × 4 = 12,000 ports needed
+ *   100 CPS × 60s hold = 6,000 sessions × 4 = 24,000 ports needed
+ * Range 16000–31999 = 16,000 ports → safe for 50 CPS
+ * Range 16000–27999 = 12,000 ports → safe for 50 CPS with tighter bound
+ * Use 16000–31999 (16000 ports) for single instance ≤50 CPS.
+ * For 100 CPS: either raise to 16000–27999 and pin ephemeral above 40000,
+ * or split across two instances on different IPs.
+ */
 #define CC_RTP_PORT_START            16000
-#define CC_RTP_PORT_COUNT            16384
+#define CC_RTP_PORT_COUNT            16000  /* 16000–31999: below ephemeral range */
 
 /* Forward P-headers on INVITE. Keep UPDATE forwarding disabled unless required. */
 #define CC_COPY_P_HEADERS_IN_UPDATE  0
@@ -140,11 +153,11 @@ static const char *CC_FWD_HEADERS[] = {
  * CC_RTP_PORT_COUNT=16384 covers this range.
  * Requires PJSUA recompile with PJSUA_MAX_CALLS=8192 (set in Makefile).
  */
-#define CC_MAX_CALLS                8192
-#define CC_LOG_LEVEL                4
+#define CC_MAX_CALLS                8192   /* 4096 sessions × 2 legs; was 32768 — PJSUA pre-allocs all slots */
+#define CC_LOG_LEVEL                3    /* reduce from 4 at >50 CPS — level 4 logs every ref acquire/release */
 #define CC_CLOCK_RATE               8000   /* G.711 narrowband */
-#define CC_POOL_INIT_SIZE           4000
-#define CC_POOL_INC_SIZE            4000
+#define CC_POOL_INIT_SIZE           8192   /* fits cc_session_t(~3940B) + fwd_hdr values in one block; was 4000 */
+#define CC_POOL_INC_SIZE            4096   /* was 4000 */
 
 /*
  * Adaptive event loop cap (milliseconds).
@@ -152,7 +165,12 @@ static const char *CC_FWD_HEADERS[] = {
  * this value. Keeps signal/shutdown latency bounded while avoiding the
  * fixed 10 ms busy-poll when the system is idle.
  */
-#define CC_EVENT_LOOP_MAX_MS        500
+#define CC_EVENT_LOOP_MAX_MS        10
+
+/* Build version — overridden at compile time by Makefile via -DCC_BUILD_VERSION */
+#ifndef CC_BUILD_VERSION
+#define CC_BUILD_VERSION "dev"
+#endif
 
 /* Free period: max prompt duration for A-party, and minimum time before
  * charging starts (B-accept is delayed if it arrives within this window).

@@ -132,6 +132,11 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
     pjsua_call_setting cs;
     pj_status_t      status;
 
+    /* Send 100 Trying immediately — before any processing — so kamailio's
+     * t_fr_timer does not expire while we do session setup (pool alloc,
+     * header parsing, MSISDN normalisation, etc.) under peak load. */
+    pjsua_call_answer(call_id, PJSIP_SC_TRYING, NULL, NULL);
+
     status = pjsua_call_get_info(call_id, &ci);
     if (status != PJ_SUCCESS) {
         PJ_LOG(1, (THIS_FILE,
@@ -256,7 +261,7 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
                            "[DIALED] prefix matched but remaining digits=%zu (need 10); "
                            "playing incomplete-number prompt to call %d",
                            dlen - best, call_id));
-                session = cc_session_create(pjsua_get_pool_factory());
+                session = cc_session_create();
                 if (!session) {
                     pjsua_call_answer(call_id, PJSIP_SC_NOT_FOUND, NULL, NULL);
                     return;
@@ -368,7 +373,7 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
 
         /* Must create a minimal session so leg_a_play_prompt_then_hangup
          * can play the WAV and hang up A cleanly. */
-        session = cc_session_create(pjsua_get_pool_factory());
+        session = cc_session_create();
         if (!session) {
             pjsua_call_answer(call_id, PJSIP_SC_NOT_FOUND, NULL, NULL);
             return;
@@ -411,7 +416,7 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
         cc_session_maybe_finalize(session);
         return;
     }
-    session = cc_session_create(pjsua_get_pool_factory());
+    session = cc_session_create();
     if (!session) {
         PJ_LOG(1, (THIS_FILE, "session_create failed"));
         pjsua_call_answer(call_id, PJSIP_SC_SERVICE_UNAVAILABLE, NULL, NULL);

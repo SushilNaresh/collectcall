@@ -19,6 +19,7 @@ static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static FILE *g_log_file = NULL;
 static char g_log_dir[CC_LOG_PATH_MAX] = "";
 static char g_log_path[CC_LOG_PATH_MAX] = "console-only";
+static long long g_log_bytes_written = 0;
 
 static int ensure_one_directory(const char *path)
 {
@@ -81,6 +82,45 @@ static int ensure_directory_tree(const char *directory)
     return ensure_one_directory(path);
 }
 
+/* Opens a new log file with a fresh timestamp; called with g_log_lock held. */
+static int open_new_log_file(void)
+{
+    char timestamp[32];
+    struct tm local_tm;
+    time_t now;
+    int path_len, fd;
+    FILE *file;
+    char new_path[CC_LOG_PATH_MAX];
+
+    now = time(NULL);
+    if (localtime_r(&now, &local_tm) == NULL ||
+        strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &local_tm) == 0)
+        return -1;
+
+    path_len = snprintf(new_path, sizeof(new_path), "%s/%s_%s_%ld.log",
+                        g_log_dir, CC_APP_LOG_PREFIX, timestamp, (long)getpid());
+    if (path_len < 0 || (size_t)path_len >= sizeof(new_path))
+        return -1;
+
+    fd = open(new_path, O_WRONLY | O_CREAT | O_APPEND, CC_APP_LOG_FILE_MODE);
+    if (fd < 0)
+        return -1;
+
+    file = fdopen(fd, "a");
+    if (!file) { close(fd); return -1; }
+
+    setvbuf(file, NULL, _IOLBF, 0);
+
+    if (g_log_file) {
+        fflush(g_log_file);
+        fclose(g_log_file);
+    }
+    g_log_file = file;
+    g_log_bytes_written = 0;
+    snprintf(g_log_path, sizeof(g_log_path), "%s", new_path);
+    return 0;
+}
+
 static int set_effective_directory(void)
 {
     const char *configured = CC_APP_LOG_DIR;
@@ -105,16 +145,8 @@ static int set_effective_directory(void)
 int cc_app_logger_init(void)
 {
 #if CC_APP_LOG_ENABLE
-    char timestamp[32];
-    struct tm local_tm;
-    time_t now;
-    int path_len;
-    int fd;
-    FILE *file;
-
     if (set_effective_directory() != 0) {
-        fprintf(stderr, "[LOGGER] invalid log directory: %s\n",
-                strerror(errno));
+        fprintf(stderr, "[LOGGER] invalid log directory: %s\n", strerror(errno));
         return -1;
     }
 
@@ -126,57 +158,13 @@ int cc_app_logger_init(void)
         return -1;
     }
 
-    now = time(NULL);
-    if (localtime_r(&now, &local_tm) == NULL ||
-        strftime(timestamp, sizeof(timestamp),
-                 "%Y%m%d_%H%M%S", &local_tm) == 0)
-    {
+    if (open_new_log_file() != 0) {
         fprintf(stderr,
-                "[LOGGER] cannot generate timestamp; "
+                "[LOGGER] cannot open initial log file; "
                 "continuing with console logging\n");
-        return -1;
-    }
-
-    path_len = snprintf(g_log_path, sizeof(g_log_path),
-                        "%s/%s_%s_%ld.log",
-                        g_log_dir, CC_APP_LOG_PREFIX,
-                        timestamp, (long)getpid());
-    if (path_len < 0 || (size_t)path_len >= sizeof(g_log_path)) {
-        snprintf(g_log_path, sizeof(g_log_path), "%s", "console-only");
-        fprintf(stderr,
-                "[LOGGER] log path is too long; "
-                "continuing with console logging\n");
-        return -1;
-    }
-
-    fd = open(g_log_path, O_WRONLY | O_CREAT | O_APPEND,
-              CC_APP_LOG_FILE_MODE);
-    if (fd < 0) {
-        fprintf(stderr,
-                "[LOGGER] cannot open log file '%s': %s; "
-                "continuing with console logging\n",
-                g_log_path, strerror(errno));
         snprintf(g_log_path, sizeof(g_log_path), "%s", "console-only");
         return -1;
     }
-
-    file = fdopen(fd, "a");
-    if (!file) {
-        int saved_errno = errno;
-        close(fd);
-        fprintf(stderr,
-                "[LOGGER] cannot create log stream: %s; "
-                "continuing with console logging\n",
-                strerror(saved_errno));
-        snprintf(g_log_path, sizeof(g_log_path), "%s", "console-only");
-        return -1;
-    }
-
-    setvbuf(file, NULL, _IOLBF, 0);
-
-    pthread_mutex_lock(&g_log_lock);
-    g_log_file = file;
-    pthread_mutex_unlock(&g_log_lock);
 #else
     if (set_effective_directory() != 0)
         snprintf(g_log_dir, sizeof(g_log_dir), "%s", "logs");
@@ -198,8 +186,13 @@ void cc_app_logger_writer(int level, const char *data, int len)
 
 #if CC_APP_LOG_ENABLE
     if (g_log_file) {
-        fwrite(data, 1, (size_t)len, g_log_file);
-        if (needs_nl) fputc('\n', g_log_file);
+#if CC_APP_LOG_MAX_SIZE_MB > 0
+        long long max_bytes = (long long)(CC_APP_LOG_MAX_SIZE_MB) * 1024 * 1024;
+        if (g_log_bytes_written + len + 1 > max_bytes)
+            open_new_log_file(); /* rotate; errors silently keep old file */
+#endif
+        g_log_bytes_written += fwrite(data, 1, (size_t)len, g_log_file);
+        if (needs_nl) { fputc('\n', g_log_file); g_log_bytes_written++; }
 #if CC_APP_LOG_FLUSH_ALWAYS
         fflush(g_log_file);
 #endif

@@ -144,6 +144,7 @@ void leg_b_on_call_state(pjsua_call_id call_id, cc_session_t *session)
         cc_session_invalidate_b(session, call_id);
 
         if (should_reject_a) {
+
             /* B dropped before accepting — play rejection to A */
             PJ_LOG(3, (THIS_FILE, "[B] disconnected before accept — reject A"));
 
@@ -176,6 +177,8 @@ void leg_b_on_call_state(pjsua_call_id call_id, cc_session_t *session)
                 cc_safe_hangup(call_a, PJSIP_SC_OK);
             }
         }
+
+        cc_session_maybe_finalize(session);
     }
 }
 

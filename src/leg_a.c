@@ -187,6 +187,8 @@ pjsua_call_id leg_a_on_call_state(pjsua_call_id call_id,
             if (cc_session_call_is_current(session, b, 0))
                 cc_safe_hangup(b, PJSIP_SC_OK);
         }
+
+        cc_session_maybe_finalize(session);
     }
 
     return deferred_hangup;

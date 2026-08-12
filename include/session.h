@@ -29,10 +29,10 @@ typedef struct {
 } cc_rtp_ep_t;
 
 /* ── Forwarded SIP header (name + value) ──────────────────────────────── */
-#define CC_MAX_FWD_HDRS  16
+#define CC_MAX_FWD_HDRS  8     /* we forward ~5-6 headers; was 16 */
 typedef struct {
-    char name[128];
-    char *value;        /* exact value copied into the session pool */
+    char  name[32];   /* longest SIP header name is 25 chars; was 128 */
+    char *value;      /* exact value copied into the session pool */
 } cc_sip_hdr_t;
 
 /* ── Session ────────────────────────────────────────────────────────────── */
@@ -129,8 +129,12 @@ typedef struct cc_session {
     void               *originate_arg; /* cc_originate_arg_t* set before worker post */
 } cc_session_t;
 
+/* ── Pool lifecycle ─────────────────────────────────────────────────────── */
+void          cc_session_pool_init(void);    /* call once after pjsua_create() */
+void          cc_session_pool_destroy(void); /* call before pjsua_destroy()    */
+
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
-cc_session_t *cc_session_create(pj_pool_factory *pf);
+cc_session_t *cc_session_create(void);  /* uses internal bounded pool — no pf arg */
 void          cc_session_destroy(cc_session_t *s);
 int           cc_session_acquire(cc_session_t *s);
 void          cc_session_release(cc_session_t *s);

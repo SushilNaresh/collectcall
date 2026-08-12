@@ -6,15 +6,59 @@
 #include "runtime_config.h"
 
 #include <pj/pool.h>
+#include <pj/os.h>
 #include <string.h>
 #include <stdlib.h>
 
-cc_session_t *cc_session_create(pj_pool_factory *pf)
+/*
+ * Dedicated caching pool for session objects.
+ *
+ * WHY NOT pjsua_get_pool_factory():
+ *   pj_caching_pool never returns freed blocks to the OS — it holds them
+ *   in a free list bounded by max_capacity (PJSUA's default = 0 = unlimited).
+ *   Under load, every destroyed session's 8KB pool block accumulates in
+ *   PJSUA's cache. RSS grows monotonically with peak session count and
+ *   never shrinks, even after all calls end.
+ *
+ * FIX: own caching pool with max_capacity = peak_sessions * pool_block_size.
+ *   Blocks beyond the cap are freed directly to the OS via free().
+ *   Peak = CC_MAX_CALLS/2 sessions * CC_POOL_INIT_SIZE bytes each.
+ *   This bounds the cached pool memory to ~64MB at CC_MAX_CALLS=8192.
+ */
+#define CC_SESSION_POOL_CAP  ((pj_size_t)(CC_MAX_CALLS / 2) * CC_POOL_INIT_SIZE)
+
+static pj_caching_pool g_session_cp;
+static int             g_session_cp_init = 0;
+
+void cc_session_pool_init(void)
+{
+    pj_caching_pool_init(&g_session_cp, NULL, CC_SESSION_POOL_CAP);
+    g_session_cp_init = 1;
+    PJ_LOG(3, ("session",
+               "[SESSION] pool init cap=%zu KB",
+               (size_t)(CC_SESSION_POOL_CAP / 1024)));
+}
+
+void cc_session_pool_destroy(void)
+{
+    if (g_session_cp_init) {
+        pj_caching_pool_destroy(&g_session_cp);
+        g_session_cp_init = 0;
+    }
+}
+
+cc_session_t *cc_session_create(void)
 {
     pj_pool_t    *pool;
     cc_session_t *s;
 
-    pool = pj_pool_create(pf, "cc_session",
+    if (!g_session_cp_init) {
+        PJ_LOG(1, ("session", "[SESSION] pool not initialised"));
+        return NULL;
+    }
+
+    pool = pj_pool_create(&g_session_cp.factory,
+                          "cc_session",
                           CC_POOL_INIT_SIZE, CC_POOL_INC_SIZE, NULL);
     if (!pool)
         return NULL;

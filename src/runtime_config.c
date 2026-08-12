@@ -393,8 +393,11 @@ int cc_cfg_rtp_port_count(void)
         return CC_RTP_PORT_COUNT;
 
     parsed = strtol(value, &end, 10);
-    /* must be even (RTP+RTCP pairs), at least 2, at most 49000 */
-    if (end == value || *end != '\0' || parsed < 2 || parsed > 49000)
+    /* must be even (RTP+RTCP pairs), at least 2.
+     * Upper bound: port_start + port_count must not exceed 65535.
+     * Validated against port_start at runtime in main.c [CONFIG] log.
+     * Allow up to 64000 to accommodate 54000 and similar large ranges. */
+    if (end == value || *end != '\0' || parsed < 2 || parsed > 64000)
         return CC_RTP_PORT_COUNT;
 
     /* round down to even so every port has an RTCP partner */

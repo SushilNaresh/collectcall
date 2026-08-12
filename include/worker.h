@@ -17,8 +17,8 @@
 #include <pjsua-lib/pjsua.h>
 #include <stdint.h>
 
-#define CC_WORKER_POOL_SIZE   64     /* fixed worker threads */
-#define CC_WORKER_QUEUE_SIZE  16384  /* MPSC ring slots      */
+#define CC_WORKER_POOL_SIZE   64     /* 50 CPS × 60s / 60 = 50 blocking workers; 64 gives headroom */
+#define CC_WORKER_QUEUE_SIZE  16384  /* MPSC ring slots — must be power of 2; 16K covers 50 CPS bursts */
 
 /* ── Event types ─────────────────────────────────────────────────────────── */
 typedef enum {

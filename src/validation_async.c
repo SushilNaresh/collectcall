@@ -33,7 +33,7 @@
 #include <pj/os.h>
 
 #define THIS_FILE       "validation_async.c"
-#define MAX_PENDING     512
+#define MAX_PENDING     1024
 #define RESPONSE_BUF    2048
 #define REQUEST_BUF     1536
 #define EPOLL_TIMEOUT_MS 200   /* wake up to sweep timeouts */
@@ -48,6 +48,50 @@ typedef struct {
     struct timespec          deadline;   /* absolute monotonic deadline */
 } vasync_slot_t;
 
+static vasync_slot_t    g_slots[MAX_PENDING];
+
+/* ── hash index for O(1) callId lookup ──────────────────────────────────── */
+/* Simple open-addressing hash over the slot array. */
+#define HASH_SIZE  2048   /* must be power of 2 and > MAX_PENDING */
+
+static int g_hash[HASH_SIZE];  /* slot index + 1, or 0 = empty */
+
+static unsigned hash_callid(const char *s)
+{
+    unsigned h = 5381;
+    while (*s) h = h * 33 ^ (unsigned char)*s++;
+    return h & (HASH_SIZE - 1);
+}
+
+static void hash_insert(int slot)
+{
+    unsigned h = hash_callid(g_slots[slot].call_id);
+    while (g_hash[h]) h = (h + 1) & (HASH_SIZE - 1);
+    g_hash[h] = slot + 1;
+}
+
+static int hash_find_remove(const char *call_id)
+{
+    unsigned h = hash_callid(call_id);
+    while (g_hash[h]) {
+        int idx = g_hash[h] - 1;
+        if (strcmp(g_slots[idx].call_id, call_id) == 0) {
+            g_hash[h] = 0;
+            /* rehash any entries that were displaced by this one */
+            unsigned j = (h + 1) & (HASH_SIZE - 1);
+            while (g_hash[j]) {
+                int ridx = g_hash[j] - 1;
+                g_hash[j] = 0;
+                hash_insert(ridx);
+                j = (j + 1) & (HASH_SIZE - 1);
+            }
+            return idx;
+        }
+        h = (h + 1) & (HASH_SIZE - 1);
+    }
+    return -1;
+}
+
 /* ── module state ───────────────────────────────────────────────────────── */
 
 static int              g_sockfd   = -1;
@@ -55,7 +99,6 @@ static int              g_epollfd  = -1;
 static pthread_t        g_thread;
 static int              g_running  = 0;
 
-static vasync_slot_t    g_slots[MAX_PENDING];
 static pthread_mutex_t  g_lock     = PTHREAD_MUTEX_INITIALIZER;
 
 static struct sockaddr_in g_server_addr;
@@ -229,6 +272,7 @@ static int slot_alloc(const char *call_id,
                 g_slots[i].deadline.tv_sec++;
                 g_slots[i].deadline.tv_nsec -= 1000000000L;
             }
+            hash_insert(i);
             pthread_mutex_unlock(&g_lock);
             return i;
         }
@@ -239,6 +283,7 @@ static int slot_alloc(const char *call_id,
 
 static void slot_free(int i)
 {
+    /* hash entry already removed by hash_find_remove or sweep */
     g_slots[i].in_use = 0;
 }
 
@@ -286,6 +331,7 @@ static void sweep_timeouts(void)
         {
             cc_vasync_callback_t cb     = g_slots[i].cb;
             void                *cb_arg = g_slots[i].cb_arg;
+            hash_find_remove(g_slots[i].call_id);  /* remove from hash first */
             slot_free(i);
             pthread_mutex_unlock(&g_lock);
 
@@ -344,19 +390,12 @@ static void *dispatcher_thread(void *arg)
                 void *cb_arg = NULL;
 
                 pthread_mutex_lock(&g_lock);
-                if (resp_call_id[0] != '\0') {
-                    int i;
-                    for (i = 0; i < MAX_PENDING; i++) {
-                        if (g_slots[i].in_use &&
-                            strcmp(g_slots[i].call_id, resp_call_id) == 0)
-                        {
-                            matched = i;
-                            cb      = g_slots[i].cb;
-                            cb_arg  = g_slots[i].cb_arg;
-                            slot_free(i);
-                            break;
-                        }
-                    }
+                if (resp_call_id[0] != '\0')
+                    matched = hash_find_remove(resp_call_id);
+                if (matched >= 0) {
+                    cb     = g_slots[matched].cb;
+                    cb_arg = g_slots[matched].cb_arg;
+                    slot_free(matched);
                 }
                 pthread_mutex_unlock(&g_lock);
 
@@ -386,11 +425,21 @@ int cc_vasync_init(void)
     int port         = cc_cfg_validation_port();
 
     memset(g_slots, 0, sizeof(g_slots));
+    memset(g_hash,  0, sizeof(g_hash));
 
     g_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (g_sockfd < 0) {
         PJ_LOG(1, (THIS_FILE, "[VASYNC] socket() failed: %s", strerror(errno)));
         return -1;
+    }
+
+    /* Set recv buffer large enough to absorb burst responses at 50 CPS.
+     * Without this the kernel auto-expands to 25MB+ under load (observed
+     * in netstat: Recv-Q=26214720). 4MB is sufficient for 50 CPS x 5s
+     * timeout = 250 in-flight x 2KB response = 500KB peak; 4MB gives 8x. */
+    {
+        int rcvbuf = 4 * 1024 * 1024;
+        setsockopt(g_sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     }
 
     /* non-blocking */

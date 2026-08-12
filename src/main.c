@@ -21,6 +21,7 @@
 #include "validation_async.h"
 
 #include <pjsua-lib/pjsua.h>
+#include <pjsua-lib/pjsua_internal.h>
 #include <pjsip/sip_endpoint.h>
 #include <pjsip/sip_config.h>
 #include <pj/timer.h>
@@ -96,16 +97,34 @@ int main(void)
     }
 
     cc_app_logger_install_pj_writer();
+
+    /*
+     * Cap PJSUA's internal caching pool (pjsua_var.cp).
+     * Default max_capacity=0 means unlimited: every freed per-call block
+     * (dialog, inv_session, SDP, transactions, RTP state) accumulates in
+     * the free list and is never returned to the OS.  RSS grows with peak
+     * call count and never shrinks.
+     * Cap = CC_MAX_CALLS * 64KB covers the full concurrent working set
+     * (~40KB/leg * 8192 legs = 320MB) with headroom for block reuse.
+     * Blocks beyond the cap are freed directly to the OS via free().
+     */
+    pjsua_var.cp.max_capacity = (pj_size_t)cc_cfg_max_calls() * 64 * 1024;
+    PJ_LOG(3, (THIS_FILE, "[CONFIG] pjsua internal pool cap=%zu MB",
+               (size_t)(pjsua_var.cp.max_capacity / 1024 / 1024)));
+
+    cc_session_pool_init();
     PJ_LOG(3, (THIS_FILE,
                "[APP] start pid=%ld log_dir=%s log_file=%s",
                (long)getpid(),
                cc_app_logger_dir(),
                cc_app_logger_path()));
+    PJ_LOG(3, (THIS_FILE, "[APP] version=%s", CC_BUILD_VERSION));
 
     /* ── 2. Configure ────────────────────────────────────────────── */
     pjsua_config_default(&ua_cfg);
-    ua_cfg.max_calls = cc_cfg_max_calls();
-    ua_cfg.user_agent = pj_str((char *)cc_cfg_user_agent());
+    ua_cfg.max_calls    = cc_cfg_max_calls();
+    ua_cfg.thread_cnt   = 4;   /* 4 PJSUA SIP I/O threads: handles 100 CPS without single-thread bottleneck */
+    ua_cfg.user_agent   = pj_str((char *)cc_cfg_user_agent());
 
     /* Wire global callbacks */
     ua_cfg.cb.on_incoming_call    = cc_on_incoming_call;
@@ -127,11 +146,11 @@ int main(void)
     log_cfg.cb            = &cc_app_logger_writer;
 
     	pjsua_media_config_default(&med_cfg);
-	/* Bypass test: allow silence suppression so PJSUA does not keep forcing RTP to VM */
-        med_cfg.no_vad      = PJ_FALSE;
+	med_cfg.no_vad      = PJ_TRUE;   /* disable VAD — B2BUA must always forward RTP */
 
 	med_cfg.clock_rate     = CC_CLOCK_RATE;
 	med_cfg.snd_clock_rate = CC_CLOCK_RATE;
+	med_cfg.thread_cnt     = 2;   /* 2 RTP I/O threads: handles 100 CPS RTP processing */
 
 	/* Allow enough conference bridge slots for all call legs.
 	 * Each session has 2 legs (A + B), each needing one slot; add 4 for WAV players.
@@ -191,6 +210,12 @@ int main(void)
                cc_cfg_rtp_port_start(),
                cc_cfg_rtp_port_start() + cc_cfg_rtp_port_count() - 1,
                cc_cfg_rtp_port_count()));
+    if (cc_cfg_rtp_port_start() + cc_cfg_rtp_port_count() > 65535)
+        PJ_LOG(1, (THIS_FILE,
+                   "[CONFIG] WARNING: RTP range %d-%d exceeds port limit 65535 — "
+                   "reduce CC_RTP_PORT_START or CC_RTP_PORT_COUNT",
+                   cc_cfg_rtp_port_start(),
+                   cc_cfg_rtp_port_start() + cc_cfg_rtp_port_count() - 1));
     PJ_LOG(3, (THIS_FILE,
                "[CONFIG] validation=%s:%d timeout_ms=%d",
                cc_cfg_validation_host(),
@@ -402,6 +427,15 @@ int main(void)
         pj_timer_heap_t *timer_heap = pjsip_endpt_get_timer_heap(endpt);
         int pipe_fds[2];
 
+        /* Port-drain diagnostics: track idle stretches and timer-heap depth */
+        unsigned long  loop_total       = 0;  /* total handle_events2 calls */
+        unsigned long  loop_idle        = 0;  /* calls that returned event_count=0 */
+        unsigned long  loop_busy        = 0;  /* calls that returned event_count>0 */
+        unsigned long  idle_streak      = 0;  /* consecutive idle iterations */
+        unsigned long  idle_streak_max  = 0;  /* longest idle streak observed */
+        pj_time_val    last_busy_time;
+        pj_gettimeofday(&last_busy_time);
+
         if (pipe(pipe_fds) == 0) {
             fcntl(pipe_fds[1], F_SETFL,
                   fcntl(pipe_fds[1], F_GETFL) | O_NONBLOCK);
@@ -421,15 +455,62 @@ int main(void)
             unsigned event_count = 0;
             long wait_ms = CC_EVENT_LOOP_MAX_MS;
             int nfds;
+            pj_size_t heap_size;
 
             /* Process pending SIP events first (non-blocking) */
             pj_timeout.sec  = 0;
             pj_timeout.msec = 0;
             pjsip_endpt_handle_events2(endpt, &pj_timeout, &event_count);
+            loop_total++;
 
-            /* If events were processed, loop immediately — no sleep */
-            if (event_count > 0)
+            if (event_count > 0) {
+                /* Busy: reset idle streak, record last-busy timestamp */
+                loop_busy++;
+                if (idle_streak > idle_streak_max)
+                    idle_streak_max = idle_streak;
+                if (idle_streak >= 100) {
+                    /* Transitioning from long idle back to busy — port drain
+                     * backlog is now being processed again. Log the gap so
+                     * we can correlate with netstat port counts. */
+                    pj_gettimeofday(&now);
+                    PJ_LOG(3, (THIS_FILE,
+                               "[LOOP-DRAIN] busy resumed after %lu idle iters "
+                               "idle_streak_max=%lu total=%lu busy=%lu idle=%lu",
+                               idle_streak, idle_streak_max,
+                               loop_total, loop_busy, loop_idle));
+                }
+                idle_streak = 0;
+                pj_gettimeofday(&last_busy_time);
                 continue;
+            }
+
+            /* Idle iteration */
+            loop_idle++;
+            idle_streak++;
+
+            /* Log when we first go idle after a busy period — this is the
+             * moment the port-drain backlog may start accumulating. */
+            if (idle_streak == 1) {
+                heap_size = pj_timer_heap_count(timer_heap);
+                pj_gettimeofday(&now);
+                PJ_LOG(3, (THIS_FILE,
+                           "[LOOP-DRAIN] went idle: timer_heap_pending=%lu "
+                           "total=%lu busy=%lu idle=%lu",
+                           (unsigned long)heap_size,
+                           loop_total, loop_busy, loop_idle));
+            }
+
+            /* Periodic idle log every 500 iterations (~5s at max_ms=10):
+             * shows if timer heap is draining or stuck. */
+            if (idle_streak % 500 == 0) {
+                heap_size = pj_timer_heap_count(timer_heap);
+                pj_gettimeofday(&now);
+                PJ_LOG(3, (THIS_FILE,
+                           "[LOOP-DRAIN] still idle: streak=%lu timer_heap_pending=%lu "
+                           "total=%lu busy=%lu idle=%lu",
+                           idle_streak, (unsigned long)heap_size,
+                           loop_total, loop_busy, loop_idle));
+            }
 
             /* No events: determine sleep time from next PJSIP timer */
             if (pj_timer_heap_earliest_time(timer_heap,
@@ -466,6 +547,12 @@ int main(void)
             }
         }
 
+        /* Final loop stats on shutdown */
+        PJ_LOG(3, (THIS_FILE,
+                   "[LOOP-DRAIN] shutdown stats: total=%lu busy=%lu idle=%lu "
+                   "idle_streak_max=%lu",
+                   loop_total, loop_busy, loop_idle, idle_streak_max));
+
         if (g_wake_rfd >= 0) close(g_wake_rfd);
         if (g_wake_wfd >= 0) close(g_wake_wfd);
     }
@@ -477,6 +564,7 @@ int main(void)
     cc_vasync_destroy();
     cc_endcall_udp_destroy();
     cc_worker_stop();
+    cc_session_pool_destroy();
     pjsua_destroy();
     cc_app_logger_close();
     return 0;
