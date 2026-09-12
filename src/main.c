@@ -16,6 +16,7 @@
 #include "options.h"
 #include "prompt_mapping.h"
 #include "runtime_config.h"
+#include "rtpengine.h"
 #include "utils.h"
 #include "worker.h"
 #include "validation_async.h"
@@ -24,6 +25,8 @@
 #include <pjsua-lib/pjsua_internal.h>
 #include <pjsip/sip_endpoint.h>
 #include <pjsip/sip_config.h>
+#include <pjmedia/echo.h>
+#include <pjmedia/jbuf.h>
 #include <pj/timer.h>
 #include <pj/log.h>
 #include <signal.h>
@@ -47,8 +50,10 @@ static void sig_handler(int sig)
     char byte = 1;
     (void)sig;
     g_running = 0;
-    if (g_wake_wfd >= 0)
-        (void)write(g_wake_wfd, &byte, 1);
+        if (g_wake_wfd >= 0) {
+            ssize_t _ign = write(g_wake_wfd, &byte, 1);
+            (void)_ign;
+        }
 }
 
 /*
@@ -123,7 +128,7 @@ int main(void)
     /* ── 2. Configure ────────────────────────────────────────────── */
     pjsua_config_default(&ua_cfg);
     ua_cfg.max_calls    = cc_cfg_max_calls();
-    ua_cfg.thread_cnt   = 4;   /* 4 PJSUA SIP I/O threads: handles 100 CPS without single-thread bottleneck */
+    ua_cfg.thread_cnt   = 6;   /* SIP I/O: A answer is off-thread; more threads help INVITE/UPDATE */
     ua_cfg.user_agent   = pj_str((char *)cc_cfg_user_agent());
 
     /* Wire global callbacks */
@@ -139,26 +144,57 @@ int main(void)
      */
     ua_cfg.cb.on_dtmf_digit       = cc_on_dtmf_digit;
     ua_cfg.cb.on_dtmf_digit2      = cc_on_dtmf_digit2;
+    ua_cfg.cb.on_stream_precreate = cc_on_stream_precreate;
+    /* Always wire stream_created2: rtpengine mode pauses TX+RX at create;
+     * line-echo wrap also runs from this callback when enabled. */
+    ua_cfg.cb.on_stream_created2  = cc_on_stream_created2;
+    if (cc_line_echo_enabled())
+        ua_cfg.cb.on_stream_destroyed = cc_on_stream_destroyed;
 
     pjsua_logging_config_default(&log_cfg);
     log_cfg.level         = cc_cfg_log_level();
     log_cfg.console_level = 0;
     log_cfg.cb            = &cc_app_logger_writer;
 
-    	pjsua_media_config_default(&med_cfg);
-	med_cfg.no_vad      = PJ_TRUE;   /* disable VAD — B2BUA must always forward RTP */
+    pjsua_media_config_default(&med_cfg);
+    med_cfg.no_vad         = PJ_TRUE;  /* disable VAD — B2BUA must always forward RTP */
+    med_cfg.clock_rate     = CC_CLOCK_RATE;
+    med_cfg.snd_clock_rate = CC_CLOCK_RATE;
+    med_cfg.channel_count  = 1;
+    med_cfg.ptime          = CC_AUDIO_PTIME_MS;
+    med_cfg.quality        = 8;
 
-	med_cfg.clock_rate     = CC_CLOCK_RATE;
-	med_cfg.snd_clock_rate = CC_CLOCK_RATE;
-	med_cfg.thread_cnt     = 2;   /* 2 RTP I/O threads: handles 100 CPS RTP processing */
+    /*
+     * Jitter buffer and line-echo processing apply whenever RTP is in the
+     * B2BUA: the whole call in local_bridge, and prompts/hold/fallback in
+     * UPDATE/re-INVITE. After hairpin bypass, endpoints handle their own QoS.
+     *
+     * Jitter buffer (G.711 ~20ms ptime over carrier):
+     *   jb_init    = 40ms  — initial depth; absorbs burst at call start
+     *   jb_min_pre = 20ms  — keep 1-2 packets; avoids underrun
+     *   jb_max_pre = 80ms  — adaptive ceiling under congestion
+     *   jb_max     = 200ms — discard later packets
+     *
+     * Per-leg AEC is off unless CC_LINE_ECHO=1 (null snd has no speaker/mic).
+     */
+    med_cfg.jb_init         = CC_JB_INIT_MS;
+    med_cfg.jb_min_pre      = CC_JB_MIN_PRE_MS;
+    med_cfg.jb_max_pre      = CC_JB_MAX_PRE_MS;
+    med_cfg.jb_max          = CC_JB_MAX_MS;
+    med_cfg.jb_discard_algo = PJMEDIA_JB_DISCARD_PROGRESSIVE;
+    med_cfg.ec_tail_len     = cc_line_echo_enabled() ? CC_EC_TAIL_MS : 0;
+    med_cfg.ec_options      = PJMEDIA_ECHO_SIMPLE | PJMEDIA_ECHO_USE_SW_ECHO;
+    med_cfg.thread_cnt      = 4;
 
-	/* Allow enough conference bridge slots for all call legs.
-	 * Each session has 2 legs (A + B), each needing one slot; add 4 for WAV players.
-	 * With CC_MAX_CALLS=8192 legs this is 8192*2+4 = 16388 slots. */
-	med_cfg.max_media_ports = (unsigned)(cc_cfg_max_calls() * 2 + 4);
-
-	/* RTP start port must be configurable for production firewall/operator setup. */
-	/*med_cfg.port = CC_RTP_PORT_START; // not available in this installed PJSUA version */
+    {
+        unsigned extra_players = 256;
+        unsigned ports = (unsigned)cc_cfg_max_calls() * 2u + extra_players;
+#ifdef PJSUA_MAX_CONF_PORTS
+        if (ports > (unsigned)PJSUA_MAX_CONF_PORTS)
+            ports = (unsigned)PJSUA_MAX_CONF_PORTS;
+#endif
+        med_cfg.max_media_ports = ports;
+    }
 
     status = pjsua_init(&ua_cfg, &log_cfg, &med_cfg);
     if (status != PJ_SUCCESS) {
@@ -167,6 +203,8 @@ int main(void)
         cc_app_logger_close();
         return 1;
     }
+    cc_media_qos_init(cc_cfg_max_calls());
+    cc_tune_audio_codecs();
 
     /* Disable auto UDP->TCP switch for messages >1300 bytes (RFC 3261 18.1.1).
      * The SBC expects UDP; our B-leg INVITE with all headers exceeds 1300. */
@@ -188,6 +226,12 @@ int main(void)
         pjsip_endpt_add_capability(endpt, NULL, PJSIP_H_SUPPORTED,
                                    NULL, 1, supported_ext);
     }
+
+    status = cc_sip_contact_fix_install();
+    if (status != PJ_SUCCESS)
+        PJ_LOG(2, (THIS_FILE,
+                   "[CONFIG] contact fixup module not registered: %d "
+                   "(bracketed-GRUU ACKs may fail)", status));
 
     cc_app_logger_install_pj_writer();
     PJ_LOG(3, (THIS_FILE,
@@ -248,11 +292,41 @@ int main(void)
                "[CONFIG] max_call_legs=%d max_sessions=%d",
                cc_cfg_max_calls(), cc_cfg_max_calls() / 2));
     PJ_LOG(3, (THIS_FILE,
+               "[CONFIG] admission_max_calls=%d admission_timer_heap_max=%d "
+               "(0=disabled)",
+               cc_cfg_admission_max_calls(),
+               cc_cfg_admission_timer_heap_max()));
+    PJ_LOG(3, (THIS_FILE,
                "[CONFIG] media_mode=%s",
                cc_cfg_media_mode_name()));
+    if (cc_rtpengine_enabled()) {
+        PJ_LOG(3, (THIS_FILE,
+                   "[CONFIG] rtpengine ng=%s:%d timeout_ms=%d flags=%s dtmf_dest=%s media_dir=%s",
+                   cc_cfg_rtpengine_host(),
+                   cc_cfg_rtpengine_port(),
+                   cc_cfg_rtpengine_timeout_ms(),
+                   cc_cfg_rtpengine_flags(),
+                   cc_cfg_rtpengine_dtmf_dest(),
+                   cc_cfg_rtpengine_media_dir()[0] ? cc_cfg_rtpengine_media_dir() : "(local realpath)"));
+        PJ_LOG(3, (THIS_FILE,
+                   "[CONFIG] rtpengine loop_med_tp=on enable_loopback=off "
+                   "(no local UDP RTP bind; SDP rewritten to RTPengine)"));
+        if (cc_rtpengine_init() != PJ_SUCCESS) {
+            PJ_LOG(1, (THIS_FILE,
+                       "[RTPENGINE] ng client init failed — UPDATEs will fall back"));
+        }
+    }
     PJ_LOG(3, (THIS_FILE,
-               "[CONFIG] max_media_ports=%d",
-               cc_cfg_max_calls() * 2 + 4));
+               "[CONFIG] media thread_cnt=%d line_echo=%s ec_tail_len=%d "
+               "jb_init=%d jb_min_pre=%d jb_max_pre=%d jb_max=%d",
+               med_cfg.thread_cnt,
+               cc_line_echo_enabled() ? "on" : "off",
+               med_cfg.ec_tail_len,
+               med_cfg.jb_init, med_cfg.jb_min_pre,
+               med_cfg.jb_max_pre, med_cfg.jb_max));
+    PJ_LOG(3, (THIS_FILE,
+               "[CONFIG] max_media_ports=%u",
+               med_cfg.max_media_ports));
 
     /* ── 3. UDP transport ────────────────────────────────────────── */
     cc_prompt_mapping_load("wav/wav_mapping.conf");
@@ -312,8 +386,10 @@ int main(void)
         PJ_LOG(3, (THIS_FILE, "[CONFIG] null sound device enabled"));
     }
 
-/* Codec policy: keep SDP small and operator-friendly.
- * Disable all codecs, then enable only PCMA/8000 and telephone-event/8000.
+/* Codec policy: single G.711 toward both legs (matches RE dummy answer +
+ * codec-strip-PCMU/G722). Advertising both PCMA and PCMU caused RE to
+ * egress interleaved PT 8+0 to softphones (noise/silence). Softphones
+ * often use telephone-event PT 120; RE dummy advertises 120 (+101).
  */
 {
     pjsua_codec_info codecs[32];
@@ -332,13 +408,12 @@ int main(void)
     codec_id = pj_str("PCMA/8000");
     pjsua_codec_set_priority(&codec_id, 255);
 
-    codec_id = pj_str("PCMU/8000");
-    pjsua_codec_set_priority(&codec_id, 253);
-
     codec_id = pj_str("telephone-event/8000");
     pjsua_codec_set_priority(&codec_id, 254);
 
-    PJ_LOG(3, (THIS_FILE, "Codec policy applied: PCMA/8000 + PCMU/8000 + telephone-event/8000"));
+    PJ_LOG(3, (THIS_FILE,
+               "Codec policy applied: PCMA/8000 + telephone-event/8000 only "
+               "(PCMU/G722/Opus disabled; RE dummy DTMF PT 120+101)"));
 }
 
 
@@ -355,12 +430,64 @@ int main(void)
     acc_cfg.register_on_acc_add = PJ_FALSE;
     acc_cfg.use_rfc5626  = 0;              /* disable ;ob in Contact */
 
-    /* Configured RTP port range */
+    /* Configured RTP port range (used for update/local_bridge UDP media;
+     * rtpengine mode uses loop_med_tp and does not bind these ports). */
     acc_cfg.rtp_cfg.port       = cc_cfg_rtp_port_start();
     acc_cfg.rtp_cfg.port_range = cc_cfg_rtp_port_count();
-    acc_cfg.rtp_cfg.randomize_port = PJ_FALSE;
+    /* Randomize to reduce EADDRINUSE clustering when scanning from a fixed start. */
+    acc_cfg.rtp_cfg.randomize_port = cc_rtpengine_enabled() ? PJ_FALSE : PJ_TRUE;
 
+    /*
+     * rtpengine / third-party media (variant C1):
+     * use_loop_med_tp — PJSUA creates pjmedia_transport_loop instead of UDP,
+     * so no OS bind on :RTP_PORT_*. Placeholder addresses appear in SDP and
+     * are rewritten to RTPengine in on_call_sdp_created.
+     * enable_loopback=0 — do not echo packets into the local stream.
+     */
+    if (cc_rtpengine_enabled()) {
+        acc_cfg.use_loop_med_tp = PJ_TRUE;
+        acc_cfg.enable_loopback = PJ_FALSE;
+    }
 
+    /*
+     * Session Timer (RFC 4028).
+     * Without this the SBC's Session-Expires:16 kills every call at ~16s
+     * because PJSUA never sends a refresh and the SBC tears down the dialog.
+     * PJSUA_SIP_TIMER_ALWAYS: always include Session-Expires in our responses
+     * and send refreshes.  If the SBC offers Session-Expires:16 we reply with
+     * 422 Session Interval Too Small (min_se=90) forcing renegotiation to
+     * sess_expires=1800.  PJSUA then owns the refresh and sends re-INVITEs
+     * every 1800s, keeping the dialog alive indefinitely.
+     */
+    acc_cfg.use_timer                  = PJSUA_SIP_TIMER_ALWAYS;
+    acc_cfg.timer_setting.sess_expires = 1800;
+    acc_cfg.timer_setting.min_se       = 90;
+
+    /*
+     * Disable lock_codec. Default (1) sends a post-answer re-INVITE/UPDATE
+     * that shrinks the codec list to a single payload. In rtpengine mode that
+     * extra B re-INVITE is unnecessary (RE endpoint unchanged) and adds
+     * fragile mid-dialog traffic; in update/local_bridge it also fights SDP
+     * rewrite. Codec preference is already set via cc_tune_audio_codecs().
+     */
+    acc_cfg.lock_codec = 0;
+
+    /* Outbound proxy — all B-leg INVITEs and in-dialog requests route
+     * through Kamailio first.  PJSUA adds this as a Route header
+     * automatically; we must NOT also add Route1 manually in b2bua.c. */
+    {
+        static char proxy_uri_buf[192];
+        snprintf(proxy_uri_buf, sizeof(proxy_uri_buf),
+                 "<sip:%s:%d;transport=udp;lr>",
+                 cc_cfg_sbc_host(), cc_cfg_sbc_port());
+        acc_cfg.proxy[0]  = pj_str(proxy_uri_buf);
+        acc_cfg.proxy_cnt = 1;
+    }
+
+    PJ_LOG(3, (THIS_FILE,
+               "[CONFIG] session_timer=ALWAYS sess_expires=%u min_se=%u lock_codec=0",
+               acc_cfg.timer_setting.sess_expires,
+               acc_cfg.timer_setting.min_se));
     PJ_LOG(3, (THIS_FILE,
                "[CONFIG] DTMF receive=RFC2833+SIP_INFO callback=on_dtmf_digit2 legacy_callback=enabled"));
 
@@ -382,8 +509,9 @@ int main(void)
         cc_app_logger_close();
         return 1;
     }
-    PJ_LOG(3, (THIS_FILE, "[WORKER] pool started (%d threads)",
-               CC_WORKER_POOL_SIZE));
+    PJ_LOG(3, (THIS_FILE,
+               "[WORKER] pools started (general=%d answer=%d)",
+               CC_WORKER_POOL_SIZE, CC_ANSWER_WORKER_POOL_SIZE));
 
     if (cc_vasync_init() != 0) {
         PJ_LOG(1, (THIS_FILE, "[ERROR] async validation init failed"));
@@ -450,7 +578,6 @@ int main(void)
             fd_set rfds;
             struct timeval tv;
             pj_time_val now;
-            pj_time_val earliest;
             pj_time_val pj_timeout;
             unsigned event_count = 0;
             long wait_ms = CC_EVENT_LOOP_MAX_MS;
@@ -512,22 +639,21 @@ int main(void)
                            loop_total, loop_busy, loop_idle));
             }
 
-            /* No events: determine sleep time from next PJSIP timer */
-            if (pj_timer_heap_earliest_time(timer_heap,
-                                            &earliest) == PJ_SUCCESS) {
-                pj_gettimeofday(&now);
-                PJ_TIME_VAL_SUB(earliest, now);
-
-                if (earliest.sec < 0 ||
-                    (earliest.sec == 0 && earliest.msec <= 0))
-                {
-                    wait_ms = 1; /* timer due — brief yield then re-process */
-                } else {
-                    long timer_ms = earliest.sec * 1000 + earliest.msec;
-                    if (timer_ms < wait_ms)
-                        wait_ms = timer_ms;
-                }
-            }
+            /*
+             * Do NOT call pj_timer_heap_earliest_time() here.
+             *
+             * pjlib does pj_assert(ht->cur_size != 0) *before* returning
+             * PJ_ENOTFOUND, and the assert runs unlocked. With
+             * ua_cfg.thread_cnt > 0 another PJSIP thread can cancel the
+             * last timer between our observation and the call → SIGABRT.
+             *
+             * Evidence (instance_3, collect_call_20260911_154704_616946.log):
+             * zero calls for ~5 min, LOOP-DRAIN always reported
+             * timer_heap_pending=1, then abort at streak≈279k with
+             * ht->cur_size==0. So the heap was not stably empty — it raced
+             * to empty. Polling every CC_EVENT_LOOP_MAX_MS (10 ms) is enough
+             * for SIP timer granularity and removes the crash.
+             */
 
             /* Block in select() on the wakeup pipe */
             FD_ZERO(&rfds);
@@ -543,7 +669,8 @@ int main(void)
             /* Drain wakeup pipe if signaled */
             if (g_wake_rfd >= 0 && FD_ISSET(g_wake_rfd, &rfds)) {
                 char drain[16];
-                (void)read(g_wake_rfd, drain, sizeof(drain));
+                ssize_t _ign = read(g_wake_rfd, drain, sizeof(drain));
+                (void)_ign;
             }
         }
 
@@ -564,6 +691,7 @@ int main(void)
     cc_vasync_destroy();
     cc_endcall_udp_destroy();
     cc_worker_stop();
+    cc_rtpengine_shutdown();
     cc_session_pool_destroy();
     pjsua_destroy();
     cc_app_logger_close();

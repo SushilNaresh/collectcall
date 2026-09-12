@@ -182,6 +182,9 @@ void cc_app_logger_writer(int level, const char *data, int len)
 
     int needs_nl = (data[len - 1] != '\n');
 
+    /* Single fwrite + optional newline under one lock acquisition.
+     * At 150 CPS with ~5000 log lines/sec this mutex is the primary
+     * contention point — keep the critical section as short as possible. */
     pthread_mutex_lock(&g_log_lock);
 
 #if CC_APP_LOG_ENABLE
@@ -189,10 +192,27 @@ void cc_app_logger_writer(int level, const char *data, int len)
 #if CC_APP_LOG_MAX_SIZE_MB > 0
         long long max_bytes = (long long)(CC_APP_LOG_MAX_SIZE_MB) * 1024 * 1024;
         if (g_log_bytes_written + len + 1 > max_bytes)
-            open_new_log_file(); /* rotate; errors silently keep old file */
+            open_new_log_file();
 #endif
-        g_log_bytes_written += fwrite(data, 1, (size_t)len, g_log_file);
-        if (needs_nl) { fputc('\n', g_log_file); g_log_bytes_written++; }
+        if (needs_nl) {
+            /* Write data + newline in one syscall via a local buffer.
+             * Avoids two fwrite calls (two syscalls) under the lock. */
+            char buf[4096];
+            if ((size_t)len + 1 < sizeof(buf)) {
+                memcpy(buf, data, (size_t)len);
+                buf[len] = '\n';
+                g_log_bytes_written += (long long)fwrite(buf, 1,
+                                           (size_t)(len + 1), g_log_file);
+            } else {
+                g_log_bytes_written += (long long)fwrite(data, 1,
+                                           (size_t)len, g_log_file);
+                fputc('\n', g_log_file);
+                g_log_bytes_written++;
+            }
+        } else {
+            g_log_bytes_written += (long long)fwrite(data, 1,
+                                       (size_t)len, g_log_file);
+        }
 #if CC_APP_LOG_FLUSH_ALWAYS
         fflush(g_log_file);
 #endif

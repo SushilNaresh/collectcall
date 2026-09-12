@@ -23,4 +23,16 @@ int cc_prompt_mapping_load(const char *path);
 const char *cc_prompt_get_path(cc_prompt_tag_t tag);
 const char *cc_prompt_tag_name(cc_prompt_tag_t tag);
 
+/* In-memory PCM for a mapped WAV (loaded once at startup). */
+typedef struct cc_wav_pcm {
+    const void *pcm;
+    unsigned    nbytes;
+    unsigned    clock_rate;
+    unsigned    channel_count;
+    unsigned    bits_per_sample;
+    int         duration_ms;
+} cc_wav_pcm_t;
+
+const cc_wav_pcm_t *cc_prompt_cache_get(const char *path);
+
 #endif /* CC_PROMPT_MAPPING_H */

@@ -252,7 +252,8 @@ void cc_map_end_call_result(const char *internal_status,
         } else if (strcmp(internal_reason, "NORMAL_CLEARING") == 0) {
             status = "COMPLETED";
             reason = CC_END_API_COMPLETED_REASON;
-        } else if (strcmp(internal_reason, "SPONSOR_BALANCE_FAIL") == 0) {
+        } else if (strcmp(internal_reason, "SPONSOR_BALANCE_FAIL") == 0 ||
+                   strcmp(internal_reason, "LOW_BALANCE") == 0) {
             status = "CANCELLED";
             reason = "SPONSOR_BALANCE_FAIL";
         } else if (strcmp(internal_reason, "CALLER_BLACKLISTED") == 0) {

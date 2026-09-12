@@ -256,6 +256,8 @@ cc_media_mode_t cc_cfg_media_mode(void)
         return CC_MEDIA_MODE_UPDATE;
     if (str_eq_ci(value, "reinvite") || str_eq_ci(value, "re-invite"))
         return CC_MEDIA_MODE_REINVITE;
+    if (str_eq_ci(value, "rtpengine"))
+        return CC_MEDIA_MODE_RTPENGINE;
 
 #if CC_MEDIA_CHANGE_USE_REINVITE
     return CC_MEDIA_MODE_REINVITE;
@@ -271,10 +273,142 @@ const char *cc_cfg_media_mode_name(void)
         return "local_bridge";
     case CC_MEDIA_MODE_REINVITE:
         return "reinvite";
+    case CC_MEDIA_MODE_RTPENGINE:
+        return "rtpengine";
     case CC_MEDIA_MODE_UPDATE:
     default:
         return "update";
     }
+}
+
+int cc_cfg_media_uses_update(void)
+{
+    /* rtpengine does not use post-accept SIP UPDATE hairpin bypass. */
+    return cc_cfg_media_mode() == CC_MEDIA_MODE_UPDATE;
+}
+
+const char *cc_cfg_rtpengine_host(void)
+{
+    const char *value = env_nonempty("CC_RTPENGINE_HOST");
+    return value ? value : CC_RTPENGINE_HOST;
+}
+
+int cc_cfg_rtpengine_port(void)
+{
+    return parse_port_env("CC_RTPENGINE_PORT", CC_RTPENGINE_PORT);
+}
+
+int cc_cfg_rtpengine_timeout_ms(void)
+{
+    const char *value = env_nonempty("CC_RTPENGINE_TIMEOUT_MS");
+    char *end = NULL;
+    long parsed;
+
+    if (!value)
+        return CC_RTPENGINE_TIMEOUT_MS;
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 50 || parsed > 5000)
+        return CC_RTPENGINE_TIMEOUT_MS;
+    return (int)parsed;
+}
+
+const char *cc_cfg_rtpengine_flags(void)
+{
+    const char *value = env_nonempty("CC_RTPENGINE_FLAGS");
+    return value ? value : CC_RTPENGINE_FLAGS;
+}
+
+int cc_cfg_rtpengine_dtmf_port(void)
+{
+    const char *full = env_nonempty("CC_RTPENGINE_DTMF_DEST");
+    int port;
+    const char *colon;
+
+    /* Full override "host:port" wins over PORT alone. */
+    if (full) {
+        colon = strrchr(full, ':');
+        if (colon && colon[1]) {
+            char *end = NULL;
+            long parsed = strtol(colon + 1, &end, 10);
+            if (end != colon + 1 && *end == '\0' &&
+                parsed > 0 && parsed <= 65535)
+                return (int)parsed;
+        }
+    }
+
+    port = parse_port_env("CC_RTPENGINE_DTMF_PORT", CC_RTPENGINE_DTMF_PORT);
+
+    /*
+     * Only rewrite when DTMF port equals THIS instance's SIP port or the
+     * ng control port. Per-instance DTMF 8061 with SIP 9061 is fine.
+     */
+    if (port == cc_cfg_local_sip_port() || port == cc_cfg_rtpengine_port()) {
+        fprintf(stderr,
+                "[CONFIG] CC_RTPENGINE_DTMF_PORT=%d collides with SIP/ng — "
+                "using default %d\n",
+                port, CC_RTPENGINE_DTMF_PORT);
+        return CC_RTPENGINE_DTMF_PORT;
+    }
+    return port;
+}
+
+const char *cc_cfg_rtpengine_dtmf_dest(void)
+{
+    static char dest[160];
+    static int logged = 0;
+    const char *full = env_nonempty("CC_RTPENGINE_DTMF_DEST");
+    const char *host = env_nonempty("CC_RTPENGINE_DTMF_HOST");
+    int port = cc_cfg_rtpengine_dtmf_port();
+    const char *re_host;
+
+    if (full && full[0] != '\0') {
+        const char *colon = strrchr(full, ':');
+        if (colon && colon > full) {
+            size_t hlen = (size_t)(colon - full);
+            if (hlen >= sizeof(dest))
+                hlen = sizeof(dest) - 1;
+            memcpy(dest, full, hlen);
+            dest[hlen] = '\0';
+            snprintf(dest + hlen, sizeof(dest) - hlen, ":%d", port);
+        } else {
+            snprintf(dest, sizeof(dest), "%s", full);
+        }
+    } else {
+        /*
+         * When RTPengine is local (127.0.0.1), DTMF UDP must also target
+         * loopback so notifies reach this process's DTMF listener
+         * (e.g. 8061 for SIP instance 9061).
+         */
+        if (!host) {
+            re_host = cc_cfg_rtpengine_host();
+            if (re_host &&
+                (strcmp(re_host, "127.0.0.1") == 0 ||
+                 strcmp(re_host, "localhost") == 0 ||
+                 strcmp(re_host, "::1") == 0))
+                host = "127.0.0.1";
+            else
+                host = cc_cfg_local_host();
+        }
+        snprintf(dest, sizeof(dest), "%s:%d", host, port);
+    }
+
+    if (!logged) {
+        logged = 1;
+        fprintf(stderr,
+                "[CONFIG] rtpengine DTMF notify dest=%s "
+                "(listener must bind this port; unique per instance)\n",
+                dest);
+    }
+    return dest;
+}
+
+const char *cc_cfg_rtpengine_media_dir(void)
+{
+    const char *value = env_nonempty("CC_RTPENGINE_MEDIA_DIR");
+    if (value)
+        return value;
+    return CC_RTPENGINE_MEDIA_DIR;
 }
 
 int cc_cfg_free_period_ms(void)
@@ -419,6 +553,46 @@ int cc_cfg_max_calls(void)
     parsed = strtol(value, &end, 10);
     if (end == value || *end != '\0' || parsed < 2 || parsed > PJSUA_MAX_CALLS)
         return CC_MAX_CALLS;
+
+    return (int)parsed;
+}
+
+/* Soft cap: keep one instance under ~100 CPS with short A treatment hold. */
+#ifndef CC_ADMISSION_MAX_CALLS_DEFAULT
+#define CC_ADMISSION_MAX_CALLS_DEFAULT  600
+#endif
+#ifndef CC_ADMISSION_TIMER_HEAP_DEFAULT
+#define CC_ADMISSION_TIMER_HEAP_DEFAULT 3000
+#endif
+
+int cc_cfg_admission_max_calls(void)
+{
+    const char *value = env_nonempty("CC_ADMISSION_MAX_CALLS");
+    char *end = NULL;
+    long parsed;
+
+    if (!value)
+        return CC_ADMISSION_MAX_CALLS_DEFAULT;
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 0 || parsed > PJSUA_MAX_CALLS)
+        return CC_ADMISSION_MAX_CALLS_DEFAULT;
+
+    return (int)parsed;
+}
+
+int cc_cfg_admission_timer_heap_max(void)
+{
+    const char *value = env_nonempty("CC_ADMISSION_TIMER_HEAP_MAX");
+    char *end = NULL;
+    long parsed;
+
+    if (!value)
+        return CC_ADMISSION_TIMER_HEAP_DEFAULT;
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 0 || parsed > 1000000)
+        return CC_ADMISSION_TIMER_HEAP_DEFAULT;
 
     return (int)parsed;
 }

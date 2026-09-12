@@ -4,35 +4,21 @@
 /*
  * worker.h — Fixed worker thread pool + event queue
  *
- * General pool: CC_WORKER_POOL_SIZE threads, CC_WORKER_QUEUE_SIZE slots.
- * Answer pool:  CC_ANSWER_WORKER_POOL_SIZE threads dedicated to
- *               CC_EV_RTPENGINE_A_ANSWER (A 200 OK) so SIP answer
- *               latency is not blocked behind prompts / sleeps.
- *               CC_EV_RTPENGINE_A_OFFER runs on the general pool first;
- *               on success it patches SDP and queues ANSWER (RE ports
- *               in the initial 200 — offer-then-answer).
- *               Pool is intentionally small: pjsua_call_answer2 holds the
- *               global PJSUA mutex (UDP bind + media); too many concurrent
- *               answer2 calls starve SIP I/O (late 100 Trying → Kam 408).
+ * 8 worker threads (CC_WORKER_POOL_SIZE) share a single MPSC ring queue
+ * (CC_WORKER_QUEUE_SIZE slots). All blocking work (sleep loops, RTP polls,
+ * WAV waits) runs inside a worker. PJSUA callbacks post events and return
+ * immediately.
  *
- * Ring/DTMF/prompt timers use post_delayed so the timer heap handles waiting —
- * workers only run actual work and return immediately when possible.
+ * Thread count: fixed 8 regardless of session count.
+ * Previously: up to 11 threads × 4096 sessions = 45,056 threads.
  */
 
 #include "session.h"
 #include <pjsua-lib/pjsua.h>
 #include <stdint.h>
 
-#define CC_WORKER_POOL_SIZE   128    /* general: originate/prompts/timers/bypass */
-#define CC_WORKER_QUEUE_SIZE  32768  /* must be power of 2; 32K covers 100 CPS bursts */
-
-/*
- * A-leg 200 OK lane. Keep low so at most a few answer2 critical sections
- * contend for PJSUA; cc_call_answer2_serialized() further serializes answer2.
- * 4 workers × ~5–20ms answer2 ≈ 200–800 answers/sec capacity.
- */
-#define CC_ANSWER_WORKER_POOL_SIZE  4
-#define CC_ANSWER_QUEUE_SIZE        8192   /* must be power of 2 */
+#define CC_WORKER_POOL_SIZE   64     /* fixed worker threads */
+#define CC_WORKER_QUEUE_SIZE  16384  /* MPSC ring slots      */
 
 /* ── Event types ─────────────────────────────────────────────────────────── */
 typedef enum {
@@ -46,10 +32,8 @@ typedef enum {
     /* play treatment WAV (non-blocking) then hangup via timer */
     CC_EV_HANGUP_A_ONLY,
 
-    /* A-leg MCA: delayed timeout / stop-offer / digit resolve (no worker sleep) */
+    /* A-leg: MCA wait loop (was mca_wait_thread) */
     CC_EV_MCA_WAIT,
-    CC_EV_MCA_STOP_PROMPT,
-    CC_EV_MCA_RESOLVE,
 
     /* B-leg: start collect prompt after CONFIRMED+RTP ready (was cc_b_prompt_start_thread) */
     CC_EV_B_PROMPT_START,
@@ -66,21 +50,6 @@ typedef enum {
     CC_EV_RING_TIMER,
     CC_EV_DTMF_TIMER,
 
-    /* UPDATE bypass — non-blocking RTP-poll + UPDATE send (replaces blocking sleep loops) */
-    CC_EV_UPDATE_A_BYPASS,
-    CC_EV_UPDATE_B_BYPASS,
-
-    /* re-INVITE bypass — non-blocking RTP-poll + re-INVITE send (same pattern as UPDATE bypass) */
-    CC_EV_REINVITE_A_BYPASS,
-    CC_EV_REINVITE_B_BYPASS,
-
-    /* Mode 2 hold/resume propagation to B-leg (REQ-11..REQ-20) */
-    CC_EV_HOLD_PROPAGATE_B,    /* send sendonly UPDATE/re-INVITE to B; wait 200 OK; play MOH to A */
-    CC_EV_RESUME_PROPAGATE_B,  /* send sendrecv UPDATE/re-INVITE to B; wait 200 OK; re-run bypass */
-
-	CC_EV_HOLD_PROPAGATE_A,
-	CC_EV_RESUME_PROPAGATE_A,
-
     /* UPDATE 491 retry (was update_a/b_retry_thread) */
     CC_EV_UPDATE_A_RETRY,
     CC_EV_UPDATE_B_RETRY,
@@ -90,23 +59,6 @@ typedef enum {
 
     /* RTP bypass watchdog (was cc_bypass_rtp_watchdog_thread) */
     CC_EV_BYPASS_RTP_WATCHDOG,
-
-    /* DTMF detected by RTPengine (RFC2833) — sip_code holds the digit */
-    CC_EV_RTPENGINE_DTMF,
-
-    /*
-     * A-leg: deferred 200 OK on answer worker pool (keeps SIP I/O free).
-     * data = NULL → pjsua_call_answer2 (after offer patched SDP in rtpengine mode).
-     * data = SDP  → legacy combined path (offer then queue answer).
-     */
-    CC_EV_RTPENGINE_A_ANSWER,
-
-    /*
-     * A-leg rtpengine: ng offer (+ dummy answer) on general pool, then
-     * patch A SDP and queue CC_EV_RTPENGINE_A_ANSWER (offer-then-answer).
-     * data = malloc'd A INVITE SDP.
-     */
-    CC_EV_RTPENGINE_A_OFFER,
 
     /* Async validation callback — fired by validation_async dispatcher */
     CC_EV_VASYNC_CB,
@@ -120,8 +72,6 @@ typedef enum {
 typedef struct {
     cc_ev_type_t    type;           /* discriminator                        */
     cc_session_t   *session;        /* always set                           */
-    unsigned        session_serial; /* copied from session->session_serial at post time;
-                                     * worker verifies match before acting  */
     pjsua_call_id   call_a;         /* PJSUA_INVALID_ID if not applicable   */
     pjsua_call_id   call_b;         /* PJSUA_INVALID_ID if not applicable   */
     int             delay_ms;       /* free-period delay for accept         */

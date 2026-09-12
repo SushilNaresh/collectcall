@@ -178,9 +178,9 @@ void cc_append_header(pjsip_tx_data *tdata,
 /* ── Media / conf helpers ───────────────────────────────────────────────── */
 
 /**
- * Create a looping (or one-shot) WAV file player and connect it to the
- * given call's conference port.
- * Returns the player_id (pjsua_player_id) on success, PJSUA_INVALID_ID on error.
+ * Create a looping (or one-shot) WAV player and connect it to the
+ * given call's conference port. Prefers the in-memory PCM cache.
+ * Returns a player handle on success, PJSUA_INVALID_ID on error.
  */
 pjsua_player_id cc_start_wav(pjsua_call_id call_id,
                               const char *wav_path,
@@ -190,6 +190,20 @@ pjsua_player_id cc_start_wav(pjsua_call_id call_id,
  * Stop and destroy a WAV player, disconnecting it from the call.
  */
 void cc_stop_wav(pjsua_player_id player_id, pjsua_call_id call_id);
+
+/** Duration of an active player (cached PCM or file), milliseconds. */
+int cc_wav_player_duration_ms(pjsua_player_id player_id);
+
+void cc_media_qos_init(int max_calls);
+int  cc_line_echo_enabled(void);
+void cc_tune_audio_codecs(void);
+void cc_on_stream_precreate(pjsua_call_id call_id,
+                            pjsua_on_stream_precreate_param *param);
+void cc_on_stream_created2(pjsua_call_id call_id,
+                           pjsua_on_stream_created_param *param);
+void cc_on_stream_destroyed(pjsua_call_id call_id,
+                            pjmedia_stream *strm,
+                            unsigned stream_idx);
 
 /**
  * Disconnect a call's conf slot from the master mix (slot 0) in both
@@ -208,6 +222,7 @@ pj_status_t cc_bridge_calls(pjsua_call_id call_a, pjsua_call_id call_b);
  */
 pj_status_t cc_unbridge_calls(pjsua_call_id call_a, pjsua_call_id call_b);
 void        cc_silence_call(pjsua_call_id call_id);
+void cc_resume_call_tx(pjsua_call_id call_id);   /* NEW */
 void        cc_spawn_bypass_rtp_watchdog(cc_session_t *session,
                                          pjsua_call_id call_a,
                                          pjsua_call_id call_b);
@@ -226,8 +241,25 @@ void cc_session_log_end(cc_session_t *session);
 /** Hangup a call safely, ignoring all errors. */
 pj_status_t cc_safe_hangup(pjsua_call_id call_id, pjsip_status_code code);
 
+/**
+ * Serialize pjsua_call_answer2 across the process.
+ * Concurrent answer2 holds the global PJSUA mutex (media/UDP bind) and
+ * starves SIP threads — INVITE sits unanswered until Kam fr_timer (~5s).
+ * If lock_wait_ms_out is non-NULL, stores milliseconds spent waiting for
+ * the answer2 lock (0 if acquired immediately).
+ */
+pj_status_t cc_call_answer2_serialized(pjsua_call_id call_id,
+                                       const pjsua_call_setting *opt,
+                                       unsigned code,
+                                       const pj_str_t *reason,
+                                       const pjsua_msg_data *msg_data,
+                                       long long *lock_wait_ms_out);
+
 /** Portable millisecond sleep. */
 void cc_sleep_ms(int ms);
+
+/** CLOCK_MONOTONIC milliseconds (for [A-TIMING] / latency logs). */
+long long cc_monotonic_ms(void);
 
 /**
  * pthread_create wrapper that sets a reduced stack size (128 KB).

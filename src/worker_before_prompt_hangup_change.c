@@ -1,13 +1,33 @@
 /*
  * worker.c — Fixed worker thread pool replacing all per-call pthreads
  *
- * General pool: CC_WORKER_POOL_SIZE threads on g_ring.
- * Answer pool:  CC_ANSWER_WORKER_POOL_SIZE threads on g_answer_ring for
- *               CC_EV_RTPENGINE_A_ANSWER only (keeps A 200 OK off the slow lane).
- *               CC_EV_RTPENGINE_A_OFFER runs on the general pool in parallel.
- *               Answer pool is small; answer2 is process-wide serialized.
+ * CC_WORKER_POOL_SIZE (64) worker threads share a single MPSC ring queue
+ * of CC_WORKER_QUEUE_SIZE (16384) slots. Each slot holds a cc_event_t.
  *
- * PJSUA callbacks post events and return immediately — they never block on ng.
+ * All blocking work that previously ran in dedicated per-call threads
+ * (sleep loops, RTP polls, WAV waits, timer countdowns) now runs inside
+ * a worker thread from this pool. PJSUA callbacks post events and return
+ * immediately — they never block.
+ *
+ * Thread count: fixed 64 regardless of session count.
+ * Previously: up to 11 threads × 4096 sessions = 45,056 threads.
+ *
+ * Events processed here (one per former pthread):
+ *   CC_EV_ORIGINATE_B          — was cc_originate_b_thread
+ *   CC_EV_WAV_HANGUP_A         — was wav_then_hangup_thread
+ *   CC_EV_MCA_WAIT             — MCA DTMF timeout (delayed timer)
+ *   CC_EV_MCA_STOP_PROMPT      — stop offer WAV when file ends
+ *   CC_EV_MCA_RESOLVE          — A DTMF during MCA wait
+ *   CC_EV_B_PROMPT_START       — was cc_b_prompt_start_thread
+ *   CC_EV_B_PROMPT_DONE        — was cc_b_prompt_done_thread
+ *   CC_EV_ACCEPT_TRANSITION    — was accept_transition_thread
+ *   CC_EV_RING_TIMER           — was timer_thread (is_ring=1)
+ *   CC_EV_DTMF_TIMER           — was timer_thread (is_ring=0)
+ *   CC_EV_UPDATE_A_RETRY       — was update_a_retry_thread
+ *   CC_EV_UPDATE_B_RETRY       — was update_b_retry_thread
+ *   CC_EV_UPDATE_ACK_WATCHDOG  — was update_ack_watchdog_thread
+ *   CC_EV_BYPASS_RTP_WATCHDOG  — was cc_bypass_rtp_watchdog_thread
+ *   CC_EV_VASYNC_CB             — async validation callback from dispatcher
  */
 
 #include "worker.h"
@@ -17,7 +37,6 @@
 #include "config.h"
 #include "prompt_mapping.h"
 #include "runtime_config.h"
-#include "rtpengine.h"
 #include "validation_async.h"
 
 #include <pjsua-lib/pjsua.h>
@@ -37,8 +56,6 @@
  * Multiple producers (PJSUA callback threads) write to the ring.
  * Multiple consumers (worker threads) read from it.
  * Each slot has an atomic sequence number for lock-free coordination.
- *
- * Two rings: g_ring (general) and g_answer_ring (A-answer hot path).
  */
 
 typedef struct {
@@ -47,69 +64,51 @@ typedef struct {
 } cc_ring_slot_t;
 
 typedef struct {
-    cc_ring_slot_t     *slots;
-    unsigned            mask;  /* size - 1; size must be power of 2 */
+    cc_ring_slot_t      slots[CC_WORKER_QUEUE_SIZE];
     _Atomic unsigned    head;  /* next slot to write (producers) */
     _Atomic unsigned    tail;  /* next slot to read  (consumers) */
-    pthread_mutex_t    *wake_mutex;
-    pthread_cond_t     *wake_cond;
+    char                _pad[64];
 } cc_ring_t;
 
-static cc_ring_slot_t   g_ring_slots[CC_WORKER_QUEUE_SIZE];
-static cc_ring_slot_t   g_answer_slots[CC_ANSWER_QUEUE_SIZE];
-static cc_ring_t        g_ring;
-static cc_ring_t        g_answer_ring;
+static cc_ring_t g_ring;
 
+/* Condvar used to wake idle workers when new events are posted */
 static pthread_mutex_t  g_wake_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t   g_wake_cond  = PTHREAD_COND_INITIALIZER;
-static pthread_mutex_t  g_answer_wake_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t   g_answer_wake_cond  = PTHREAD_COND_INITIALIZER;
-
-static void ring_init_one(cc_ring_t *r, cc_ring_slot_t *slots, unsigned size,
-                          pthread_mutex_t *wake_mutex, pthread_cond_t *wake_cond)
-{
-    unsigned i;
-
-    r->slots = slots;
-    r->mask = size - 1;
-    r->wake_mutex = wake_mutex;
-    r->wake_cond = wake_cond;
-    for (i = 0; i < size; i++)
-        atomic_store_explicit(&slots[i].seq, i, memory_order_relaxed);
-    atomic_store_explicit(&r->head, 0, memory_order_relaxed);
-    atomic_store_explicit(&r->tail, 0, memory_order_relaxed);
-}
 
 static void ring_init(void)
 {
-    ring_init_one(&g_ring, g_ring_slots, CC_WORKER_QUEUE_SIZE,
-                  &g_wake_mutex, &g_wake_cond);
-    ring_init_one(&g_answer_ring, g_answer_slots, CC_ANSWER_QUEUE_SIZE,
-                  &g_answer_wake_mutex, &g_answer_wake_cond);
+    unsigned i;
+    memset(&g_ring, 0, sizeof(g_ring));
+    for (i = 0; i < CC_WORKER_QUEUE_SIZE; i++)
+        atomic_store_explicit(&g_ring.slots[i].seq, i, memory_order_relaxed);
+    atomic_store_explicit(&g_ring.head, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_ring.tail, 0, memory_order_relaxed);
 }
 
 /* Returns 0 on success, -1 if queue full */
-static int ring_push(cc_ring_t *r, const cc_event_t *ev)
+static int ring_push(const cc_event_t *ev)
 {
     unsigned head, seq;
     cc_ring_slot_t *slot;
 
     for (;;) {
-        head = atomic_load_explicit(&r->head, memory_order_relaxed);
-        slot = &r->slots[head & r->mask];
+        head = atomic_load_explicit(&g_ring.head, memory_order_relaxed);
+        slot = &g_ring.slots[head & (CC_WORKER_QUEUE_SIZE - 1)];
         seq  = atomic_load_explicit(&slot->seq, memory_order_acquire);
 
         if (seq == head) {
             if (atomic_compare_exchange_weak_explicit(
-                    &r->head, &head, head + 1,
+                    &g_ring.head, &head, head + 1,
                     memory_order_relaxed, memory_order_relaxed))
             {
                 slot->ev = *ev;
                 atomic_store_explicit(&slot->seq, head + 1,
                                       memory_order_release);
-                pthread_mutex_lock(r->wake_mutex);
-                pthread_cond_signal(r->wake_cond);
-                pthread_mutex_unlock(r->wake_mutex);
+                /* Wake one idle worker */
+                pthread_mutex_lock(&g_wake_mutex);
+                pthread_cond_signal(&g_wake_cond);
+                pthread_mutex_unlock(&g_wake_mutex);
                 return 0;
             }
         } else if ((int)(seq - head) < 0) {
@@ -120,24 +119,24 @@ static int ring_push(cc_ring_t *r, const cc_event_t *ev)
 }
 
 /* Returns 1 if an event was popped, 0 if queue empty */
-static int ring_pop(cc_ring_t *r, cc_event_t *ev)
+static int ring_pop(cc_event_t *ev)
 {
     unsigned tail, seq;
     cc_ring_slot_t *slot;
 
     for (;;) {
-        tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
-        slot = &r->slots[tail & r->mask];
+        tail = atomic_load_explicit(&g_ring.tail, memory_order_relaxed);
+        slot = &g_ring.slots[tail & (CC_WORKER_QUEUE_SIZE - 1)];
         seq  = atomic_load_explicit(&slot->seq, memory_order_acquire);
 
         if (seq == tail + 1) {
             if (atomic_compare_exchange_weak_explicit(
-                    &r->tail, &tail, tail + 1,
+                    &g_ring.tail, &tail, tail + 1,
                     memory_order_relaxed, memory_order_relaxed))
             {
                 *ev = slot->ev;
                 atomic_store_explicit(&slot->seq,
-                                      tail + (r->mask + 1),
+                                      tail + CC_WORKER_QUEUE_SIZE,
                                       memory_order_release);
                 return 1;
             }
@@ -151,65 +150,56 @@ static int ring_pop(cc_ring_t *r, cc_event_t *ev)
 /* ── Worker pool ─────────────────────────────────────────────────────────── */
 
 static pthread_t        g_workers[CC_WORKER_POOL_SIZE];
-static pthread_t        g_answer_workers[CC_ANSWER_WORKER_POOL_SIZE];
 static volatile int     g_running = 0;
 
 /* forward declaration */
 static void process_event(cc_event_t *ev);
 
-static void *worker_thread_loop(void *arg, cc_ring_t *ring, const char *name_pfx)
+static void *worker_thread(void *arg)
 {
     pj_thread_desc  desc;
     pj_thread_t    *pj_thread = NULL;
     char            name[32];
     int             idx = (int)(intptr_t)arg;
 
-    snprintf(name, sizeof(name), "%s_%d", name_pfx, idx);
+    snprintf(name, sizeof(name), "cc_worker_%d", idx);
     pj_bzero(desc, sizeof(desc));
     if (pj_thread_register(name, desc, &pj_thread) != PJ_SUCCESS) {
-        PJ_LOG(1, (THIS_FILE, "[WORKER] pj_thread_register failed %s", name));
+        PJ_LOG(1, (THIS_FILE, "[WORKER] pj_thread_register failed idx=%d", idx));
         return NULL;
     }
 
-    PJ_LOG(3, (THIS_FILE, "[WORKER] thread %s started", name));
+    PJ_LOG(3, (THIS_FILE, "[WORKER] thread %d started", idx));
 
     while (g_running) {
         cc_event_t ev;
-        if (ring_pop(ring, &ev)) {
+        if (ring_pop(&ev)) {
             process_event(&ev);
         } else {
+            /* Sleep until signalled by ring_push or shutdown */
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += 1;
-            pthread_mutex_lock(ring->wake_mutex);
-            if (!ring_pop(ring, &ev)) {
-                pthread_cond_timedwait(ring->wake_cond, ring->wake_mutex, &ts);
-                pthread_mutex_unlock(ring->wake_mutex);
+            ts.tv_sec += 1;  /* 1s timeout — safety net for missed signals */
+            pthread_mutex_lock(&g_wake_mutex);
+            if (!ring_pop(&ev)) {
+                pthread_cond_timedwait(&g_wake_cond, &g_wake_mutex, &ts);
+                pthread_mutex_unlock(&g_wake_mutex);
             } else {
-                pthread_mutex_unlock(ring->wake_mutex);
+                pthread_mutex_unlock(&g_wake_mutex);
                 process_event(&ev);
             }
         }
     }
 
+    /* drain remaining events on shutdown */
     {
         cc_event_t ev;
-        while (ring_pop(ring, &ev))
+        while (ring_pop(&ev))
             process_event(&ev);
     }
 
-    PJ_LOG(3, (THIS_FILE, "[WORKER] thread %s stopped", name));
+    PJ_LOG(3, (THIS_FILE, "[WORKER] thread %d stopped", idx));
     return NULL;
-}
-
-static void *worker_thread(void *arg)
-{
-    return worker_thread_loop(arg, &g_ring, "cc_worker");
-}
-
-static void *answer_worker_thread(void *arg)
-{
-    return worker_thread_loop(arg, &g_answer_ring, "cc_answer");
 }
 
 /* ── Timer queue (min-heap) ──────────────────────────────────────────────── */
@@ -312,10 +302,9 @@ static void *timer_thread_fn(void *arg)
 
         /* For CC_EV_WAV_HANGUP_A: stop the waiting-prompt player immediately
          * to prevent EOF spam while the event waits in the worker queue.
-	 *          * ev.player_a was captured at queue time and stays in_use until
-         * cc_stop_wav, so it cannot have been handed to a new call.
-         * Always stop it — even if A already DISCONNECTED — otherwise the
-         * slot leaks. Do not hang up here; the worker still checks ownership.
+         * Guard: verify the session still owns this call_id slot before
+         * stopping the player — the slot may have been reused by a new call
+         * whose player_a happens to share the same id.
          * For CC_EV_HANGUP_A_ONLY: player_a is the treatment player —
          * leave it running, ev_hangup_a_only stops it after the delay. */
         if (ev.type == CC_EV_WAV_HANGUP_A && ev.player_a != PJSUA_INVALID_ID) {
@@ -327,57 +316,28 @@ static void *timer_thread_fn(void *arg)
                 session_owns_slot = (s->call_a == ev.call_a);
                 pthread_mutex_unlock(lk);
             }
-            if (session_owns_slot) 
+            if (session_owns_slot) {
                 PJ_LOG(3, (THIS_FILE, "[TIMER] Stop A waiting prompt before treatment"));
-             else 
-                PJ_LOG(3, (THIS_FILE,  "[TIMER] Stop orphaned A waiting prompt (A-leg gone)"));
-	    cc_stop_wav(ev.player_a, PJSUA_INVALID_ID);
-            ev.player_a = PJSUA_INVALID_ID;
+                cc_stop_wav(ev.player_a, PJSUA_INVALID_ID);
+                ev.player_a = PJSUA_INVALID_ID;
+            } else {
+                PJ_LOG(3, (THIS_FILE,
+                           "[TIMER] Skipping stale player stop — call slot reused"));
+                ev.player_a = PJSUA_INVALID_ID;
+            }
         }
 
         /* Post to worker pool — cc_worker_post acquires its own ref for the
          * worker's copy of the event.  The timer held its own ref (ev.reason)
          * while the event sat in the heap; that timer ref must be released
          * here regardless of whether the post succeeded.
-         * On failure also clear a_treatment_running so maybe_finalize can run.
-         * For HANGUP_A_ONLY, also hang up + emit deferred CDR — otherwise A
-         * stays up forever after a queue-full drop. */
+         * On failure also clear a_treatment_running so maybe_finalize can run. */
         int posted = (cc_worker_post(&ev) == 0);
         if (!posted && ev.session) {
-            cc_session_t *s = ev.session;
-            pthread_mutex_t *lock = s->lock;
-            char status[32];
-            char reason[64];
-            int need_end = 0;
-            pjsua_call_id call_a = ev.call_a;
-            pjsip_status_code code = (pjsip_status_code)ev.sip_code;
-
-            if (ev.type == CC_EV_HANGUP_A_ONLY) {
-                if (ev.player_a != PJSUA_INVALID_ID) {
-                    cc_stop_wav(ev.player_a, PJSUA_INVALID_ID);
-                    ev.player_a = PJSUA_INVALID_ID;
-                }
-                if (cc_session_call_is_current(s, call_a, 1))
-                    cc_safe_hangup(call_a, code);
-                pthread_mutex_lock(lock);
-                if (!s->end_reported && s->final_status[0] != '\0') {
-                    snprintf(status, sizeof(status), "%s", s->final_status);
-                    snprintf(reason, sizeof(reason), "%s", s->final_reason);
-                    need_end = 1;
-                }
-                s->a_treatment_running = 0;
-                pthread_mutex_unlock(lock);
-                if (need_end)
-                    cc_session_mark_end(s, status, reason);
-                PJ_LOG(1, (THIS_FILE,
-                           "[TIMER] HANGUP_A_ONLY dropped (queue full) — "
-                           "forced hangup call_a=%d",
-                           call_a));
-            } else {
-                pthread_mutex_lock(lock);
-                s->a_treatment_running = 0;
-                pthread_mutex_unlock(lock);
-            }
+            pthread_mutex_t *lock = ev.session->lock;
+            pthread_mutex_lock(lock);
+            ev.session->a_treatment_running = 0;
+            pthread_mutex_unlock(lock);
         }
         if (ev.session)
             cc_session_release_reason(ev.session, ev.reason);
@@ -437,22 +397,10 @@ int cc_worker_start(void)
         }
     }
 
-    for (i = 0; i < CC_ANSWER_WORKER_POOL_SIZE; i++) {
-        if (pthread_create(&g_answer_workers[i], &attr,
-                           answer_worker_thread, (void *)(intptr_t)i) != 0)
-        {
-            PJ_LOG(1, (THIS_FILE,
-                       "[WORKER] failed to create answer worker thread %d", i));
-            pthread_attr_destroy(&attr);
-            return -1;
-        }
-    }
-
     pthread_attr_destroy(&attr);
     PJ_LOG(3, (THIS_FILE,
-               "[WORKER] pools started: general=%d q=%d, answer=%d q=%d",
-               CC_WORKER_POOL_SIZE, CC_WORKER_QUEUE_SIZE,
-               CC_ANSWER_WORKER_POOL_SIZE, CC_ANSWER_QUEUE_SIZE));
+               "[WORKER] pool started: %d threads, queue=%d slots",
+               CC_WORKER_POOL_SIZE, CC_WORKER_QUEUE_SIZE));
 
     if (pthread_create(&g_timer_thread, NULL, timer_thread_fn, NULL) != 0) {
         PJ_LOG(1, (THIS_FILE, "[WORKER] failed to create timer thread"));
@@ -472,23 +420,15 @@ void cc_worker_stop(void)
     pthread_mutex_lock(&g_wake_mutex);
     pthread_cond_broadcast(&g_wake_cond);
     pthread_mutex_unlock(&g_wake_mutex);
-    pthread_mutex_lock(&g_answer_wake_mutex);
-    pthread_cond_broadcast(&g_answer_wake_cond);
-    pthread_mutex_unlock(&g_answer_wake_mutex);
     for (i = 0; i < CC_WORKER_POOL_SIZE; i++)
         pthread_join(g_workers[i], NULL);
-    for (i = 0; i < CC_ANSWER_WORKER_POOL_SIZE; i++)
-        pthread_join(g_answer_workers[i], NULL);
-    PJ_LOG(3, (THIS_FILE, "[WORKER] pools stopped"));
+    PJ_LOG(3, (THIS_FILE, "[WORKER] pool stopped"));
 }
 
 /* ── Public post API ─────────────────────────────────────────────────────── */
 
 int cc_worker_post(cc_event_t *ev)
 {
-    cc_ring_t *dest;
-    const char *qname;
-
     if (!ev)
         return -1;
 
@@ -506,20 +446,11 @@ int cc_worker_post(cc_event_t *ev)
             return -1;
     }
 
-    if (ev->type == CC_EV_RTPENGINE_A_ANSWER) {
-        dest = &g_answer_ring;
-        qname = "answer";
-    } else {
-        dest = &g_ring;
-        qname = "general";
-    }
-
-    if (ring_push(dest, ev) != 0) {
+    if (ring_push(ev) != 0) {
         if (ev->session)
             cc_session_release_reason(ev->session, ev->reason);
         PJ_LOG(1, (THIS_FILE,
-                   "[WORKER] %s queue full — event type=%d dropped",
-                   qname, ev->type));
+                   "[WORKER] queue full — event type=%d dropped", ev->type));
         return -1;
     }
 
@@ -558,56 +489,6 @@ static void ev_originate_b(cc_event_t *ev)
     cc_originate_b_thread(arg);
 }
 
-/* Hang up A after treatment — prefer session ownership, then active-call fallback. */
-static void hangup_a_after_treatment(cc_session_t *s,
-                                     pjsua_call_id call_a,
-                                     pjsip_status_code code)
-{
-    pjsua_call_id cur = PJSUA_INVALID_ID;
-
-    if (!s || call_a == PJSUA_INVALID_ID)
-        return;
-
-    if (cc_session_call_is_current(s, call_a, 1)) {
-        PJ_LOG(3, (THIS_FILE,
-                   "[VOICE] Hangup A after treatment call=%d code=%d",
-                   call_a, (int)code));
-        cc_safe_hangup(call_a, code);
-        return;
-    }
-
-    CC_SESSION_LOCK(s);
-    cur = s->call_a;
-    CC_SESSION_UNLOCK(s);
-
-    /*
-     * call_is_current can fail if user_data was cleared early while the SIP
-     * dialog is still up — still BYE so A does not stay connected after
-     * reject/timeout prompts.
-     */
-    if (cur == call_a && pjsua_call_is_active(call_a) == PJ_TRUE) {
-        PJ_LOG(2, (THIS_FILE,
-                   "[VOICE] Hangup A after treatment (session match, "
-                   "user_data mismatch) call=%d code=%d",
-                   call_a, (int)code));
-        cc_safe_hangup(call_a, code);
-        return;
-    }
-
-    if (pjsua_call_is_active(call_a) == PJ_TRUE) {
-        PJ_LOG(2, (THIS_FILE,
-                   "[VOICE] Hangup A after treatment (active fallback) "
-                   "call=%d cur=%d code=%d",
-                   call_a, cur, (int)code));
-        cc_safe_hangup(call_a, code);
-        return;
-    }
-
-    PJ_LOG(3, (THIS_FILE,
-               "[VOICE] Hangup A after treatment skipped — call gone "
-               "call=%d cur=%d",
-               call_a, cur));
-}
 
 /* CC_EV_WAV_HANGUP_A — was wav_then_hangup_thread */
 static void ev_wav_hangup_a(cc_event_t *ev)
@@ -618,26 +499,16 @@ static void ev_wav_hangup_a(cc_event_t *ev)
     pjsua_call_id      call_a  = ev->call_a;
 
     /* Stale-session guard: if the session no longer owns this call_id slot
-         * (A already gone, or PJSUA call_id reused), do not play treatment and
-     * do not hang up. Still release the waiting player captured on this
-     * event — take_a_waiting_prompt moved it off session->player_a, so
-     * DISCONNECTED / destroy would not stop it. */
+     * (slot was reused by a new call), abort entirely — do not stop any
+     * player and do not hang up the new call. */
     {
         int session_owns_slot = 0;
         CC_SESSION_LOCK(s);
         session_owns_slot = (s->call_a == call_a);
         CC_SESSION_UNLOCK(s);
         if (!session_owns_slot) {
-	                if (ev->player_a != PJSUA_INVALID_ID) {
-                PJ_LOG(3, (THIS_FILE,
-                           "[WAV] stale CC_EV_WAV_HANGUP_A — stop orphaned player=%d",
-                           (int)ev->player_a));
-                cc_stop_wav(ev->player_a, PJSUA_INVALID_ID);
-                ev->player_a = PJSUA_INVALID_ID;
-            } else {
-                PJ_LOG(3, (THIS_FILE,
-                           "[WAV] stale CC_EV_WAV_HANGUP_A — A-leg gone, aborting"));
-            }
+            PJ_LOG(3, (THIS_FILE,
+                       "[WAV] stale CC_EV_WAV_HANGUP_A — call slot reused, aborting"));
             pthread_mutex_t *lock = s->lock;
             pthread_mutex_lock(lock);
             s->a_treatment_running = 0;
@@ -655,34 +526,10 @@ static void ev_wav_hangup_a(cc_event_t *ev)
 
     /* Step 2: start treatment WAV, then post a delayed CC_EV_HANGUP_A_ONLY
      * so this worker is free immediately — no sleeping for wav duration. */
-    if (cc_session_call_is_current(s, call_a, 1) ||
-        pjsua_call_is_active(call_a) == PJ_TRUE)
-    {
+    if (cc_session_call_is_current(s, call_a, 1)) {
         pjsua_player_id pid = cc_start_wav(call_a, wav_path, PJ_FALSE);
         int wav_ms = worker_player_duration_ms(pid);
         cc_event_t hev;
-
-        if (pid == PJSUA_INVALID_ID) {
-            /* Still hang up after a short delay so logs show the failure. */
-            int cached = 0;
-            if (wav_path && cc_prompt_cache_get(wav_path))
-                cached = cc_prompt_cache_get(wav_path)->duration_ms;
-            wav_ms = cached > 0 ? cached : 4000;
-            PJ_LOG(1, (THIS_FILE,
-                       "[VOICE] treatment start failed path=%s — hangup in %dms",
-                       wav_path ? wav_path : "(null)", wav_ms));
-        }
-
-        /* Clamp: too-small ends the call mid-prompt; absurd values leave A up. */
-        if (wav_ms < 500)
-            wav_ms = 500;
-        if (wav_ms > 120000)
-            wav_ms = 120000;
-
-        PJ_LOG(3, (THIS_FILE,
-                   "[VOICE] treatment armed path=%s — hangup A in %dms call=%d",
-                   wav_path ? wav_path : "(null)", wav_ms, call_a));
-
         memset(&hev, 0, sizeof(hev));
         hev.type     = CC_EV_HANGUP_A_ONLY;
         hev.session  = s;
@@ -693,22 +540,13 @@ static void ev_wav_hangup_a(cc_event_t *ev)
         if (cc_worker_post_delayed(&hev, wav_ms) != 0) {
             /* fallback: stop player and hang up inline */
             cc_stop_wav(pid, PJSUA_INVALID_ID);
-            hangup_a_after_treatment(s, call_a, code);
-            {
-                char status[32], reason[64];
-                int need_end = 0;
-                pthread_mutex_t *lock = s->lock;
-                pthread_mutex_lock(lock);
-                s->a_treatment_running = 0;
-                if (!s->end_reported && s->final_status[0] != '\0') {
-                    snprintf(status, sizeof(status), "%s", s->final_status);
-                    snprintf(reason, sizeof(reason), "%s", s->final_reason);
-                    need_end = 1;
-                }
-                pthread_mutex_unlock(lock);
-                if (need_end)
-                    cc_session_mark_end(s, status, reason);
-            }
+            if (cc_session_call_is_current(s, call_a, 1))
+                cc_safe_hangup(call_a, code);
+            /* HANGUP_A_ONLY will not run — clear treatment flag now */
+            pthread_mutex_t *lock = s->lock;
+            pthread_mutex_lock(lock);
+            s->a_treatment_running = 0;
+            pthread_mutex_unlock(lock);
         }
         /* a_treatment_running stays set when post succeeded —
          * HANGUP_A_ONLY is the terminal event and clears it via process_event */
@@ -732,31 +570,14 @@ static void ev_hangup_a_only(cc_event_t *ev)
     cc_session_t      *s      = ev->session;
     pjsua_call_id      call_a = ev->call_a;
     pjsip_status_code  code   = (pjsip_status_code)ev->sip_code;
-    char status[32];
-    char reason[64];
-    int need_end = 0;
 
     /* Stop the treatment player */
     if (ev->player_a != PJSUA_INVALID_ID) {
         cc_stop_wav(ev->player_a, PJSUA_INVALID_ID);
         ev->player_a = PJSUA_INVALID_ID;
     }
-    hangup_a_after_treatment(s, call_a, code);
-
-    /*
-     * Validation-reject / B-reject / DTMF-timeout set torn_down + final_*
-     * before playing the treatment WAV and defer mark_end so RTPengine stays
-     * up for audio. Emit CDR / delete now that treatment is done.
-     */
-    CC_SESSION_LOCK(s);
-    if (!s->end_reported && s->final_status[0] != '\0') {
-        snprintf(status, sizeof(status), "%s", s->final_status);
-        snprintf(reason, sizeof(reason), "%s", s->final_reason);
-        need_end = 1;
-    }
-    CC_SESSION_UNLOCK(s);
-    if (need_end)
-        cc_session_mark_end(s, status, reason);
+    if (cc_session_call_is_current(s, call_a, 1))
+        cc_safe_hangup(call_a, code);
     /* a_treatment_running cleared by process_event after maybe_finalize */
 }
 
@@ -786,27 +607,7 @@ static void mca_clear_treatment(cc_session_t *s)
     pthread_mutex_unlock(lock);
 }
 
-/* Emit CDR / rtpengine delete when follow-up audio cannot run. */
-static void mca_mark_end_if_deferred(cc_session_t *s)
-{
-    char status[32];
-    char reason[64];
-    int need_end = 0;
-
-    CC_SESSION_LOCK(s);
-    if (!s->end_reported && s->final_status[0] != '\0') {
-        snprintf(status, sizeof(status), "%s", s->final_status);
-        snprintf(reason, sizeof(reason), "%s", s->final_reason);
-        need_end = 1;
-    }
-    CC_SESSION_UNLOCK(s);
-    if (need_end)
-        cc_session_mark_end(s, status, reason);
-}
-
-/* Play follow-up WAV then hang up via delayed CC_EV_HANGUP_A_ONLY (no sleep).
- * Caller must have stored final_* and set torn_down; mark_end runs from
- * HANGUP_A_ONLY so RTPengine stays up for the confirmation prompt. */
+/* Play follow-up WAV then hang up via delayed CC_EV_HANGUP_A_ONLY (no sleep). */
 static void mca_followup_wav_then_hangup(cc_session_t *s,
                                          pjsua_call_id call_a,
                                          const char *path,
@@ -818,27 +619,10 @@ static void mca_followup_wav_then_hangup(cc_session_t *s,
 
     if (!cc_session_call_is_current(s, call_a, 1)) {
         mca_clear_treatment(s);
-        mca_mark_end_if_deferred(s);
         return;
     }
 
     pid = cc_start_wav(call_a, path, PJ_FALSE);
-    if (pid == PJSUA_INVALID_ID) {
-        /*
-         * Prompt missing / RTPengine play failed: do not wait for a fake
-         * duration (cc_wav_player_duration_ms(INVALID) returns 4000). Hang
-         * up A immediately and emit deferred CDR.
-         */
-        PJ_LOG(1, (THIS_FILE,
-                   "[VOICE] MCA follow-up start failed path=%s — hangup now",
-                   path ? path : "(null)"));
-        if (cc_session_call_is_current(s, call_a, 1))
-            cc_safe_hangup(call_a, code);
-        mca_clear_treatment(s);
-        mca_mark_end_if_deferred(s);
-        return;
-    }
-
     wav_ms = worker_player_duration_ms(pid);
     cap = cc_cfg_free_period_ms();
     wait_ms = wav_ms > cap ? cap : wav_ms;
@@ -874,7 +658,6 @@ static void mca_followup_wav_then_hangup(cc_session_t *s,
         if (cc_session_call_is_current(s, call_a, 1))
             cc_safe_hangup(call_a, code);
         mca_clear_treatment(s);
-        mca_mark_end_if_deferred(s);
     }
 }
 
@@ -935,8 +718,6 @@ static void ev_mca_resolve(cc_event_t *ev)
     pjsua_call_id call_a = ev->call_a;
     pjsua_player_id take;
     int decided;
-    const char *end_reason;
-    const char *wav_path;
 
     CC_SESSION_LOCK(s);
     decided = s->mca_decided;
@@ -947,28 +728,16 @@ static void ev_mca_resolve(cc_event_t *ev)
     if (take != PJSUA_INVALID_ID)
         cc_stop_wav(take, PJSUA_INVALID_ID);
 
-    if (decided == 1 || decided == 2) {
-        /*
-         * Same as validation-reject: store CDR fields + torn_down, play
-         * confirmation WAV, then mark_end from HANGUP_A_ONLY so RTPengine
-         * is not deleted before MCA_SENT / MCA_NOT_SENT audio.
-         */
-        end_reason = (decided == 1) ? "SPONSOR_UNREACHABLE_MCA"
-                                    : "SPONSOR_UNREACHABLE_NoMCA";
-        wav_path = cc_prompt_get_path(decided == 1 ? CC_PROMPT_MCA_SENT
-                                                   : CC_PROMPT_MCA_NOT_SENT);
-
-        CC_SESSION_LOCK(s);
-        s->torn_down = 1;
-        snprintf(s->final_status, sizeof(s->final_status), "FAILED");
-        snprintf(s->final_reason, sizeof(s->final_reason), "%s", end_reason);
-        CC_SESSION_UNLOCK(s);
-
-        PJ_LOG(3, (THIS_FILE,
-                   "[MCA] resolve decided=%d reason=%s play=%s (defer mark_end)",
-                   decided, end_reason, wav_path ? wav_path : "(null)"));
-
-        mca_followup_wav_then_hangup(s, call_a, wav_path, PJSIP_SC_OK);
+    if (decided == 1) {
+        cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_MCA");
+        mca_followup_wav_then_hangup(s, call_a,
+                                     cc_prompt_get_path(CC_PROMPT_MCA_SENT),
+                                     PJSIP_SC_OK);
+    } else if (decided == 2) {
+        cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_NoMCA");
+        mca_followup_wav_then_hangup(s, call_a,
+                                     cc_prompt_get_path(CC_PROMPT_MCA_NOT_SENT),
+                                     PJSIP_SC_OK);
     } else {
         cc_session_mark_end(s, "FAILED", "SPONSOR_UNREACHABLE_NoMCA");
         if (cc_session_call_is_current(s, call_a, 1))
@@ -1009,8 +778,7 @@ static void ev_b_prompt_start(cc_event_t *ev)
         if (aborted) goto bps_done;
     }
 
-    /* Poll until B RTP ready (max 3s) — skip when RTPengine owns media. */
-    if (!cc_rtpengine_enabled())
+    /* Poll until B RTP ready (max 3s) */
     {
         cc_rtp_ep_t rtp;
         int rtp_ms = 0, aborted = 0;
@@ -1030,33 +798,9 @@ static void ev_b_prompt_start(cc_event_t *ev)
 
     path = cc_prompt_get_path(CC_PROMPT_COLLECT_PROMPT);
     CC_SESSION_LOCK(session);
-    if (session->accepted || session->torn_down ||
-        session->call_b != call_id ||
-        session->player_b != PJSUA_INVALID_ID)
-    {
-        session->b_prompt_starting = 0;
-        CC_SESSION_UNLOCK(session);
-        PJ_LOG(3, (THIS_FILE,
-                   "[VOICE] B collect prompt skip — already active/accepted/"
-                   "torn (call=%d)", call_id));
-        return;
-    }
     if (session->b_prompt_start_ts == 0)
         session->b_prompt_start_ts = time(NULL);
     CC_SESSION_UNLOCK(session);
-
-    /*
-     * Single B-facing announcement: stop any prior B play, stop relaying A's
-     * audio, then start collect once. Without the block RTPengine sends the
-     * prompt SSRC and the relayed A SSRC to B at the same time — Linphone
-     * locks the first SSRC and never plays the prompt, Zoiper mixes both and
-     * sounds choppy. The block is directional (A party only) so B's RFC2833
-     * still reaches DTMF-log-dest.
-     */
-    if (cc_rtpengine_enabled()) {
-        cc_rtpengine_stop_play(session, 0);
-        cc_rtpengine_block_media(session);
-    }
 
     pid = cc_start_wav(call_id, path, PJ_FALSE);
 
@@ -1443,9 +1187,6 @@ static void ev_accept_bridge(cc_event_t *ev)
             cc_stop_wav(pb, PJSUA_INVALID_ID);
     }
 
-    /* Collect phase over — resume A -> B forwarding before bridging. */
-    cc_rtpengine_unblock_media(s);
-
     if (accept_is_stale(s, call_a, call_b)) {
         PJ_LOG(3, (THIS_FILE, "[ACCEPT] phase3 stale — abort"));
         CC_SESSION_LOCK(s);
@@ -1482,19 +1223,6 @@ static void ev_accept_bridge(cc_event_t *ev)
             cc_bridge_calls(call_a, call_b);
             leg_a_send_reinvite_bypass(s);
             leg_b_send_reinvite_bypass(s);
-        } else if (mode == CC_MEDIA_MODE_RTPENGINE) {
-            /*
-             * Both legs already advertise RTPengine from offer/answer (and
-             * A re-INVITE if A-facing ports moved). Post-accept UPDATEs are
-             * redundant and collide with that re-INVITE under load
-             * (PJ_EINVALIDOP / retry storms). Just stay on RTPengine.
-             */
-            PJ_LOG(3, (THIS_FILE,
-                       "[MEDIA-MODE] rtpengine: skip UPDATE — media already on "
-                       "RTPengine (call_a=%d call_b=%d)",
-                       call_a, call_b));
-            cc_silence_call(call_a);
-            cc_silence_call(call_b);
         } else {
             PJ_LOG(3, (THIS_FILE, "[MEDIA-MODE] update: sending SIP UPDATEs"));
             leg_a_send_update_bypass(call_a, s);
@@ -1543,31 +1271,17 @@ static void ev_timer(cc_event_t *ev, int is_ring)
             s->decision_completed = 1;
             s->decision_digit = '\0';
             s->torn_down = 1;
-            snprintf(s->final_status, sizeof(s->final_status), "FAILED");
-            snprintf(s->final_reason, sizeof(s->final_reason), "NO_ANSWER");
             fired = 1;
         }
         CC_SESSION_UNLOCK(s);
         if (fired) {
-            int treatment_armed = 0;
-            pjsua_call_id call_a = PJSUA_INVALID_ID;
+            cc_session_mark_end(s, "FAILED", "NO_ANSWER");
             if (cc_session_call_is_current(s, call_b, 0))
                 cc_safe_hangup(call_b, PJSIP_SC_REQUEST_TIMEOUT);
-            /* NOT_AVAILABLE_TO_PAY (1.45.wav) — defer mark_end until after play */
+            /* NOT_AVAILABLE_TO_PAY (1.45.wav) — one-shot then hangup, no MCA */
             leg_a_play_prompt_then_hangup(s,
                                           CC_PROMPT_NOT_AVAILABLE_TO_PAY,
                                           PJSIP_SC_TEMPORARILY_UNAVAILABLE);
-            CC_SESSION_LOCK(s);
-            treatment_armed = s->a_treatment_running;
-            call_a = s->call_a;
-            CC_SESSION_UNLOCK(s);
-            if (!treatment_armed) {
-                if (call_a != PJSUA_INVALID_ID &&
-                    (cc_session_call_is_current(s, call_a, 1) ||
-                     pjsua_call_is_active(call_a) == PJ_TRUE))
-                    cc_safe_hangup(call_a, PJSIP_SC_TEMPORARILY_UNAVAILABLE);
-                cc_session_mark_end(s, "FAILED", "NO_ANSWER");
-            }
         }
     } else {
         PJ_LOG(2, (THIS_FILE, "[WORKER] DTMF timeout — ELIGIBILITY_TIMEOUT"));
@@ -1662,7 +1376,7 @@ static void cc_maybe_arm_update_ack_watchdog(cc_session_t *s,
     ev.call_b  = call_b;
     snprintf(ev.reason, sizeof(ev.reason), "update-ack-watchdog-send-path");
 
-    if (cc_worker_post_delayed(&ev, CC_UPDATE_ACK_TIMEOUT_MS) != 0) {
+    if (cc_worker_post(&ev) != 0) {
         CC_SESSION_LOCK(s);
         s->update_ack_watchdog_started = 0;
         CC_SESSION_UNLOCK(s);
@@ -1673,39 +1387,6 @@ static void cc_maybe_arm_update_ack_watchdog(cc_session_t *s,
     PJ_LOG(3, (THIS_FILE,
                "[UPDATE-WD] watchdog armed at send path — fallback to bridge if no 200 OK in %dms",
                CC_UPDATE_ACK_TIMEOUT_MS));
-}
-
-/* Returns:
- *   0  not rtpengine mode
- *   1  rtpengine ready
- *  -1  waiting (re-posted)
- *  -2  timeout
- */
-static int rtpengine_wait_ready(cc_event_t *ev, cc_session_t *s, const char *tag)
-{
-    if (!cc_rtpengine_enabled())
-        return 0;
-    if (cc_rtpengine_ready(s)) {
-        PJ_LOG(3, (THIS_FILE, "[%s] RTPengine ready for SDP rewrite", tag));
-        return 1;
-    }
-    if (ev->delay_ms >= 5000) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[%s] RTPengine not ready after 5s — falling back to peer RTP",
-                   tag));
-        return -2;
-    }
-    ev->delay_ms += 50;
-    cc_worker_post_delayed(ev, 50);
-    return -1;
-}
-
-static int rewrite_ep_ready(cc_session_t *s, int for_a_leg)
-{
-    cc_rtp_ep_t ep;
-    if (cc_rtpengine_sdp_target(s, for_a_leg, &ep))
-        return 1;
-    return for_a_leg ? (s->rtp_b.port != 0) : (s->rtp_a.port != 0);
 }
 
 /* CC_EV_UPDATE_A_BYPASS — non-blocking A-leg UPDATE with RTP poll re-post
@@ -1724,16 +1405,6 @@ static void ev_update_a_bypass(cc_event_t *ev)
     pjsua_msg_data msg_data;
     pj_status_t    status;
 
-    if (cc_cfg_media_mode() == CC_MEDIA_MODE_RTPENGINE) {
-        PJ_LOG(3, (THIS_FILE,
-                   "[A] UPDATE bypass skipped — rtpengine mode (no hairpin UPDATE)"));
-        return;
-    }
-
-    memset(&rtp_a, 0, sizeof(rtp_a));
-    memset(&rtp_b, 0, sizeof(rtp_b));
-    memset(&cached_b, 0, sizeof(cached_b));
-
     CC_SESSION_LOCK(s);
     ri_active = s->b_reinvite_active;
     torn = s->torn_down || s->call_a != call_a || s->call_b != call_b;
@@ -1751,14 +1422,6 @@ static void ev_update_a_bypass(cc_event_t *ev)
             PJ_LOG(1, (THIS_FILE, "[A] UPDATE skipped: B-leg not CONFIRMED"));
             return;
         }
-    }
-
-    {
-        int ng = rtpengine_wait_ready(ev, s, "A");
-        if (ng == -1)
-            return;
-        if (ng == 1)
-            goto arm_a_update;
     }
 
     /* If re-INVITE still active or B RTP not ready, re-post after 50ms */
@@ -1788,15 +1451,14 @@ static void ev_update_a_bypass(cc_event_t *ev)
     else
         PJ_LOG(3, (THIS_FILE, "[A] A RTP not readable (post-bypass normal) — arming rewrite with rtp_b only"));
 
-arm_a_update:
     CC_SESSION_LOCK(s);
     if (s->call_a == call_a && s->call_b == call_b && !s->torn_down) {
-        if (rtp_b.port != 0)
-            s->rtp_b = rtp_b;
+        s->rtp_b = rtp_b;
         s->update_a_pending = 1;
     }
     CC_SESSION_UNLOCK(s);
-    PJ_LOG(3, (THIS_FILE, "[A] UPDATE rewrite armed"));
+    PJ_LOG(3, (THIS_FILE, "[A] UPDATE rewrite armed: A will receive B RTP %s:%d",
+               rtp_b.ip, rtp_b.port));
 
     pjsua_msg_data_init(&msg_data);
     PJ_LOG(3, (THIS_FILE, "[A] Sending SIP UPDATE"));
@@ -1827,12 +1489,6 @@ static void ev_update_b_bypass(cc_event_t *ev)
     pjsua_msg_data msg_data;
     pj_status_t    status;
 
-    if (cc_cfg_media_mode() == CC_MEDIA_MODE_RTPENGINE) {
-        PJ_LOG(3, (THIS_FILE,
-                   "[B] UPDATE bypass skipped — rtpengine mode (no hairpin UPDATE)"));
-        return;
-    }
-
     CC_SESSION_LOCK(s);
     ri_active = s->b_reinvite_active;
     torn = s->torn_down || s->call_a != call_a || s->call_b != call_b;
@@ -1851,16 +1507,6 @@ static void ev_update_b_bypass(cc_event_t *ev)
             PJ_LOG(1, (THIS_FILE, "[B] UPDATE skipped: B-leg not CONFIRMED"));
             return;
         }
-    }
-
-    memset(&rtp_a, 0, sizeof(rtp_a));
-    memset(&rtp_b, 0, sizeof(rtp_b));
-    {
-        int ng = rtpengine_wait_ready(ev, s, "B");
-        if (ng == -1)
-            return;
-        if (ng == 1)
-            goto arm_b_update;
     }
 
     /* If re-INVITE still active or B RTP not ready, re-post after 50ms */
@@ -1891,17 +1537,15 @@ static void ev_update_b_bypass(cc_event_t *ev)
 
     PJ_LOG(3, (THIS_FILE, "[B] A RTP ready: %s:%d", rtp_a.ip, rtp_a.port));
 
-arm_b_update:
     CC_SESSION_LOCK(s);
     if (s->call_a == call_a && s->call_b == call_b && !s->torn_down) {
-        if (rtp_a.port != 0)
-            s->rtp_a = rtp_a;
-        if (rtp_b.port != 0)
-            s->rtp_b = rtp_b;
+        s->rtp_a = rtp_a;
+        s->rtp_b = rtp_b;
         s->update_b_pending = 1;
     }
     CC_SESSION_UNLOCK(s);
-    PJ_LOG(3, (THIS_FILE, "[B] UPDATE rewrite armed"));
+    PJ_LOG(3, (THIS_FILE, "[B] UPDATE rewrite armed: B will receive A RTP %s:%d",
+               rtp_a.ip, rtp_a.port));
 
     pjsua_msg_data_init(&msg_data);
     PJ_LOG(3, (THIS_FILE, "[B] Sending SIP UPDATE"));
@@ -1958,16 +1602,6 @@ static void ev_reinvite_a_bypass(cc_event_t *ev)
         }
     }
 
-    memset(&rtp_a, 0, sizeof(rtp_a));
-    memset(&rtp_b, 0, sizeof(rtp_b));
-    {
-        int ng = rtpengine_wait_ready(ev, s, "A-REINVITE");
-        if (ng == -1)
-            return;
-        if (ng == 1)
-            goto arm_a_reinvite;
-    }
-
     /* If SBC re-INVITE active or B RTP not ready, re-post after 50ms */
     if (ri_active ||
         cc_get_call_remote_rtp(call_b, &rtp_b) != PJ_SUCCESS ||
@@ -1996,18 +1630,16 @@ static void ev_reinvite_a_bypass(cc_event_t *ev)
         return;
     }
 
-arm_a_reinvite:
     CC_SESSION_LOCK(s);
     if (s->call_a == call_a && s->call_b == call_b && !s->torn_down) {
-        if (rtp_a.port != 0)
-            s->rtp_a = rtp_a;
-        if (rtp_b.port != 0)
-            s->rtp_b = rtp_b;
+        s->rtp_a = rtp_a;
+        s->rtp_b = rtp_b;
         s->reinvite_a_pending = 1;
     }
     CC_SESSION_UNLOCK(s);
 
-    PJ_LOG(3, (THIS_FILE, "[A] re-INVITE rewrite armed"));
+    PJ_LOG(3, (THIS_FILE, "[A] re-INVITE rewrite armed: A will receive B RTP %s:%d",
+               rtp_b.ip, rtp_b.port));
 
     pjsua_msg_data_init(&msg_data);
     PJ_LOG(3, (THIS_FILE, "[A] Sending SIP re-INVITE"));
@@ -2053,16 +1685,6 @@ static void ev_reinvite_b_bypass(cc_event_t *ev)
         }
     }
 
-    memset(&rtp_a, 0, sizeof(rtp_a));
-    memset(&rtp_b, 0, sizeof(rtp_b));
-    {
-        int ng = rtpengine_wait_ready(ev, s, "B-REINVITE");
-        if (ng == -1)
-            return;
-        if (ng == 1)
-            goto arm_b_reinvite;
-    }
-
     /* If SBC re-INVITE active or B RTP not ready, re-post after 50ms */
     if (ri_active ||
         cc_get_call_remote_rtp(call_b, &rtp_b) != PJ_SUCCESS ||
@@ -2093,18 +1715,16 @@ static void ev_reinvite_b_bypass(cc_event_t *ev)
 
     PJ_LOG(3, (THIS_FILE, "[B] re-INVITE: A RTP ready: %s:%d", rtp_a.ip, rtp_a.port));
 
-arm_b_reinvite:
     CC_SESSION_LOCK(s);
     if (s->call_a == call_a && s->call_b == call_b && !s->torn_down) {
-        if (rtp_a.port != 0)
-            s->rtp_a = rtp_a;
-        if (rtp_b.port != 0)
-            s->rtp_b = rtp_b;
+        s->rtp_a = rtp_a;
+        s->rtp_b = rtp_b;
         s->reinvite_b_pending = 1;
     }
     CC_SESSION_UNLOCK(s);
 
-    PJ_LOG(3, (THIS_FILE, "[B] re-INVITE rewrite armed"));
+    PJ_LOG(3, (THIS_FILE, "[B] re-INVITE rewrite armed: B will receive A RTP %s:%d",
+               rtp_a.ip, rtp_a.port));
 
     pjsua_msg_data_init(&msg_data);
     PJ_LOG(3, (THIS_FILE, "[B] Sending SIP re-INVITE"));
@@ -2166,7 +1786,7 @@ static void ev_hold_propagate_b(cc_event_t *ev)
     s->resume_sdp_b_pending = 0;
     s->update_b_pending = 0;
     s->reinvite_b_pending = 0;
-    if (rewrite_ep_ready(s, 0) && !s->torn_down && s->call_b == call_b)
+    if (s->rtp_a.port != 0 && !s->torn_down && s->call_b == call_b)
         s->hold_sdp_b_pending = 1;
     else {
         s->hold_sdp_b_pending = 0;
@@ -2314,7 +1934,7 @@ static void ev_resume_propagate_b(cc_event_t *ev)
     s->hold_sdp_direction = 0;
     s->update_b_pending = 0;
     s->reinvite_b_pending = 0;
-    if (rewrite_ep_ready(s, 0) && !s->torn_down && s->call_b == call_b)
+    if (s->rtp_a.port != 0 && !s->torn_down && s->call_b == call_b)
         s->resume_sdp_b_pending = 1;
     else {
         s->resume_sdp_b_pending = 0;
@@ -2449,7 +2069,7 @@ static void ev_hold_propagate_a(cc_event_t *ev)
     s->resume_sdp_a_pending = 0;
     s->update_a_pending = 0;
     s->reinvite_a_pending = 0;
-    if (rewrite_ep_ready(s, 1) && !s->torn_down && s->call_a == call_a)
+    if (s->rtp_b.port != 0 && !s->torn_down && s->call_a == call_a)
         s->hold_sdp_a_pending = 1;
     else {
         s->hold_sdp_a_pending = 0;
@@ -2590,7 +2210,7 @@ static void ev_resume_propagate_a(cc_event_t *ev)
     s->hold_sdp_direction = 0;
     s->update_a_pending = 0;
     s->reinvite_a_pending = 0;
-    if (rewrite_ep_ready(s, 1) && !s->torn_down && s->call_a == call_a)
+    if (s->rtp_b.port != 0 && !s->torn_down && s->call_a == call_a)
         s->resume_sdp_a_pending = 1;
     else {
         s->resume_sdp_a_pending = 0;
@@ -2678,14 +2298,7 @@ static void ev_update_a_retry(cc_event_t *ev)
     pjsua_call_id  call_a = ev->call_a;
     int skip;
 
-    if (cc_cfg_media_mode() == CC_MEDIA_MODE_RTPENGINE) {
-        CC_SESSION_LOCK(s);
-        s->update_a_retry_pending = 0;
-        CC_SESSION_UNLOCK(s);
-        return;
-    }
-
-    /* Delay is applied via cc_worker_post_delayed(3000) at spawn — no sleep. */
+    cc_sleep_ms(3000);
 
     CC_SESSION_LOCK(s);
     skip = s->torn_down || s->media_bypassed ||
@@ -2707,12 +2320,7 @@ static void ev_update_b_retry(cc_event_t *ev)
     pjsua_call_id  call_b = ev->call_b;
     int skip;
 
-    if (cc_cfg_media_mode() == CC_MEDIA_MODE_RTPENGINE) {
-        CC_SESSION_LOCK(s);
-        s->update_b_retry_pending = 0;
-        CC_SESSION_UNLOCK(s);
-        return;
-    }
+    cc_sleep_ms(3000);
 
     CC_SESSION_LOCK(s);
     skip = s->torn_down || s->media_bypassed ||
@@ -2727,38 +2335,56 @@ static void ev_update_b_retry(cc_event_t *ev)
 
 }
 
-/* CC_EV_UPDATE_ACK_WATCHDOG — one-shot delayed timeout (no worker sleep).
- * Armed with post_delayed(CC_UPDATE_ACK_TIMEOUT_MS). Early success clears
- * update_ack_watchdog_started elsewhere; this fire is a no-op if already bypassed. */
+/* CC_EV_UPDATE_ACK_WATCHDOG — was update_ack_watchdog_thread.
+ * CC_UPDATE_ACK_TIMEOUT_MS/CC_UPDATE_ACK_POLL_MS now defined earlier
+ * (above cc_maybe_arm_update_ack_watchdog) since they're needed there too. */
 
 static void ev_update_ack_watchdog(cc_event_t *ev)
 {
     cc_session_t  *s      = ev->session;
     pjsua_call_id  call_a = ev->call_a;
     pjsua_call_id  call_b = ev->call_b;
-    int need_fallback = 0;
+    int waited_ms = 0;
 
-    CC_SESSION_LOCK(s);
-    if (!s->media_bypassed && !s->torn_down && s->accepted &&
-        s->call_a == call_a && s->call_b == call_b)
-    {
-        PJ_LOG(2, (THIS_FILE,
-                   "[WORKER] UPDATE ack timeout %dms — fallback to bridge",
-                   CC_UPDATE_ACK_TIMEOUT_MS));
-        s->update_a_sent = s->update_b_sent = 0;
-        s->update_a_acked = s->update_b_acked = 0;
-        s->update_a_pending = s->update_b_pending = 0;
-        s->update_a_retry_pending = s->update_b_retry_pending = 0;
-        need_fallback = 1;
+    while (waited_ms < CC_UPDATE_ACK_TIMEOUT_MS) {
+        int done, torn;
+        CC_SESSION_LOCK(s);
+        torn = s->torn_down || s->call_a != call_a || s->call_b != call_b;
+        done = s->media_bypassed || torn;
+        CC_SESSION_UNLOCK(s);
+        if (torn) goto wd_done;
+        if (done) goto wd_done;
+        cc_sleep_ms(CC_UPDATE_ACK_POLL_MS);
+        waited_ms += CC_UPDATE_ACK_POLL_MS;
     }
+
+    {
+        int need_fallback = 0;
+        CC_SESSION_LOCK(s);
+        if (!s->media_bypassed && !s->torn_down && s->accepted &&
+            s->call_a == call_a && s->call_b == call_b)
+        {
+            PJ_LOG(2, (THIS_FILE,
+                       "[WORKER] UPDATE ack timeout %dms — fallback to bridge",
+                       CC_UPDATE_ACK_TIMEOUT_MS));
+            s->update_a_sent = s->update_b_sent = 0;
+            s->update_a_acked = s->update_b_acked = 0;
+            s->update_a_pending = s->update_b_pending = 0;
+            s->update_a_retry_pending = s->update_b_retry_pending = 0;
+            need_fallback = 1;
+        }
+        CC_SESSION_UNLOCK(s);
+        if (need_fallback)
+            cc_bridge_calls(call_a, call_b);
+    }
+
+wd_done:
+    CC_SESSION_LOCK(s);
     s->update_ack_watchdog_started = 0;
     CC_SESSION_UNLOCK(s);
-
-    if (need_fallback)
-        cc_bridge_calls(call_a, call_b);
 }
 
-/* CC_EV_BYPASS_RTP_WATCHDOG — non-blocking RTP poll via post_delayed re-post */
+/* CC_EV_BYPASS_RTP_WATCHDOG — was cc_bypass_rtp_watchdog_thread */
 #define CC_BYPASS_RTP_WATCHDOG_MS  2500
 #define CC_BYPASS_RTP_POLL_MS        50
 
@@ -2767,97 +2393,43 @@ static void ev_bypass_rtp_watchdog(cc_event_t *ev)
     cc_session_t  *s      = ev->session;
     pjsua_call_id  call_a = ev->call_a;
     pjsua_call_id  call_b = ev->call_b;
-    int torn;
+    int waited_ms = 0, rtp_ok = 0;
     unsigned long pkt_a_start = 0, pkt_b_start = 0;
+    int snapped = 0;
 
-    CC_SESSION_LOCK(s);
-    torn = s->torn_down || s->call_a != call_a || s->call_b != call_b;
-    CC_SESSION_UNLOCK(s);
-    if (torn)
-        goto rtp_wd_done;
+    while (waited_ms < CC_BYPASS_RTP_WATCHDOG_MS) {
+        int torn;
+        CC_SESSION_LOCK(s);
+        torn = s->torn_down || s->call_a != call_a || s->call_b != call_b;
+        CC_SESSION_UNLOCK(s);
+        if (torn) { rtp_ok = 1; break; }
 
-    {
-        pjsua_stream_stat sa, sb;
-        if (pjsua_call_get_stream_stat(call_a, 0, &sa) == PJ_SUCCESS &&
-            pjsua_call_get_stream_stat(call_b, 0, &sb) == PJ_SUCCESS)
         {
-            /* delay_ms encodes elapsed; sip_code encodes whether we snapped */
-            if (ev->sip_code == 0) {
-                ev->sip_code = 1;
-                /* stash start counts in prompt_ms / timeout_sec (unused here) */
-                ev->prompt_ms = (int)sa.rtcp.rx.pkt;
-                ev->timeout_sec = (int)sb.rtcp.rx.pkt;
-            } else {
-                pkt_a_start = (unsigned long)ev->prompt_ms;
-                pkt_b_start = (unsigned long)ev->timeout_sec;
-                if (sa.rtcp.rx.pkt > pkt_a_start + 2 &&
-                    sb.rtcp.rx.pkt > pkt_b_start + 2)
+            pjsua_stream_stat sa, sb;
+            if (pjsua_call_get_stream_stat(call_a, 0, &sa) == PJ_SUCCESS &&
+                pjsua_call_get_stream_stat(call_b, 0, &sb) == PJ_SUCCESS)
+            {
+                if (!snapped) {
+                    pkt_a_start = sa.rtcp.rx.pkt;
+                    pkt_b_start = sb.rtcp.rx.pkt;
+                    snapped = 1;
+                } else if (sa.rtcp.rx.pkt > pkt_a_start + 2 &&
+                           sb.rtcp.rx.pkt > pkt_b_start + 2)
                 {
                     PJ_LOG(3, (THIS_FILE, "[WORKER] bypass RTP flowing — OK"));
-                    goto rtp_wd_done;
+                    rtp_ok = 1;
+                    break;
                 }
             }
         }
+
+        cc_sleep_ms(CC_BYPASS_RTP_POLL_MS);
+        waited_ms += CC_BYPASS_RTP_POLL_MS;
     }
 
-    if (ev->delay_ms >= CC_BYPASS_RTP_WATCHDOG_MS) {
-        int do_fallback = 0;
-        CC_SESSION_LOCK(s);
-        if (!s->torn_down && s->accepted && s->media_bypassed &&
-            s->call_a == call_a && s->call_b == call_b)
-        {
-            s->media_bypassed = s->update_a_sent = s->update_b_sent = 0;
-            s->update_a_acked = s->update_b_acked = 0;
-            do_fallback = 1;
-        }
-        CC_SESSION_UNLOCK(s);
-        if (do_fallback) {
-            PJ_LOG(2, (THIS_FILE,
-                       "[WORKER] no direct RTP after %dms — fallback to bridge",
-                       CC_BYPASS_RTP_WATCHDOG_MS));
-            cc_bridge_calls(call_a, call_b);
-        }
-        goto rtp_wd_done;
-    }
-
-    ev->delay_ms += CC_BYPASS_RTP_POLL_MS;
-    if (cc_worker_post_delayed(ev, CC_BYPASS_RTP_POLL_MS) != 0) {
-        PJ_LOG(1, (THIS_FILE, "[WORKER] bypass RTP watchdog re-post failed"));
-        goto rtp_wd_done;
-    }
-    return;
-
-rtp_wd_done:
     CC_SESSION_LOCK(s);
     s->bypass_rtp_watchdog_started = 0;
     CC_SESSION_UNLOCK(s);
-}
-
-/* CC_EV_RTPENGINE_A_ANSWER — deferred A 200 OK on answer pool (data always NULL
- * for offer-then-answer / local modes). Legacy SDP payload still supported. */
-static void ev_rtpengine_a_answer(cc_event_t *ev)
-{
-    char *sdp = (char *)ev->data;
-
-    ev->data = NULL;
-    if (!sdp) {
-        cc_complete_a_local_answer(ev->session, ev->call_a);
-        return;
-    }
-    cc_complete_a_rtpengine_answer(ev->session, ev->call_a, sdp);
-    free(sdp);
-}
-
-/* CC_EV_RTPENGINE_A_OFFER — ng offer then queue A 200 (RE ports in 200). */
-static void ev_rtpengine_a_offer(cc_event_t *ev)
-{
-    char *sdp = (char *)ev->data;
-
-    ev->data = NULL;
-    if (sdp) {
-        cc_complete_a_rtpengine_offer(ev->session, ev->call_a, sdp);
-        free(sdp);
-    }
 }
 
 /* ── Central dispatcher ──────────────────────────────────────────────────── */
@@ -2877,11 +2449,6 @@ static void process_event(cc_event_t *ev)
                        "[WORKER] stale event type=%d dropped — serial mismatch "
                        "ev=%u session=%u",
                        ev->type, ev->session_serial, current_serial));
-            if ((ev->type == CC_EV_RTPENGINE_A_ANSWER ||
-                 ev->type == CC_EV_RTPENGINE_A_OFFER) && ev->data) {
-                free(ev->data);
-                ev->data = NULL;
-            }
             cc_session_release_reason(ev->session, ev->reason);
             return;
         }
@@ -2913,16 +2480,6 @@ static void process_event(cc_event_t *ev)
     case CC_EV_UPDATE_B_RETRY:      ev_update_b_retry(ev);           break;
     case CC_EV_UPDATE_ACK_WATCHDOG: ev_update_ack_watchdog(ev);      break;
     case CC_EV_BYPASS_RTP_WATCHDOG: ev_bypass_rtp_watchdog(ev);      break;
-    case CC_EV_RTPENGINE_A_ANSWER:  ev_rtpengine_a_answer(ev);       break;
-    case CC_EV_RTPENGINE_A_OFFER:   ev_rtpengine_a_offer(ev);        break;
-    case CC_EV_RTPENGINE_DTMF: {
-        int digit = ev->sip_code;
-        if (ev->call_b != PJSUA_INVALID_ID)
-            leg_b_on_dtmf(ev->call_b, digit, ev->session);
-        else if (ev->call_a != PJSUA_INVALID_ID)
-            leg_a_on_dtmf_mca(ev->call_a, digit, ev->session);
-        break;
-    }
     case CC_EV_VASYNC_CB:
         /* session is NULL — skip session release */
         if (ev->data) {
@@ -2944,11 +2501,12 @@ static void process_event(cc_event_t *ev)
 
         /* Clear a_treatment_running and run maybe_finalize while the worker
          * ref still keeps s alive — safe to touch s->lock here. */
-        /* CC_EV_WAV_HANGUP_A / CC_EV_MCA_RESOLVE must NOT clear
-         * a_treatment_running here: they post CC_EV_HANGUP_A_ONLY which is
-         * the real terminal event. Clearing here would allow maybe_finalize
-         * to destroy the session while HANGUP_A_ONLY is still queued.
-         * Only the true terminal treatment event clears the flag. */
+        /* CC_EV_WAV_HANGUP_A must NOT clear a_treatment_running here:
+         * it posts CC_EV_HANGUP_A_ONLY which is the real terminal event.
+         * Clearing here would allow maybe_finalize to destroy the session
+         * while HANGUP_A_ONLY is still queued, causing a destroyed-mutex
+         * crash at line 1447 when HANGUP_A_ONLY reaches process_event.
+         * Only the true terminal treatment events clear the flag. */
         if (ev->type == CC_EV_HANGUP_A_ONLY) {
             pthread_mutex_lock(lock);
             s->a_treatment_running = 0;

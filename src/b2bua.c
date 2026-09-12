@@ -14,14 +14,24 @@
 #include "handlers.h"
 #include "utils.h"
 #include "config.h"
+#include "validation.h"
 #include "validation_async.h"
 #include "api_mapping.h"
 #include "runtime_config.h"
+#include "rtpengine.h"
 #include "worker.h"
 
 #include <pjsua-lib/pjsua.h>
+#include <pjsua-lib/pjsua_internal.h>
 #include <pjsip/sip_msg.h>
+#include <pjsip/sip_event.h>
+#include <pjsip/sip_endpoint.h>
+#include <pjsip-ua/sip_inv.h>
+#include <pjmedia/sdp_neg.h>
+#include <pjmedia/sdp.h>
+#include <pj/timer.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
@@ -30,21 +40,545 @@
 #define THIS_FILE "b2bua.c"
 #define CC_SDP_SESSION_NAME "ccmedia"
 
-static const char *validation_end_reason(int status)
+/*
+ * Kamailio issues public GRUUs shaped like
+ *   sip:<user>@[10.20.10.120:5061];gr=urn:uuid:...
+ * with host:port wrapped in square brackets, which RFC 3261 reserves for IPv6
+ * literals. PJSIP parses that as host "10.20.10.120:5061" with no port and
+ * copies it into the dialog's remote target, so our ACK carries a request-URI
+ * Kamailio will not route. B then retransmits its 200 OK until it gives up and
+ * sends BYE — an ~8 s call that never completes. Unwrap the brackets before
+ * the dialog layer reads the response; the ;gr= parameter is left intact so
+ * Kamailio can still resolve the contact it issued.
+ */
+static pj_bool_t cc_unwrap_bracketed_ipv4_uri(pj_pool_t *pool,
+                                              pjsip_sip_uri *uri)
 {
-    switch (status) {
-    case CC_VALIDATION_CALLER_BLACKLISTED:
-        return "CALLER_BLACKLISTED";
-    case CC_VALIDATION_SPONSOR_BALANCE_FAIL:
-        return "SPONSOR_BALANCE_FAIL";
-    case CC_VALIDATION_SPONSOR_DND_ACTIVE:
-        return "SPONSOR_DND_ACTIVE";
-    case CC_VALIDATION_SPONSOR_ROAMING:
-        return "SPONSOR_ROAMING";
-    case CC_VALIDATION_API_FAILURE:
-        return "API_FAILURE";
-    default:
-        return "SYSTEM_ERROR";
+    const char *host;
+    pj_ssize_t host_len = -1;
+    pj_ssize_t i;
+    int dots = 0;
+    int port = 0;
+    char *fixed;
+
+    if (!pool || !uri || uri->port != 0 || uri->host.slen < 9)
+        return PJ_FALSE;
+
+    host = uri->host.ptr;
+
+    for (i = 0; i < uri->host.slen; i++) {
+        if (host[i] == ':') {
+            if (host_len >= 0)
+                return PJ_FALSE;    /* more than one colon: real IPv6 */
+            host_len = i;
+        } else if (host[i] == '.') {
+            if (host_len < 0)
+                dots++;
+        }
+    }
+    if (host_len <= 0 || dots != 3 || host_len >= 64)
+        return PJ_FALSE;
+
+    for (i = host_len + 1; i < uri->host.slen; i++) {
+        if (host[i] < '0' || host[i] > '9')
+            return PJ_FALSE;
+        port = port * 10 + (host[i] - '0');
+        if (port > 65535)
+            return PJ_FALSE;
+    }
+    if (port <= 0)
+        return PJ_FALSE;
+
+    fixed = (char *)pj_pool_alloc(pool, (pj_size_t)host_len + 1);
+    if (!fixed)
+        return PJ_FALSE;
+    pj_memcpy(fixed, host, (pj_size_t)host_len);
+    fixed[host_len] = '\0';
+
+    uri->host.ptr = fixed;
+    uri->host.slen = host_len;
+    uri->port = port;
+    return PJ_TRUE;
+}
+
+static pj_bool_t cc_on_rx_response_fix_contact(pjsip_rx_data *rdata)
+{
+    pjsip_msg *msg = rdata->msg_info.msg;
+    pjsip_contact_hdr *h;
+
+    if (!msg || msg->type != PJSIP_RESPONSE_MSG)
+        return PJ_FALSE;
+
+    h = (pjsip_contact_hdr *)pjsip_msg_find_hdr(msg, PJSIP_H_CONTACT, NULL);
+    while (h) {
+        if (h->uri &&
+            (PJSIP_URI_SCHEME_IS_SIP(h->uri) || PJSIP_URI_SCHEME_IS_SIPS(h->uri)))
+        {
+            pjsip_sip_uri *u = (pjsip_sip_uri *)pjsip_uri_get_uri(h->uri);
+            if (cc_unwrap_bracketed_ipv4_uri(rdata->tp_info.pool, u)) {
+                PJ_LOG(3, (THIS_FILE,
+                           "[CONTACT-FIX] %d Contact had bracketed IPv4 — "
+                           "target now %.*s:%d",
+                           msg->line.status.code,
+                           (int)u->host.slen, u->host.ptr, u->port));
+            }
+        }
+        h = (pjsip_contact_hdr *)pjsip_msg_find_hdr(msg, PJSIP_H_CONTACT,
+                                                    h->next);
+    }
+    return PJ_FALSE;    /* never consume the message */
+}
+
+static pjsip_module cc_contact_fix_mod = {
+    NULL, NULL,                             /* prev, next          */
+    { "mod-cc-contact-fix", 18 },           /* name                */
+    -1,                                     /* id                  */
+    PJSIP_MOD_PRIORITY_TRANSPORT_LAYER + 1, /* before dialog layer */
+    NULL,                                   /* load                */
+    NULL,                                   /* start               */
+    NULL,                                   /* stop                */
+    NULL,                                   /* unload              */
+    NULL,                                   /* on_rx_request       */
+    &cc_on_rx_response_fix_contact,         /* on_rx_response      */
+    NULL,                                   /* on_tx_request       */
+    NULL,                                   /* on_tx_response      */
+    NULL                                    /* on_tsx_state        */
+};
+
+pj_status_t cc_sip_contact_fix_install(void)
+{
+    return pjsip_endpt_register_module(pjsua_get_pjsip_endpt(),
+                                       &cc_contact_fix_mod);
+}
+
+static void cc_rewrite_sdp_audio_endpoint(pj_pool_t *pool,
+                                          pjmedia_sdp_session *sdp,
+                                          const cc_rtp_ep_t *ep,
+                                          const char *tag);
+
+/* Patch negotiator local SDP to A-facing RTPengine ports before 200 OK. */
+static pj_status_t cc_patch_a_answer_sdp_for_rtpengine(pjsua_call_id call_id,
+                                                       cc_session_t *session)
+{
+    cc_rtp_ep_t tgt;
+    pj_status_t status = PJ_ENOTFOUND;
+    const pjmedia_sdp_session *local = NULL;
+    pjmedia_sdp_session *cloned = NULL;
+    pj_pool_t *pool = NULL;
+    pjsip_inv_session *inv = NULL;
+    pjmedia_sdp_neg *neg = NULL;
+
+    if (!cc_rtpengine_enabled() || !session)
+        return PJ_ENOTSUP;
+
+    if (!cc_rtpengine_sdp_target(session, 1, &tgt) || !tgt.valid) {
+        PJ_LOG(1, (THIS_FILE,
+                   "[RTPENGINE] A-answer SDP patch skipped — no A-facing endpoint"));
+        return PJ_ENOTFOUND;
+    }
+
+    if (call_id < 0 || !pjsua_var.mutex || !pjsua_var.calls)
+        return PJ_EINVALIDOP;
+
+    pj_mutex_lock(pjsua_var.mutex);
+    {
+        struct pjsua_call *call = &pjsua_var.calls[call_id];
+        inv = call->inv;
+        if (inv && inv->neg) {
+            neg = inv->neg;
+            status = pjmedia_sdp_neg_get_neg_local(neg, &local);
+            if (status != PJ_SUCCESS || !local)
+                status = pjmedia_sdp_neg_get_active_local(neg, &local);
+            pool = inv->pool_prov ? inv->pool_prov : inv->pool;
+        }
+    }
+    pj_mutex_unlock(pjsua_var.mutex);
+
+    if (status != PJ_SUCCESS || !local || !pool || !neg) {
+        PJ_LOG(1, (THIS_FILE,
+                   "[RTPENGINE] A-answer SDP patch failed — no local SDP "
+                   "(status=%d)", status));
+        return status != PJ_SUCCESS ? status : PJ_ENOTFOUND;
+    }
+
+    cloned = pjmedia_sdp_session_clone(pool, local);
+    if (!cloned) {
+        PJ_LOG(1, (THIS_FILE, "[RTPENGINE] A-answer SDP clone failed"));
+        return PJ_ENOMEM;
+    }
+
+    cc_rewrite_sdp_audio_endpoint(pool, cloned, &tgt, "A-ANSWER");
+
+    /* Prefer replacing the negotiator answer so answer2 serializes this SDP. */
+    status = pjmedia_sdp_neg_set_local_answer(pool, neg, cloned);
+    if (status != PJ_SUCCESS) {
+        /* Fallback: mutate the object already held by the negotiator. */
+        cc_rewrite_sdp_audio_endpoint(pool, (pjmedia_sdp_session *)local,
+                                      &tgt, "A-ANSWER-MUTATE");
+        PJ_LOG(2, (THIS_FILE,
+                   "[RTPENGINE] set_local_answer status=%d — mutated in place to %s:%d",
+                   status, tgt.ip, tgt.port));
+        CC_SESSION_LOCK(session);
+        session->rtpengine_a_advertised = 1;
+        CC_SESSION_UNLOCK(session);
+        return PJ_SUCCESS;
+    }
+
+    PJ_LOG(3, (THIS_FILE,
+               "[RTPENGINE] A-answer SDP patched to %s:%d before 200 OK",
+               tgt.ip, tgt.port));
+    CC_SESSION_LOCK(session);
+    session->rtpengine_a_advertised = 1;
+    CC_SESSION_UNLOCK(session);
+    return PJ_SUCCESS;
+}
+
+/* Queue A 200 on the answer pool (after offer + optional SDP patch). */
+static int cc_queue_a_answer(cc_session_t *session, pjsua_call_id call_a)
+{
+    cc_event_t ev_ans;
+    long long t_queued;
+
+    if (!session || call_a == PJSUA_INVALID_ID)
+        return -1;
+
+    memset(&ev_ans, 0, sizeof(ev_ans));
+    ev_ans.type = CC_EV_RTPENGINE_A_ANSWER;
+    ev_ans.session = session;
+    ev_ans.session_serial = session->session_serial;
+    ev_ans.call_a = call_a;
+    snprintf(ev_ans.reason, sizeof(ev_ans.reason), "rtpengine-a-answer");
+
+    CC_SESSION_LOCK(session);
+    if (session->torn_down || session->call_a != call_a) {
+        CC_SESSION_UNLOCK(session);
+        return -1;
+    }
+    session->rtpengine_a_answer_pending = 1;
+    CC_SESSION_UNLOCK(session);
+
+    if (cc_worker_post(&ev_ans) != 0) {
+        CC_SESSION_LOCK(session);
+        session->rtpengine_a_answer_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        return -1;
+    }
+
+    t_queued = cc_monotonic_ms();
+    CC_SESSION_LOCK(session);
+    session->a_answer_queued_ms = t_queued;
+    CC_SESSION_UNLOCK(session);
+
+    PJ_LOG(3, (THIS_FILE,
+               "[A-TIMING] call_a=%d callId=%s phase=ANSWER_QUEUED "
+               "since_cb_ms=%lld mode=rtpengine-offer-then-answer",
+               call_a, session->call_id,
+               session->a_invite_cb_ms > 0 ?
+                   t_queued - session->a_invite_cb_ms : -1));
+    return 0;
+}
+
+static int cc_admission_should_reject(unsigned *active_out,
+                                      unsigned *timer_out,
+                                      const char **why_out)
+{
+    unsigned active;
+    unsigned timers = 0;
+    int max_calls = cc_cfg_admission_max_calls();
+    int max_timers = cc_cfg_admission_timer_heap_max();
+    pjsip_endpoint *endpt;
+    pj_timer_heap_t *heap;
+
+    active = pjsua_call_get_count();
+    if (active_out)
+        *active_out = active;
+    if (timer_out)
+        *timer_out = 0;
+    if (why_out)
+        *why_out = NULL;
+
+    endpt = pjsua_get_pjsip_endpt();
+    if (endpt) {
+        heap = pjsip_endpt_get_timer_heap(endpt);
+        if (heap) {
+            timers = (unsigned)pj_timer_heap_count(heap);
+            if (timer_out)
+                *timer_out = timers;
+        }
+    }
+
+    if (max_calls > 0 && (int)active >= max_calls) {
+        if (why_out)
+            *why_out = "active_calls";
+        return 1;
+    }
+    if (max_timers > 0 && (int)timers >= max_timers) {
+        if (why_out)
+            *why_out = "timer_heap";
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * Worker path (legacy): offer then queue 200 (RE ports in initial answer).
+ */
+void cc_complete_a_rtpengine_answer(cc_session_t *session,
+                                    pjsua_call_id call_a,
+                                    const char *sdp)
+{
+    if (!sdp || !sdp[0] || !session)
+        return;
+    CC_SESSION_LOCK(session);
+    if (!session->torn_down && session->call_a == call_a &&
+        !session->rtpengine_deleted)
+        session->rtpengine_a_offer_pending = 1;
+    else {
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+    CC_SESSION_UNLOCK(session);
+    cc_complete_a_rtpengine_offer(session, call_a, sdp);
+}
+
+/*
+ * Async ng offer, patch A SDP to RTPengine, then queue 200 on answer pool.
+ * Media no longer waits on CONFIRMED → re-INVITE under SIP starvation.
+ */
+void cc_complete_a_rtpengine_offer(cc_session_t *session,
+                                   pjsua_call_id call_a,
+                                   const char *sdp)
+{
+    pj_status_t status;
+    int pending = 0;
+    long long t0;
+    long long t1;
+    long long since_cb = -1;
+    long long since_200 = -1;
+    pj_status_t patch_st;
+
+    if (!session || call_a == PJSUA_INVALID_ID || !sdp || !sdp[0])
+        return;
+
+    t0 = cc_monotonic_ms();
+    CC_SESSION_LOCK(session);
+    pending = session->rtpengine_a_offer_pending;
+    session->a_offer_start_ms = t0;
+    if (session->a_invite_cb_ms > 0)
+        since_cb = t0 - session->a_invite_cb_ms;
+    if (session->a_200_sent_ms > 0)
+        since_200 = t0 - session->a_200_sent_ms;
+    if (!pending || session->torn_down || session->rtpengine_deleted ||
+        session->call_a != call_a)
+    {
+        session->rtpengine_a_offer_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+    CC_SESSION_UNLOCK(session);
+
+    PJ_LOG(3, (THIS_FILE,
+               "[A-TIMING] call_a=%d callId=%s phase=OFFER_START "
+               "since_cb_ms=%lld since_200_ms=%lld",
+               call_a, session->call_id, since_cb, since_200));
+
+    if (!cc_session_call_is_current(session, call_a, 1)) {
+        CC_SESSION_LOCK(session);
+        session->rtpengine_a_offer_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+
+    /* Do not keep pjsua_call_info on this stack frame during offer/answer
+     * (large struct + heap SDP nesting previously blew the 128KB worker stack). */
+    status = cc_rtpengine_offer(session, sdp);
+    t1 = cc_monotonic_ms();
+    PJ_LOG(3, (THIS_FILE,
+               "[A-TIMING] call_a=%d callId=%s phase=OFFER_DONE "
+               "offer_dur_ms=%lld status=%d",
+               call_a, session->call_id, t1 - t0, status));
+
+    CC_SESSION_LOCK(session);
+    session->rtpengine_a_offer_pending = 0;
+    session->a_offer_done_ms = t1;
+    if (status != PJ_SUCCESS) {
+        session->torn_down = 1;
+        CC_SESSION_UNLOCK(session);
+        PJ_LOG(1, (THIS_FILE,
+                   "[RTPENGINE] A-leg async offer failed status=%d — drop A",
+                   status));
+        cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
+        {
+            pjsua_call_info ci;
+            if (pjsua_call_get_info(call_a, &ci) == PJ_SUCCESS &&
+                ci.state != PJSIP_INV_STATE_DISCONNECTED &&
+                ci.state != PJSIP_INV_STATE_NULL)
+            {
+                if (ci.state < PJSIP_INV_STATE_CONNECTING)
+                    pjsua_call_answer(call_a, PJSIP_SC_SERVICE_UNAVAILABLE,
+                                      NULL, NULL);
+                else
+                    cc_safe_hangup(call_a, PJSIP_SC_SERVICE_UNAVAILABLE);
+            }
+        }
+        cc_session_invalidate_a(session, call_a);
+        return;
+    }
+    CC_SESSION_UNLOCK(session);
+
+    patch_st = cc_patch_a_answer_sdp_for_rtpengine(call_a, session);
+    if (patch_st != PJ_SUCCESS) {
+        PJ_LOG(2, (THIS_FILE,
+                   "[RTPENGINE] pre-200 SDP patch status=%d — 200 may need "
+                   "re-INVITE advertise", patch_st));
+    }
+
+    if (cc_queue_a_answer(session, call_a) != 0) {
+        PJ_LOG(1, (THIS_FILE,
+                   "[RTPENGINE] answer queue full after offer — drop A call %d",
+                   call_a));
+        CC_SESSION_LOCK(session);
+        session->torn_down = 1;
+        CC_SESSION_UNLOCK(session);
+        cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
+        pjsua_call_answer(call_a, PJSIP_SC_SERVICE_UNAVAILABLE, NULL, NULL);
+        cc_session_invalidate_a(session, call_a);
+        return;
+    }
+
+    {
+        int advertised = 0;
+        CC_SESSION_LOCK(session);
+        advertised = session->rtpengine_a_advertised;
+        CC_SESSION_UNLOCK(session);
+        PJ_LOG(3, (THIS_FILE,
+                   "[A-TIMING] call_a=%d callId=%s phase=OFFER_QUEUED_ANSWER "
+                   "offer_dur_ms=%lld patch_status=%d advertised=%d",
+                   call_a, session->call_id, t1 - t0, patch_st, advertised));
+    }
+}
+
+/*
+ * Worker path (update / reinvite / local_bridge / rtpengine answer-first):
+ * pjsua_call_answer2 only. Same answer-pool lane for all modes.
+ * Reuses rtpengine_a_answer_pending as the deferred-answer guard.
+ */
+void cc_complete_a_local_answer(cc_session_t *session, pjsua_call_id call_a)
+{
+    pjsua_call_setting cs;
+    pjsua_call_info ci;
+    pj_status_t status;
+    int pending = 0;
+    long long t_worker;
+    long long t_done;
+    long long queue_wait_ms = -1;
+    long long since_cb = -1;
+    long long since_100 = -1;
+
+    if (!session || call_a == PJSUA_INVALID_ID)
+        return;
+
+    t_worker = cc_monotonic_ms();
+
+    CC_SESSION_LOCK(session);
+    pending = session->rtpengine_a_answer_pending;
+    session->a_200_worker_ms = t_worker;
+    if (session->a_answer_queued_ms > 0)
+        queue_wait_ms = t_worker - session->a_answer_queued_ms;
+    if (session->a_invite_cb_ms > 0)
+        since_cb = t_worker - session->a_invite_cb_ms;
+    if (session->a_100_sent_ms > 0)
+        since_100 = t_worker - session->a_100_sent_ms;
+    if (!pending || session->torn_down || session->call_a != call_a) {
+        session->rtpengine_a_answer_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+    CC_SESSION_UNLOCK(session);
+
+    PJ_LOG(3, (THIS_FILE,
+               "[A-TIMING] call_a=%d callId=%s phase=200_WORKER "
+               "queue_wait_ms=%lld since_cb_ms=%lld since_100_ms=%lld",
+               call_a, session->call_id, queue_wait_ms, since_cb, since_100));
+
+    if (!cc_session_call_is_current(session, call_a, 1)) {
+        CC_SESSION_LOCK(session);
+        session->rtpengine_a_answer_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+
+    if (pjsua_call_get_info(call_a, &ci) != PJ_SUCCESS) {
+        CC_SESSION_LOCK(session);
+        session->rtpengine_a_answer_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        return;
+    }
+    if (ci.state == PJSIP_INV_STATE_NULL ||
+        ci.state == PJSIP_INV_STATE_DISCONNECTED ||
+        ci.state == PJSIP_INV_STATE_CONFIRMED)
+    {
+        CC_SESSION_LOCK(session);
+        session->rtpengine_a_answer_pending = 0;
+        CC_SESSION_UNLOCK(session);
+        PJ_LOG(3, (THIS_FILE,
+                   "[A] local answer skipped — call %d state=%d",
+                   call_a, (int)ci.state));
+        return;
+    }
+
+    pjsua_call_setting_default(&cs);
+    cs.aud_cnt = 1;
+    cs.vid_cnt = 0;
+    cs.txt_cnt = 0;
+
+    /* Rtpengine: ensure RE ports are in negotiator SDP before answer2. */
+    if (cc_rtpengine_enabled()) {
+        pj_status_t pst = cc_patch_a_answer_sdp_for_rtpengine(call_a, session);
+        if (pst != PJ_SUCCESS) {
+            PJ_LOG(2, (THIS_FILE,
+                       "[RTPENGINE] answer-time SDP patch status=%d call=%d",
+                       pst, call_a));
+        }
+    }
+
+    {
+        long long lock_wait_ms = 0;
+        long long t_ans = cc_monotonic_ms();
+        int advertised = 0;
+        status = cc_call_answer2_serialized(call_a, &cs, PJSIP_SC_OK,
+                                            NULL, NULL, &lock_wait_ms);
+        t_done = cc_monotonic_ms();
+
+        CC_SESSION_LOCK(session);
+        session->rtpengine_a_answer_pending = 0;
+        session->a_200_sent_ms = t_done;
+        advertised = session->rtpengine_a_advertised;
+        since_cb = session->a_invite_cb_ms > 0 ? t_done - session->a_invite_cb_ms : -1;
+        since_100 = session->a_100_sent_ms > 0 ? t_done - session->a_100_sent_ms : -1;
+        CC_SESSION_UNLOCK(session);
+
+        if (status != PJ_SUCCESS) {
+            PJ_LOG(1, (THIS_FILE, "[ERROR] A-leg async 200 OK failed: %d", status));
+            cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
+            CC_SESSION_LOCK(session);
+            session->torn_down = 1;
+            CC_SESSION_UNLOCK(session);
+            cc_session_invalidate_a(session, call_a);
+            return;
+        }
+
+        PJ_LOG(3, (THIS_FILE,
+                   "[A-TIMING] call_a=%d callId=%s phase=200_OK "
+                   "answer2_dur_ms=%lld answer2_lock_wait_ms=%lld "
+                   "since_cb_ms=%lld since_100_ms=%lld "
+                   "queue_wait_ms=%lld mode=%s rtpengine_sdp=%d",
+                   call_a, session->call_id,
+                   (t_done - t_ans) - lock_wait_ms, lock_wait_ms,
+                   since_cb, since_100, queue_wait_ms,
+                   cc_rtpengine_enabled() ? "rtpengine-offer-then-answer" : "local",
+                   advertised));
+        (void)t_worker;
     }
 }
 
@@ -131,11 +665,50 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
     cc_session_t    *session;
     pjsua_call_setting cs;
     pj_status_t      status;
+    long long        t_cb = cc_monotonic_ms();
+    long long        t_100 = 0;
+    long long        t_queued = 0;
 
-    /* Send 100 Trying immediately — before any processing — so kamailio's
-     * t_fr_timer does not expire while we do session setup (pool alloc,
-     * header parsing, MSISDN normalisation, etc.) under peak load. */
-    pjsua_call_answer(call_id, PJSIP_SC_TRYING, NULL, NULL);
+    /* Soft admission: shed new INVITEs. PJSUA already sent auto-100 before
+     * this callback (see below); a 503 after that is still fine. */
+    {
+        unsigned active = 0;
+        unsigned timers = 0;
+        const char *why = NULL;
+        if (cc_admission_should_reject(&active, &timers, &why)) {
+            PJ_LOG(2, (THIS_FILE,
+                       "[ADMISSION] reject call_a=%d reason=%s active_calls=%u "
+                       "timer_heap=%u max_calls=%d max_timers=%d",
+                       call_id, why ? why : "unknown", active, timers,
+                       cc_cfg_admission_max_calls(),
+                       cc_cfg_admission_timer_heap_max()));
+            pjsua_call_answer(call_id, PJSIP_SC_SERVICE_UNAVAILABLE, NULL, NULL);
+            return;
+        }
+    }
+
+    /*
+     * Do NOT pjsua_call_answer(100) here.
+     *
+     * With default PJSUA_DISABLE_AUTO_SEND_100=0, pjsua_call.c already sent
+     * 100 Trying before invoking on_incoming_call. A second answer(100)
+     * produces two identical Trying responses on the wire (seen 2026-09-11
+     * in sip_traffic.pcap). Kamailio's t_fr is already armed by that first
+     * auto-100, which is earlier than anything we can send from this
+     * callback.
+     *
+     * Only restore an explicit answer(100) if pjproject is rebuilt with
+     * -DPJSUA_DISABLE_AUTO_SEND_100=1.
+     */
+    {
+        unsigned active = pjsua_call_get_count();
+        t_100 = cc_monotonic_ms();
+        PJ_LOG(3, (THIS_FILE,
+                   "[A-TIMING] call_a=%d phase=100_TRYING "
+                   "cb_entry_ms=%lld since_cb_ms=%lld active_calls=%u "
+                   "(PJSUA auto-100; no app answer)",
+                   call_id, t_cb, t_100 - t_cb, active));
+    }
 
     status = pjsua_call_get_info(call_id, &ci);
     if (status != PJ_SUCCESS) {
@@ -166,16 +739,16 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
         }
     }
 
-    /* Log active call count and compile-time limit for diagnostics */
+    /* Log active call count at debug — hot path under SIPp. */
     {
         unsigned active = pjsua_call_get_count();
-        PJ_LOG(3, (THIS_FILE,
+        PJ_LOG(4, (THIS_FILE,
                    "[CALL-SLOTS] incoming call_id=%d active_calls=%u "
                    "pjsua_max_calls=%d",
                    call_id, active, PJSUA_MAX_CALLS));
     }
 
-    PJ_LOG(3, (THIS_FILE, "Incoming call: from=%.*s to=%.*s",
+    PJ_LOG(4, (THIS_FILE, "Incoming call: from=%.*s to=%.*s",
                (int)ci.remote_info.slen, ci.remote_info.ptr,
                (int)ci.local_info.slen,  ci.local_info.ptr));
 
@@ -185,17 +758,17 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
                                          sizeof(raw_ruri),
                                          ruri_user,
                                          sizeof(ruri_user));
-    PJ_LOG(3, (THIS_FILE,
+    PJ_LOG(4, (THIS_FILE,
                "[INCOMING] raw_ruri=%s",
                raw_ruri[0] ? raw_ruri : "<unavailable>"));
     if (status == PJ_SUCCESS) {
         snprintf(dialed_raw, sizeof(dialed_raw), "%s", ruri_user);
         snprintf(dialed_source, sizeof(dialed_source), "%s", "Request-URI");
-        PJ_LOG(3, (THIS_FILE,
+        PJ_LOG(4, (THIS_FILE,
                    "[INCOMING] ruri_user=%s",
                    ruri_user));
     } else {
-        PJ_LOG(3, (THIS_FILE,
+        PJ_LOG(4, (THIS_FILE,
                    "[INCOMING] Request-URI user unavailable; trying To header"));
     }
 
@@ -229,7 +802,7 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
         return;
     }
 
-    PJ_LOG(3, (THIS_FILE,
+    PJ_LOG(4, (THIS_FILE,
                "[DIALED] raw=%s source=%s",
                dialed_raw,
                dialed_source));
@@ -282,7 +855,8 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
                 CC_SESSION_UNLOCK(session);
                 pjsua_call_setting_default(&cs);
                 cs.aud_cnt = 1; cs.vid_cnt = 0; cs.txt_cnt = 0;
-                if (pjsua_call_answer2(call_id, &cs, PJSIP_SC_OK, NULL, NULL)
+                if (cc_call_answer2_serialized(call_id, &cs, PJSIP_SC_OK,
+                                               NULL, NULL, NULL)
                         != PJ_SUCCESS) {
                     pjsua_call_answer(call_id, PJSIP_SC_NOT_FOUND, NULL, NULL);
                     cc_session_invalidate_a(session, call_id);
@@ -339,7 +913,7 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
         }
     }
 
-    PJ_LOG(3, (THIS_FILE,
+    PJ_LOG(4, (THIS_FILE,
                "[PREFIX] mode=%s prefixes=%s matched=%s already_stripped=%s",
                cc_cfg_prefix_mode_name(),
                cc_cfg_collect_prefixes(),
@@ -359,7 +933,7 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
         return;
     }
 
-    PJ_LOG(3, (THIS_FILE,
+    PJ_LOG(4, (THIS_FILE,
                "[B-PARTY] raw=%s normalized=%s",
                collect_number.sponsor_raw,
                sponsor_normalized));
@@ -394,7 +968,8 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
         cs.aud_cnt = 1;
         cs.vid_cnt = 0;
         cs.txt_cnt = 0;
-        if (pjsua_call_answer2(call_id, &cs, PJSIP_SC_OK, NULL, NULL)
+        if (cc_call_answer2_serialized(call_id, &cs, PJSIP_SC_OK,
+                                       NULL, NULL, NULL)
                 != PJ_SUCCESS) {
             pjsua_call_answer(call_id, PJSIP_SC_NOT_FOUND, NULL, NULL);
             cc_session_mark_end(session, "FAILED", "INVALID_B_NUMBER");
@@ -406,13 +981,24 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
             return;
         }
 
-        cc_session_mark_end(session, "FAILED", "INVALID_B_NUMBER");
         CC_SESSION_LOCK(session);
         session->torn_down = 1;
+        snprintf(session->final_status, sizeof(session->final_status),
+                 "FAILED");
+        snprintf(session->final_reason, sizeof(session->final_reason),
+                 "INVALID_B_NUMBER");
         CC_SESSION_UNLOCK(session);
         leg_a_play_prompt_then_hangup(session,
                                       CC_PROMPT_INCOMPLETE_NUMBER,
                                       PJSIP_SC_NOT_FOUND);
+        {
+            int treatment_armed = 0;
+            CC_SESSION_LOCK(session);
+            treatment_armed = session->a_treatment_running;
+            CC_SESSION_UNLOCK(session);
+            if (!treatment_armed)
+                cc_session_mark_end(session, "FAILED", "INVALID_B_NUMBER");
+        }
         cc_session_maybe_finalize(session);
         return;
     }
@@ -455,6 +1041,8 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
              "%s",
              sponsor_normalized);
     session->call_start_ts = time(NULL);
+    session->a_invite_cb_ms = t_cb;
+    session->a_100_sent_ms = t_100;
     if (ci.call_id.slen > 0) {
         pj_size_t len = (pj_size_t)ci.call_id.slen;
         if (len >= sizeof(session->call_id))
@@ -471,6 +1059,47 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
     /* Capture operator headers and API identity fields from A's INVITE. */
     if (rdata && rdata->msg_info.msg)
         cc_capture_fwd_headers(rdata->msg_info.msg, session);
+
+    /* Extract SSP from the LAST Record-Route of A-leg INVITE.
+     * Record-Route order as seen by B2BUA (outermost = closest to B2BUA):
+     *   RR[0]: Kamailio  <sip:10.185.49.39;lr>          (topmost)
+     *   RR[1]: MTN SBC   <sip:102.89.52.113:5060;lr>    (last = phone-side SBC)
+     * The last RR is the SBC that anchored the call from the subscriber side.
+     * Use typed PJSIP_H_RECORD_ROUTE search — more reliable than name string
+     * walk which can miss headers depending on parse order. */
+    if (rdata && rdata->msg_info.msg) {
+        pjsip_route_hdr *rr = (pjsip_route_hdr *)
+            pjsip_msg_find_hdr(rdata->msg_info.msg,
+                               PJSIP_H_RECORD_ROUTE, NULL);
+        pjsip_route_hdr *rr_last = NULL;
+        int rr_count = 0;
+        while (rr) {
+            rr_last = rr;
+            rr_count++;
+            rr = (pjsip_route_hdr *)
+                pjsip_msg_find_hdr(rdata->msg_info.msg,
+                                   PJSIP_H_RECORD_ROUTE, rr->next);
+        }
+        PJ_LOG(4, (THIS_FILE, "[SSP] Record-Route count=%d", rr_count));
+        if (rr_last) {
+            pjsip_sip_uri *rr_uri =
+                (pjsip_sip_uri *)pjsip_uri_get_uri(rr_last->name_addr.uri);
+            if (rr_uri && rr_uri->host.slen > 0) {
+                pj_size_t hlen = (pj_size_t)rr_uri->host.slen;
+                if (hlen >= sizeof(session->a_rr_host))
+                    hlen = sizeof(session->a_rr_host) - 1;
+                memcpy(session->a_rr_host, rr_uri->host.ptr, hlen);
+                session->a_rr_host[hlen] = '\0';
+                session->a_rr_port = rr_uri->port > 0 ? rr_uri->port : 5060;
+                PJ_LOG(4, (THIS_FILE,
+                           "[SSP] extracted from Record-Route[%d/%d]: %s:%d",
+                           rr_count, rr_count,
+                           session->a_rr_host, session->a_rr_port));
+            }
+        } else {
+            PJ_LOG(4, (THIS_FILE, "[SSP] no Record-Route in A-leg INVITE"));
+        }
+    }
 
     {
         const char *pai_value;
@@ -546,53 +1175,143 @@ void cc_on_incoming_call(pjsua_acc_id acc_id,
         PJ_LOG(1, (THIS_FILE,
                    "[INITIATE-API] callerMsisdn could not be extracted from P-Asserted-Identity or From"));
     } else {
-        PJ_LOG(3, (THIS_FILE,
+        PJ_LOG(4, (THIS_FILE,
                    "[CALLER] raw=%s normalized=%s source=%s",
                    session->caller_msisdn_raw,
                    session->caller_msisdn,
                    session->caller_msisdn_source[0] ?
                        session->caller_msisdn_source : "UNKNOWN"));
-        PJ_LOG(3, (THIS_FILE,
+        PJ_LOG(4, (THIS_FILE,
                    "[INITIATE-API] callerMsisdn=%s",
                    session->caller_msisdn));
     }
 
-    PJ_LOG(3, (THIS_FILE,
+    PJ_LOG(4, (THIS_FILE,
                "[END-API] ICID=%s",
                session->icid));
 
     /* Attach session as call user_data so callbacks can find it */
     pjsua_call_set_user_data(call_id, session);
 
-    PJ_LOG(3, (THIS_FILE, "Collect call: A=%.*s B=%s",
-               (int)ci.remote_info.slen,
-               ci.remote_info.ptr,
-               sponsor_normalized));
-
     /*
-     * Expected customer flow:
-     * First complete A-leg: INVITE -> 200 OK -> ACK.
-     * B-leg must start only after A-leg reaches CONFIRMED state.
+     * RTPengine offer-then-answer: ng offer on general pool, patch A SDP to
+     * RTPengine ports, then 200 on answer pool. Phone gets correct media in
+     * the initial 200 — does not wait for late CONFIRMED/re-INVITE.
      */
-    pjsua_call_setting_default(&cs);
-    cs.aud_cnt = 1;
-    cs.vid_cnt = 0;
-    cs.txt_cnt = 0;
+    if (cc_rtpengine_enabled()) {
+        char *sdp = (char *)malloc(CC_RTPENGINE_SDP_MAX);
+        cc_event_t ev_off;
 
-    status = pjsua_call_answer2(call_id, &cs,
-                                 PJSIP_SC_OK, NULL, NULL);
-    if (status != PJ_SUCCESS) {
-        PJ_LOG(1, (THIS_FILE, "[ERROR] A-leg 200 OK failed: %d", status));
-        cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
+        if (!sdp ||
+            cc_rtpengine_copy_rdata_sdp(rdata, sdp, CC_RTPENGINE_SDP_MAX) < 0)
+        {
+            PJ_LOG(1, (THIS_FILE,
+                       "[RTPENGINE] A-leg SDP copy failed — reject call %d",
+                       call_id));
+            free(sdp);
+            cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
+            CC_SESSION_LOCK(session);
+            session->torn_down = 1;
+            CC_SESSION_UNLOCK(session);
+            pjsua_call_answer(call_id, PJSIP_SC_SERVICE_UNAVAILABLE, NULL, NULL);
+            cc_session_invalidate_a(session, call_id);
+            cc_session_maybe_finalize(session);
+            return;
+        }
+
+        PJ_LOG(4, (THIS_FILE,
+                   "Collect call (offer-then-answer rtpengine): A=%.*s B=%s",
+                   (int)ci.remote_info.slen, ci.remote_info.ptr,
+                   sponsor_normalized));
+
+        memset(&ev_off, 0, sizeof(ev_off));
+        ev_off.type = CC_EV_RTPENGINE_A_OFFER;
+        ev_off.session = session;
+        ev_off.session_serial = session->session_serial;
+        ev_off.call_a = call_id;
+        ev_off.data = sdp;
+        snprintf(ev_off.reason, sizeof(ev_off.reason), "rtpengine-a-offer");
+
         CC_SESSION_LOCK(session);
-        session->torn_down = 1;
+        session->rtpengine_a_answer_pending = 0;
+        session->rtpengine_a_offer_pending = 1;
+        session->rtpengine_a_advertised = 0;
+        session->rtpengine_a_need_advertise = 0;
         CC_SESSION_UNLOCK(session);
-        cc_session_invalidate_a(session, call_id);
-        cc_session_maybe_finalize(session);
+
+        if (cc_worker_post(&ev_off) != 0) {
+            PJ_LOG(1, (THIS_FILE,
+                       "[RTPENGINE] offer queue full — reject A call %d",
+                       call_id));
+            free(sdp);
+            CC_SESSION_LOCK(session);
+            session->rtpengine_a_offer_pending = 0;
+            session->torn_down = 1;
+            CC_SESSION_UNLOCK(session);
+            cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
+            pjsua_call_answer(call_id, PJSIP_SC_SERVICE_UNAVAILABLE, NULL, NULL);
+            cc_session_invalidate_a(session, call_id);
+            cc_session_maybe_finalize(session);
+            return;
+        }
+
+        t_queued = cc_monotonic_ms();
+        PJ_LOG(3, (THIS_FILE,
+                   "[A-TIMING] call_a=%d callId=%s phase=OFFER_QUEUED "
+                   "since_cb_ms=%lld since_100_ms=%lld setup_ms=%lld "
+                   "mode=rtpengine-offer-then-answer",
+                   call_id, session->call_id,
+                   t_queued - t_cb, t_queued - t_100, t_queued - t_100));
         return;
     }
 
-    PJ_LOG(3, (THIS_FILE, "A-leg 200 OK sent; waiting for ACK/CONFIRMED before starting B-leg"));
+    /*
+     * UPDATE / re-INVITE / local_bridge: defer pjsua_call_answer2 (UDP bind +
+     * media create) to the answer worker pool — same CPS pattern as rtpengine.
+     */
+    {
+        cc_event_t ev;
+
+        PJ_LOG(3, (THIS_FILE, "Collect call (async local answer): A=%.*s B=%s",
+                   (int)ci.remote_info.slen, ci.remote_info.ptr,
+                   sponsor_normalized));
+
+        memset(&ev, 0, sizeof(ev));
+        ev.type = CC_EV_RTPENGINE_A_ANSWER; /* data=NULL → local answer path */
+        ev.session = session;
+        ev.session_serial = session->session_serial;
+        ev.call_a = call_id;
+        snprintf(ev.reason, sizeof(ev.reason), "a-answer-local");
+
+        CC_SESSION_LOCK(session);
+        session->rtpengine_a_answer_pending = 1;
+        CC_SESSION_UNLOCK(session);
+
+        if (cc_worker_post(&ev) != 0) {
+            PJ_LOG(1, (THIS_FILE,
+                       "[A] answer worker queue full — reject call %d", call_id));
+            CC_SESSION_LOCK(session);
+            session->rtpengine_a_answer_pending = 0;
+            session->torn_down = 1;
+            CC_SESSION_UNLOCK(session);
+            cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
+            pjsua_call_answer(call_id, PJSIP_SC_SERVICE_UNAVAILABLE, NULL, NULL);
+            cc_session_invalidate_a(session, call_id);
+            cc_session_maybe_finalize(session);
+            return;
+        }
+
+        t_queued = cc_monotonic_ms();
+        CC_SESSION_LOCK(session);
+        session->a_answer_queued_ms = t_queued;
+        CC_SESSION_UNLOCK(session);
+        PJ_LOG(3, (THIS_FILE,
+                   "[A-TIMING] call_a=%d callId=%s phase=ANSWER_QUEUED "
+                   "since_cb_ms=%lld since_100_ms=%lld mode=local",
+                   call_id, session->call_id,
+                   t_queued - t_cb, t_queued - t_100));
+        return;
+    }
 }
 
 /* ── Async validation callback context ──────────────────────────────────── */
@@ -641,12 +1360,25 @@ static void cc_on_validation_result(cc_session_t *session,
                      ? "FAILED" : "CANCELLED";
         end_reason = result->reason[0] ? result->reason
                                        : "ELIGIBILITY_TIMEOUT";
-        cc_session_mark_end(session, end_status, end_reason);
+        /*
+         * Do NOT mark_end / rtpengine delete yet — that would tear down media
+         * before the rejection prompt can play to A. Store CDR fields, play
+         * treatment, then mark_end from hangup-after-WAV (torn_down already
+         * set so DISCONNECTED will not overwrite with USER_ABANDONED).
+         */
+        CC_SESSION_LOCK(session);
+        snprintf(session->final_status, sizeof(session->final_status),
+                 "%s", end_status);
+        snprintf(session->final_reason, sizeof(session->final_reason),
+                 "%s", end_reason);
+        CC_SESSION_UNLOCK(session);
         free(arg);
 
         {
             cc_prompt_tag_t prompt_tag;
             pjsip_status_code sip_code;
+            int treatment_armed = 0;
+
             switch (vstatus) {
             case CC_VALIDATION_CALLER_BLACKLISTED:
                 prompt_tag = CC_PROMPT_NOT_AVAILABLE_TO_PAY;
@@ -656,6 +1388,7 @@ static void cc_on_validation_result(cc_session_t *session,
                 prompt_tag = CC_PROMPT_LOW_BALANCE;
                 sip_code   = PJSIP_SC_FORBIDDEN;
                 break;
+            case CC_VALIDATION_CALLER_ROAMING:
             case CC_VALIDATION_SPONSOR_DND_ACTIVE:
             case CC_VALIDATION_SPONSOR_ROAMING:
                 prompt_tag = CC_PROMPT_NOT_AVAILABLE_TO_PAY;
@@ -667,6 +1400,14 @@ static void cc_on_validation_result(cc_session_t *session,
                 break;
             }
             leg_a_play_prompt_then_hangup(session, prompt_tag, sip_code);
+
+            CC_SESSION_LOCK(session);
+            treatment_armed = session->a_treatment_running;
+            CC_SESSION_UNLOCK(session);
+            if (!treatment_armed) {
+                /* Prompt/worker post failed — emit CDR and tear down media now. */
+                cc_session_mark_end(session, end_status, end_reason);
+            }
         }
 
         cc_session_acquire_reason(session, "finalize-guard");
@@ -778,6 +1519,7 @@ static void cc_on_validation_result(cc_session_t *session,
         return;
     }
     session->b_origination_pending = 1;
+    session->b_leg_started = 1;
     CC_SESSION_UNLOCK(session);
 
     if (!cc_session_acquire_reason(session, "b-origination-worker")) {
@@ -859,12 +1601,15 @@ pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session)
 
     CC_SESSION_LOCK(session);
 
-    if (session->torn_down || session->b_leg_started) {
+    if (session->torn_down || session->b_validation_started) {
         CC_SESSION_UNLOCK(session);
         return PJSUA_INVALID_ID;
     }
 
-    session->b_leg_started = 1;
+    /* Mark validation flow started — do NOT set b_leg_started yet.
+     * b_leg_started means B originate was armed after ELIGIBLE; setting it
+     * here made ineligible take the "stop MOH" path and cut off 1.1.wav. */
+    session->b_validation_started = 1;
 
     arg = malloc(sizeof(*arg));
     if (!arg) {
@@ -1048,9 +1793,20 @@ void *cc_originate_b_thread(void *arg_ptr)
         CC_SESSION_LOCK(session);
         session->torn_down = 1;
         session->b_origination_pending = 0;
+        snprintf(session->final_status, sizeof(session->final_status),
+                 "FAILED");
+        snprintf(session->final_reason, sizeof(session->final_reason),
+                 "SYSTEM_ERROR");
         CC_SESSION_UNLOCK(session);
-        cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
         leg_a_play_unavailable_then_hangup(session);
+        {
+            int treatment_armed = 0;
+            CC_SESSION_LOCK(session);
+            treatment_armed = session->a_treatment_running;
+            CC_SESSION_UNLOCK(session);
+            if (!treatment_armed)
+                cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
+        }
         return NULL;
     }
 
@@ -1281,34 +2037,36 @@ void *cc_originate_b_thread(void *arg_ptr)
         cc_add_msg_header(hdr_pool, &msg_data, "Supported", "100rel");
     }
 
-    /* Route header(s) to SBC (loose-route) — added only if configured */
+    /* Route2: SSP from A-leg last Record-Route.
+     * Route1 (Kamailio) is added automatically by PJSUA via acc_cfg.proxy_uri.
+     * Only add Route2 when the MTN SBC is distinct from Kamailio. */
     {
-        const char *route_host = cc_cfg_sbc_host();
-        int route_port = cc_cfg_sbc_port();
+        char ssp_host[128];
+        int  ssp_port;
+        const char *kam_host = cc_cfg_sbc_host();
+        int         kam_port = cc_cfg_sbc_port();
 
-        if (route_host && route_host[0] != '\0' && hdr_pool) {
+        CC_SESSION_LOCK(session);
+        snprintf(ssp_host, sizeof(ssp_host), "%s", session->a_rr_host);
+        ssp_port = session->a_rr_port;
+        CC_SESSION_UNLOCK(session);
+
+        if (ssp_host[0] != '\0' && hdr_pool &&
+            (strcmp(ssp_host, kam_host) != 0 || ssp_port != kam_port))
+        {
             char route_buf[256];
             int rlen = snprintf(route_buf, sizeof(route_buf),
                                 "<sip:%s:%d;transport=udp;lr>",
-                                route_host, route_port);
+                                ssp_host, ssp_port);
             if (rlen > 0 && (size_t)rlen < sizeof(route_buf)) {
                 cc_add_msg_header(hdr_pool, &msg_data, "Route", route_buf);
-                PJ_LOG(3, (THIS_FILE,
-                           "[B-LEG-HDR] Route=%s", route_buf));
+                PJ_LOG(3, (THIS_FILE, "[B-LEG-HDR] Route2(SSP)=%s", route_buf));
             }
-        }
-
-        /* Optional second Route — directs Kamailio to a specific next SBC */
-        const char *route2 = cc_cfg_sbc_route2();
-        if (route2 && route2[0] != '\0' && hdr_pool) {
-            char route2_buf[256];
-            int rlen = snprintf(route2_buf, sizeof(route2_buf),
-                                "<%s>", route2);
-            if (rlen > 0 && (size_t)rlen < sizeof(route2_buf)) {
-                cc_add_msg_header(hdr_pool, &msg_data, "Route", route2_buf);
-                PJ_LOG(3, (THIS_FILE,
-                           "[B-LEG-HDR] Route2=%s", route2_buf));
-            }
+        } else if (ssp_host[0] == '\0') {
+            PJ_LOG(3, (THIS_FILE, "[B-LEG-HDR] Route2(SSP) omitted — no Record-Route in A-leg"));
+        } else {
+            PJ_LOG(3, (THIS_FILE, "[B-LEG-HDR] Route2(SSP) omitted — same as Kamailio (%s:%d)",
+                       ssp_host, ssp_port));
         }
     }
 
@@ -1323,9 +2081,20 @@ void *cc_originate_b_thread(void *arg_ptr)
         CC_SESSION_LOCK(session);
         session->torn_down = 1;
         session->b_origination_pending = 0;
+        snprintf(session->final_status, sizeof(session->final_status),
+                 "FAILED");
+        snprintf(session->final_reason, sizeof(session->final_reason),
+                 "SYSTEM_ERROR");
         CC_SESSION_UNLOCK(session);
-        cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
         leg_a_play_unavailable_then_hangup(session);
+        {
+            int treatment_armed = 0;
+            CC_SESSION_LOCK(session);
+            treatment_armed = session->a_treatment_running;
+            CC_SESSION_UNLOCK(session);
+            if (!treatment_armed)
+                cc_session_mark_end(session, "FAILED", "SYSTEM_ERROR");
+        }
         return NULL;
     }
 
@@ -1460,12 +2229,30 @@ void cc_on_call_state(pjsua_call_id call_id, pjsip_event *e)
     pjsua_call_id deferred_hangup = PJSUA_INVALID_ID;
     int leg;
 
-    (void)e;
     session = (cc_session_t *)pjsua_call_get_user_data(call_id);
     if (!session || !cc_session_acquire_reason(session, "callback-call-state"))
         return;
 
     leg = cc_resolve_leg(session, call_id);
+
+    /* ng answer/re-offer on any SDP-bearing SIP message (200/183/UPDATE/re-INVITE). */
+    if (cc_rtpengine_enabled() && e) {
+        pjsip_rx_data *rdata = NULL;
+        if (e->type == PJSIP_EVENT_TSX_STATE &&
+            e->body.tsx_state.type == PJSIP_EVENT_RX_MSG)
+            rdata = e->body.tsx_state.src.rdata;
+        else if (e->type == PJSIP_EVENT_RX_MSG)
+            rdata = e->body.rx_msg.rdata;
+        if (rdata) {
+            if (leg == 1)
+                (void)cc_rtpengine_offer_from_rdata(session, rdata);
+            else if (leg == 2) {
+                (void)cc_rtpengine_answer_from_rdata(session, rdata);
+                if (cc_rtpengine_consume_a_ep_changed(session))
+                    leg_a_on_rtpengine_a_ep_changed(session);
+            }
+        }
+    }
     if (leg == 1)
         deferred_hangup = leg_a_on_call_state(call_id, session);
     else if (leg == 2) {
@@ -1490,6 +2277,36 @@ void cc_on_call_state(pjsua_call_id call_id, pjsip_event *e)
             }
         }
         leg_b_on_call_state(call_id, session);
+    }
+
+    /* Capture Allow: UPDATE from B-leg 200 OK (REQ-18: per-dialog capability check).
+     * pjsua_call_get_info exposes last_status; the Allow header is in the
+     * response tdata which is not directly accessible here.  We use a
+     * conservative heuristic: if the B-leg reaches CONFIRMED it has
+     * successfully processed at least one UPDATE (the bypass UPDATE sent
+     * during setup), so UPDATE is confirmed supported.  Set the flag once. */
+    if (leg == 2) {
+        pjsua_call_info ci_b;
+        if (pjsua_call_get_info(call_id, &ci_b) == PJ_SUCCESS &&
+            ci_b.state == PJSIP_INV_STATE_CONFIRMED)
+        {
+            CC_SESSION_LOCK(session);
+            session->b_update_allowed = 1;
+            CC_SESSION_UNLOCK(session);
+        }
+    }
+
+    /* Mirror of the above for A-leg (needed now that hold propagation can
+     * also target A — see ev_hold_propagate_a/ev_resume_propagate_a). */
+    if (leg == 1) {
+        pjsua_call_info ci_a;
+        if (pjsua_call_get_info(call_id, &ci_a) == PJ_SUCCESS &&
+            ci_a.state == PJSIP_INV_STATE_CONFIRMED)
+        {
+            CC_SESSION_LOCK(session);
+            session->a_update_allowed = 1;
+            CC_SESSION_UNLOCK(session);
+        }
     }
 
     cc_session_release_reason(session, "callback-call-state");
@@ -1525,14 +2342,12 @@ static void spawn_update_b_retry(cc_session_t *session, pjsua_call_id call_b)
     ev.call_b  = call_b;
     snprintf(ev.reason, sizeof(ev.reason), "update-b-retry-worker");
 
-    if (cc_worker_post(&ev) != 0) {
+    if (cc_worker_post_delayed(&ev, 3000) != 0) {
         CC_SESSION_LOCK(session);
         session->update_b_retry_pending = 0;
         CC_SESSION_UNLOCK(session);
     }
 }
-
-/* ── A-leg UPDATE 491 retry ──────────────────────────────────────────────── */
 
 
 static void spawn_update_a_retry(cc_session_t *session, pjsua_call_id call_a)
@@ -1557,7 +2372,7 @@ static void spawn_update_a_retry(cc_session_t *session, pjsua_call_id call_a)
     ev.call_a  = call_a;
     snprintf(ev.reason, sizeof(ev.reason), "update-a-retry-worker");
 
-    if (cc_worker_post(&ev) != 0) {
+    if (cc_worker_post_delayed(&ev, 3000) != 0) {
         CC_SESSION_LOCK(session);
         session->update_a_retry_pending = 0;
         CC_SESSION_UNLOCK(session);
@@ -1596,7 +2411,7 @@ static void spawn_update_ack_watchdog(cc_session_t *session,
     ev.call_b  = call_b;
     snprintf(ev.reason, sizeof(ev.reason), "update-ack-watchdog-worker");
 
-    if (cc_worker_post(&ev) != 0) {
+    if (cc_worker_post_delayed(&ev, CC_UPDATE_ACK_TIMEOUT_MS) != 0) {
         CC_SESSION_LOCK(session);
         session->update_ack_watchdog_started = 0;
         CC_SESSION_UNLOCK(session);
@@ -1622,6 +2437,14 @@ void cc_on_call_media_state(pjsua_call_id call_id)
     else if (leg == 2)
         leg_b_on_media_state(call_id, session);
 
+    /* Prompts and conversation RTP live on RTPengine — mute local TX/RX so
+     * PJSUA does not emit a second stream toward the MGW, and isolate from
+     * the master mix so silence frames are not fed into the paused stream. */
+    if (cc_rtpengine_enabled()) {
+        cc_silence_call(call_id);
+        cc_isolate_call_from_master(call_id);
+    }
+
     /*
      * UPDATE bypass post-processing: once both UPDATE 200 OKs have been
      * processed by PJSUA (triggering on_call_media_state on each leg),
@@ -1629,7 +2452,7 @@ void cc_on_call_media_state(pjsua_call_id call_id)
      * This is the industry-standard approach: the B2BUA exits the media
      * path by disconnecting its conf ports after the UPDATEs complete.
      */
-    if (cc_cfg_media_mode() == CC_MEDIA_MODE_UPDATE) {
+    if (cc_cfg_media_uses_update()) {
         pjsua_call_id call_a, call_b;
         int do_silence = 0;
         int do_hold = 0;
@@ -1663,7 +2486,24 @@ void cc_on_call_media_state(pjsua_call_id call_id)
                    !session->torn_down &&
                    session->accepted)
         {
-            /* Post-bypass: either leg media state changed — hold or resume */
+            /* Post-bypass: either leg media state changed — hold or resume.
+             * Also detect B's 200 OK to a hold/resume UPDATE (REQ-14/REQ-19):
+             * when hold_propagate_pending is set and B's media state fires,
+             * that is B confirming the hold UPDATE — set hold_update_b_acked. */
+            if (call_id == call_b && session->hold_propagate_pending &&
+                !session->hold_update_b_acked)
+            {
+                session->hold_update_b_acked = 1;
+                PJ_LOG(3, (THIS_FILE, "[HOLD/M2] B hold UPDATE 200 OK detected"));
+            }
+            /* Mirror: detect A's 200 OK to a hold/resume UPDATE propagated
+             * because B went on hold — set hold_update_a_acked. */
+            if (call_id == call_a && session->hold_propagate_a_pending &&
+                !session->hold_update_a_acked)
+            {
+                session->hold_update_a_acked = 1;
+                PJ_LOG(3, (THIS_FILE, "[HOLD/M2] A hold UPDATE 200 OK detected"));
+            }
             if (call_id == call_b) {
                 pjsua_call_info ci_b;
                 if (pjsua_call_get_info(call_b, &ci_b) == PJ_SUCCESS) {
@@ -1729,7 +2569,8 @@ void cc_on_call_media_state(pjsua_call_id call_id)
                        "[BYPASS] both UPDATE 200 OKs received — silencing B2BUA conf slots"));
             cc_silence_call(call_a);
             cc_silence_call(call_b);
-            cc_spawn_bypass_rtp_watchdog(session, call_a, call_b);
+            if (!cc_rtpengine_enabled())
+                cc_spawn_bypass_rtp_watchdog(session, call_a, call_b);
         }
 
         /* A acked but B hasn't — 491 on B-leg; retry after delay */
@@ -1776,7 +2617,22 @@ void cc_on_call_media_state(pjsua_call_id call_id)
             }
         }
 
-        /* Spawn UPDATE ack timeout watchdog once both UPDATEs are sent */
+        /* Spawn UPDATE ack timeout watchdog once both UPDATEs are sent.
+         *
+         * NOTE: this is now a SECONDARY safety net only. The primary arm
+         * point moved to worker.c's send path (cc_maybe_arm_update_ack_watchdog,
+         * called from ev_update_a_bypass/ev_update_b_bypass/
+         * ev_reinvite_a_bypass/ev_reinvite_b_bypass right after a successful
+         * send) — because this callback only fires on a SUCCESSFUL media
+         * renegotiation, so a rejected (e.g. 405) or unanswered UPDATE never
+         * reaches this code at all, leaving the watchdog unarmed in exactly
+         * the failure case it exists to catch (see rtp_test_1.pcap /
+         * collect_call log analysis: 10s of silence, no watchdog, call
+         * killed by a PJSIP-level transaction timeout instead of falling
+         * back to local bridge). Left here so the watchdog also gets armed
+         * in the reverse ordering (media_state fires before both sends are
+         * observed by the worker for some reason) — update_ack_watchdog_started
+         * makes this idempotent with the send-path arm. */
         {
             int need_watchdog = 0;
             CC_SESSION_LOCK(session);
@@ -1794,55 +2650,85 @@ void cc_on_call_media_state(pjsua_call_id call_id)
                 spawn_update_ack_watchdog(session, call_a, call_b);
         }
         if (do_hold == 1) {
-            /* B put the call on hold — play MOH to A */
-            pjsua_player_id moh_pid = PJSUA_INVALID_ID;
-            PJ_LOG(3, (THIS_FILE, "[HOLD] B on hold — playing MOH to A"));
-            if (cc_session_call_is_current(session, call_a, 1)) {
-                const char *moh_path = cc_prompt_get_path(CC_PROMPT_MOH);
-                moh_pid = cc_start_wav(call_a, moh_path, PJ_TRUE);
-            }
+            /* B put the call on hold.
+             * Mirrors do_hold==2 exactly (A<->B swapped): propagate
+             * sendonly to A via UPDATE. Post CC_EV_HOLD_PROPAGATE_A; worker
+             * sends UPDATE sendonly to A, waits for 200 OK, then plays MOH
+             * to B — matching the target convention do_hold==2 already
+             * uses (MOH to the leg that ISN'T re-signaled). No local-only
+             * shortcut anymore.
+             *
+             * NOTE ON STRAY RTP: ev_hold_propagate_a() below only resumes
+             * TX + bridges call_b (to carry MOH), leaving call_a's B2BUA
+             * side stream paused. Resuming call_a's TX here too would
+             * revive B2BUA-origin RTP toward A's real address even though
+             * A's SBC is expecting direct bypass RTP from B — that duplicate
+             * stream is exactly the "stray RTP after UPDATE" bug from the
+             * pcap. If your SBC-side testing shows the existing do_hold==2
+             * path (which mirrors this one) needs both legs resumed, apply
+             * the same change to both symmetrically — don't diverge the two
+             * directions again. */
+            int already;
             CC_SESSION_LOCK(session);
-            if (moh_pid != PJSUA_INVALID_ID &&
-                session->hold_player_a == PJSUA_INVALID_ID &&
-                !session->torn_down)
-            {
-                session->hold_player_a = moh_pid;
-            } else if (moh_pid != PJSUA_INVALID_ID) {
-                CC_SESSION_UNLOCK(session);
-                cc_stop_wav(moh_pid, PJSUA_INVALID_ID);
-                goto hold_done;
-            }
+            already = session->hold_propagate_a_pending || session->torn_down;
+            if (!already) session->hold_propagate_a_pending = 1;
             CC_SESSION_UNLOCK(session);
-            hold_done:;
+            if (!already) {
+                cc_event_t hev;
+                memset(&hev, 0, sizeof(hev));
+                hev.type    = CC_EV_HOLD_PROPAGATE_A;
+                hev.session = session;
+                hev.call_a  = call_a;
+                hev.call_b  = call_b;
+                snprintf(hev.reason, sizeof(hev.reason), "hold-propagate-a");
+                if (cc_worker_post(&hev) != 0) {
+                    CC_SESSION_LOCK(session);
+                    session->hold_propagate_a_pending = 0;
+                    CC_SESSION_UNLOCK(session);
+                    PJ_LOG(1, (THIS_FILE, "[HOLD/M2] hold propagate-A post failed"));
+                } else {
+                    PJ_LOG(3, (THIS_FILE, "[HOLD/M2] B on hold — posted hold propagation to A"));
+                }
+            }
         }
 
         if (do_hold == 2) {
-            /* A put the call on hold — play MOH to B */
-            pjsua_player_id moh_pid = PJSUA_INVALID_ID;
-            PJ_LOG(3, (THIS_FILE, "[HOLD] A on hold — playing MOH to B"));
-            if (cc_session_call_is_current(session, call_b, 0)) {
-                const char *moh_path = cc_prompt_get_path(CC_PROMPT_MOH);
-                moh_pid = cc_start_wav(call_b, moh_path, PJ_TRUE);
-            }
+            /* A put the call on hold.
+             * Mode 2 (REQ-11..REQ-15): propagate sendonly to B via UPDATE.
+             * Post CC_EV_HOLD_PROPAGATE_B; worker sends UPDATE sendonly to B,
+             * waits for 200 OK, then plays MOH to A.
+             * PJSUA has already answered A's re-INVITE locally (recvonly) —
+             * REQ-14 cannot be satisfied synchronously in a PJSUA callback;
+             * the local answer is immediate and the B propagation is async. */
+            int already;
             CC_SESSION_LOCK(session);
-            if (moh_pid != PJSUA_INVALID_ID &&
-                session->hold_player_b == PJSUA_INVALID_ID &&
-                !session->torn_down)
-            {
-                session->hold_player_b = moh_pid;
-            } else if (moh_pid != PJSUA_INVALID_ID) {
-                CC_SESSION_UNLOCK(session);
-                cc_stop_wav(moh_pid, PJSUA_INVALID_ID);
-                goto hold_b_done;
-            }
+            already = session->hold_propagate_pending || session->torn_down;
+            if (!already) session->hold_propagate_pending = 1;
             CC_SESSION_UNLOCK(session);
-            hold_b_done:;
+            if (!already) {
+                cc_event_t hev;
+                memset(&hev, 0, sizeof(hev));
+                hev.type    = CC_EV_HOLD_PROPAGATE_B;
+                hev.session = session;
+                hev.call_a  = call_a;
+                hev.call_b  = call_b;
+                snprintf(hev.reason, sizeof(hev.reason), "hold-propagate-b");
+                if (cc_worker_post(&hev) != 0) {
+                    CC_SESSION_LOCK(session);
+                    session->hold_propagate_pending = 0;
+                    CC_SESSION_UNLOCK(session);
+                    PJ_LOG(1, (THIS_FILE, "[HOLD/M2] hold propagate post failed"));
+                } else {
+                    PJ_LOG(3, (THIS_FILE, "[HOLD/M2] A on hold — posted hold propagation to B"));
+                }
+            }
         }
 
         if (do_resume == 1) {
-            /* B resumed — stop MOH on A, re-send UPDATEs to reconnect RTP */
+            /* B resumed — stop MOH on A, re-send bypass UPDATEs to restore direct RTP.
+             * B's resume is local to B's dialog; no A-leg signaling needed (symmetric REQ-9). */
             pjsua_player_id moh_pid = PJSUA_INVALID_ID;
-            PJ_LOG(3, (THIS_FILE, "[HOLD] B resumed — stopping MOH, re-sending UPDATEs"));
+            PJ_LOG(3, (THIS_FILE, "[HOLD/M2] B resumed — stopping MOH, re-sending bypass UPDATEs"));
             CC_SESSION_LOCK(session);
             if (session->hold_player_a != PJSUA_INVALID_ID) {
                 moh_pid = session->hold_player_a;
@@ -1856,19 +2742,33 @@ void cc_on_call_media_state(pjsua_call_id call_id)
         }
 
         if (do_resume == 2) {
-            /* A resumed — stop MOH on B, re-send UPDATEs to reconnect RTP */
-            pjsua_player_id moh_pid = PJSUA_INVALID_ID;
-            PJ_LOG(3, (THIS_FILE, "[HOLD] A resumed — stopping MOH, re-sending UPDATEs"));
+            /* A resumed.
+             * Mode 2 (REQ-17..REQ-20): propagate sendrecv to B via UPDATE.
+             * Post CC_EV_RESUME_PROPAGATE_B; worker sends UPDATE sendrecv to B,
+             * waits for 200 OK, then re-runs bypass UPDATEs to restore direct RTP.
+             * hold_update_b_acked check guards against duplicate resume events. */
+            int already;
             CC_SESSION_LOCK(session);
-            if (session->hold_player_b != PJSUA_INVALID_ID) {
-                moh_pid = session->hold_player_b;
-                session->hold_player_b = PJSUA_INVALID_ID;
-            }
+            already = session->resume_propagate_pending || session->torn_down;
+            if (!already) session->resume_propagate_pending = 1;
             CC_SESSION_UNLOCK(session);
-            if (moh_pid != PJSUA_INVALID_ID)
-                cc_stop_wav(moh_pid, PJSUA_INVALID_ID);
-            leg_a_send_update_bypass(resume_call_a, session);
-            leg_b_send_update_bypass(resume_call_b, session);
+            if (!already) {
+                cc_event_t rev;
+                memset(&rev, 0, sizeof(rev));
+                rev.type    = CC_EV_RESUME_PROPAGATE_B;
+                rev.session = session;
+                rev.call_a  = resume_call_a;
+                rev.call_b  = resume_call_b;
+                snprintf(rev.reason, sizeof(rev.reason), "resume-propagate-b");
+                if (cc_worker_post(&rev) != 0) {
+                    CC_SESSION_LOCK(session);
+                    session->resume_propagate_pending = 0;
+                    CC_SESSION_UNLOCK(session);
+                    PJ_LOG(1, (THIS_FILE, "[HOLD/M2] resume propagate post failed"));
+                } else {
+                    PJ_LOG(3, (THIS_FILE, "[HOLD/M2] A resumed — posted resume propagation to B"));
+                }
+            }
         }
     }
 
@@ -2042,19 +2942,221 @@ void cc_on_dtmf_digit2(pjsua_call_id call_id,
     cc_session_release_reason(session, "callback-dtmf2");
 }
 
+/*
+ * Align SIP SDP with RTPengine single-codec policy (PCMA + telephone-event).
+ * Endpoint rewrite alone left PJSUA advertising PCMU+PCMA; RE then mixed
+ * PT 0 and PT 8 toward Linphone. Strip non-PCMA audio PTs on every rewrite.
+ */
+static int cc_sdp_pt_is_kept(const pjmedia_sdp_media *m, const pj_str_t *fmt)
+{
+    unsigned j;
+    char ptbuf[16];
+    pj_str_t te = pj_str("telephone-event");
+
+    if (!m || !fmt || !fmt->ptr || fmt->slen <= 0)
+        return 0;
+
+    /* Static PCMA */
+    if (fmt->slen == 1 && fmt->ptr[0] == '8')
+        return 1;
+
+    if (fmt->slen >= (pj_ssize_t)sizeof(ptbuf))
+        return 0;
+    memcpy(ptbuf, fmt->ptr, (size_t)fmt->slen);
+    ptbuf[fmt->slen] = '\0';
+
+    for (j = 0; j < m->attr_count; j++) {
+        const pjmedia_sdp_attr *a = m->attr[j];
+        const char *v;
+        const char *sp;
+        size_t ptlen;
+
+        if (!a || pj_strcmp2(&a->name, "rtpmap") != 0 || !a->value.ptr)
+            continue;
+        v = a->value.ptr;
+        sp = memchr(v, ' ', (size_t)a->value.slen);
+        if (!sp)
+            continue;
+        ptlen = (size_t)(sp - v);
+        if (ptlen != (size_t)fmt->slen || memcmp(v, fmt->ptr, ptlen) != 0)
+            continue;
+        /* rtpmap:<pt> <encoding>/... */
+        if (pj_stristr(&a->value, &te) != NULL)
+            return 1;
+        if (a->value.slen >= (pj_ssize_t)(ptlen + 1 + 4) &&
+            strncasecmp(sp + 1, "PCMA", 4) == 0)
+            return 1;
+        return 0;
+    }
+
+    /* No rtpmap: keep only static 8 (already handled). Drop unknown PTs. */
+    return 0;
+}
+
+void cc_sdp_restrict_audio_pcma_te(pj_pool_t *pool,
+                                   pjmedia_sdp_session *sdp,
+                                   const char *tag)
+{
+    pj_size_t mi;
+    unsigned removed_total = 0;
+
+    if (!pool || !sdp)
+        return;
+
+    for (mi = 0; mi < sdp->media_count; mi++) {
+        pjmedia_sdp_media *m = sdp->media[mi];
+        pj_str_t keep_fmt[PJMEDIA_MAX_SDP_FMT];
+        unsigned keep_n = 0;
+        unsigned fi;
+        unsigned ai;
+        unsigned new_attr_n = 0;
+        unsigned removed;
+
+        if (!m || pj_strcmp2(&m->desc.media, "audio") != 0)
+            continue;
+
+        for (fi = 0; fi < m->desc.fmt_count; fi++) {
+            if (!cc_sdp_pt_is_kept(m, &m->desc.fmt[fi])) {
+                removed_total++;
+                continue;
+            }
+            if (keep_n < PJMEDIA_MAX_SDP_FMT)
+                keep_fmt[keep_n++] = m->desc.fmt[fi];
+        }
+
+        /* Ensure PCMA (PT 8) is always first among kept formats. */
+        {
+            unsigned k;
+            int have_8 = 0;
+            for (k = 0; k < keep_n; k++) {
+                if (keep_fmt[k].slen == 1 && keep_fmt[k].ptr &&
+                    keep_fmt[k].ptr[0] == '8')
+                {
+                    have_8 = 1;
+                    break;
+                }
+            }
+            if (!have_8) {
+                if (keep_n >= PJMEDIA_MAX_SDP_FMT)
+                    keep_n = PJMEDIA_MAX_SDP_FMT - 1;
+                for (k = keep_n; k > 0; k--)
+                    keep_fmt[k] = keep_fmt[k - 1];
+                keep_fmt[0] = pj_strdup3(pool, "8");
+                keep_n++;
+                PJ_LOG(2, (THIS_FILE,
+                           "[%s] SDP codec restrict: inserting PCMA/8",
+                           tag ? tag : "SDP"));
+            }
+        }
+
+        /* Always advertise rtpmap for PCMA when PT 8 is kept. */
+        {
+            int have_pcma_map = 0;
+            for (ai = 0; ai < m->attr_count; ai++) {
+                pjmedia_sdp_attr *a = m->attr[ai];
+                if (a && pj_strcmp2(&a->name, "rtpmap") == 0 &&
+                    a->value.ptr && a->value.slen >= 6 &&
+                    a->value.ptr[0] == '8' && a->value.ptr[1] == ' ' &&
+                    strncasecmp(a->value.ptr + 2, "PCMA", 4) == 0)
+                {
+                    have_pcma_map = 1;
+                    break;
+                }
+            }
+            if (!have_pcma_map && m->attr_count < PJMEDIA_MAX_SDP_ATTR) {
+                pjmedia_sdp_attr *a = PJ_POOL_ZALLOC_T(pool, pjmedia_sdp_attr);
+                a->name = pj_str("rtpmap");
+                a->value = pj_strdup3(pool, "8 PCMA/8000");
+                m->attr[m->attr_count++] = a;
+            }
+        }
+
+        removed = m->desc.fmt_count > keep_n ? m->desc.fmt_count - keep_n : 0;
+        m->desc.fmt_count = keep_n;
+        for (fi = 0; fi < keep_n; fi++)
+            m->desc.fmt[fi] = keep_fmt[fi];
+
+        /* Drop rtpmap/fmtp for removed PTs; keep other attributes. */
+        for (ai = 0; ai < m->attr_count; ai++) {
+            pjmedia_sdp_attr *a = m->attr[ai];
+            const char *v;
+            const char *sp;
+            pj_str_t pt;
+            unsigned k;
+            int is_map = 0;
+
+            if (!a)
+                continue;
+            if (pj_strcmp2(&a->name, "rtpmap") == 0 ||
+                pj_strcmp2(&a->name, "fmtp") == 0)
+                is_map = 1;
+            if (!is_map) {
+                m->attr[new_attr_n++] = a;
+                continue;
+            }
+            if (!a->value.ptr || a->value.slen <= 0)
+                continue;
+            v = a->value.ptr;
+            sp = memchr(v, ' ', (size_t)a->value.slen);
+            pt.ptr = (char *)v;
+            pt.slen = sp ? (pj_ssize_t)(sp - v) : a->value.slen;
+            for (k = 0; k < keep_n; k++) {
+                if (pt.slen == keep_fmt[k].slen &&
+                    memcmp(pt.ptr, keep_fmt[k].ptr, (size_t)pt.slen) == 0)
+                {
+                    m->attr[new_attr_n++] = a;
+                    break;
+                }
+            }
+        }
+        m->attr_count = new_attr_n;
+
+        if (removed > 0) {
+            PJ_LOG(3, (THIS_FILE,
+                       "[%s] SDP codec restrict: kept PCMA+telephone-event "
+                       "(%u fmt, removed %u)",
+                       tag ? tag : "SDP", keep_n, removed));
+        }
+    }
+
+    (void)removed_total;
+}
+
 static void cc_rewrite_sdp_audio_endpoint(pj_pool_t *pool,
                                           pjmedia_sdp_session *sdp,
                                           const cc_rtp_ep_t *ep,
                                           const char *tag)
 {
     pj_size_t i;
+    cc_rtp_ep_t use;
+    const char *media_ip;
 
     if (!pool || !sdp || !ep || !ep->valid)
         return;
 
+    use = *ep;
+    media_ip = use.ip;
+    /* Never advertise loopback toward phones — prompts would stay on server. */
+    if (strcmp(use.ip, "127.0.0.1") == 0 || strcmp(use.ip, "::1") == 0 ||
+        strcmp(use.ip, "0.0.0.0") == 0 || use.ip[0] == '\0')
+    {
+        media_ip = cc_cfg_local_host();
+        PJ_LOG(2, (THIS_FILE,
+                   "[%s] SDP media IP %s replaced with CC_LOCAL_HOST %s",
+                   tag ? tag : "SDP",
+                   use.ip[0] ? use.ip : "(empty)",
+                   media_ip));
+        snprintf(use.ip, sizeof(use.ip), "%s", media_ip);
+    }
+
+    /* Keep o= origin aligned with advertised media. Wireshark/SBCs that
+     * display Owner Address otherwise keep showing the B2BUA bound IP. */
+    sdp->origin.addr = pj_strdup3(pool, use.ip);
+    sdp->origin.version++;
+
     /* Rewrite session-level c= line if present */
     if (sdp->conn) {
-        sdp->conn->addr = pj_strdup3(pool, ep->ip);
+        sdp->conn->addr = pj_strdup3(pool, use.ip);
     }
 
     for (i = 0; i < sdp->media_count; i++) {
@@ -2080,22 +3182,22 @@ static void cc_rewrite_sdp_audio_endpoint(pj_pool_t *pool,
         }
 
         /* Rewrite audio m= port */
-        m->desc.port = (pj_uint16_t)ep->port;
+        m->desc.port = (pj_uint16_t)use.port;
 
         /* Rewrite media-level c= line */
         conn = m->conn ? m->conn : sdp->conn;
         if (conn) {
-            conn->addr = pj_strdup3(pool, ep->ip);
+            conn->addr = pj_strdup3(pool, use.ip);
         } else {
             m->conn = PJ_POOL_ZALLOC_T(pool, pjmedia_sdp_conn);
             m->conn->net_type  = pj_str("IN");
             m->conn->addr_type = pj_str("IP4");
-            m->conn->addr      = pj_strdup3(pool, ep->ip);
+            m->conn->addr      = pj_strdup3(pool, use.ip);
         }
 
         /* Rewrite a=rtcp:<port+1> IN IP4 <ip> */
         snprintf(rtcp_value, sizeof(rtcp_value), "%d IN IP4 %s",
-                 ep->port + 1, ep->ip);
+                 use.port + 1, use.ip);
 
         for (j = 0; j < m->attr_count; j++) {
             if (m->attr[j] &&
@@ -2120,9 +3222,12 @@ static void cc_rewrite_sdp_audio_endpoint(pj_pool_t *pool,
         PJ_LOG(3, (THIS_FILE,
                    "[%s] SDP rewritten to RTP %s:%d",
                    tag ? tag : "UPDATE",
-                   ep->ip,
-                   ep->port));
+                   use.ip,
+                   use.port));
     }
+
+    /* After IP/port rewrite: force single audio codec on the wire. */
+    cc_sdp_restrict_audio_pcma_te(pool, sdp, tag);
 }
 
 static int cc_sdp_has_rtpmap(const pjmedia_sdp_session *sdp,
@@ -2168,11 +3273,11 @@ void cc_on_call_sdp_created(pjsua_call_id call_id,
     int do_b = 0;
     int was_update = 0;
     int was_reinvite = 0;
+    int hold_direction = 0;  /* 1=sendonly 2=sendrecv for hold/resume SDP rewrite */
+    int leg = 0;
     cc_rtp_ep_t target;
     const char *method = NULL;
     const char *tag = NULL;
-
-    (void)rem_sdp;
 
     cc_sdp_set_session_name(sdp, pool, CC_SDP_SESSION_NAME);
 
@@ -2180,24 +3285,20 @@ void cc_on_call_sdp_created(pjsua_call_id call_id,
     if (!session || !cc_session_acquire_reason(session, "callback-sdp"))
         return;
 
-    {
-        int leg = cc_resolve_leg(session, call_id);
-        int has_pcma = cc_sdp_has_rtpmap(sdp, "PCMA/8000");
-        int has_telephone_event =
-            cc_sdp_has_rtpmap(sdp, "telephone-event/8000");
+    /*
+     * Associate early B INVITE before rewrite decisions. make_call() fires
+     * on_call_sdp_created before it returns call_b; without this, B SDP kept
+     * PJSUA 127.0.0.1:106xx and RE played prompts to loopback.
+     */
+    leg = cc_resolve_leg(session, call_id);
 
-        if (has_pcma && has_telephone_event) {
-            PJ_LOG(3, (THIS_FILE,
-                       "[SDP] call_id=%d leg=%s PCMA/8000=yes telephone-event/8000=yes",
-                       call_id,
-                       leg == 1 ? "A" : (leg == 2 ? "B" : "UNKNOWN")));
-        } else {
-            PJ_LOG(1, (THIS_FILE,
-                       "[SDP] call_id=%d leg=%s PCMA/8000=%s telephone-event/8000=%s",
-                       call_id,
-                       leg == 1 ? "A" : (leg == 2 ? "B" : "UNKNOWN"),
-                       has_pcma ? "yes" : "no",
-                       has_telephone_event ? "yes" : "no"));
+    if (cc_rtpengine_enabled() && rem_sdp) {
+        if (leg == 1)
+            (void)cc_rtpengine_offer_from_sdp(session, rem_sdp);
+        else if (leg == 2) {
+            (void)cc_rtpengine_answer_from_sdp(session, rem_sdp);
+            if (cc_rtpengine_consume_a_ep_changed(session))
+                leg_a_on_rtpengine_a_ep_changed(session);
         }
     }
 
@@ -2205,27 +3306,120 @@ void cc_on_call_sdp_created(pjsua_call_id call_id,
 
     CC_SESSION_LOCK(session);
 
+    {
+        cc_rtp_ep_t a_tgt, b_tgt;
+        int have_a_tgt = 0;
+        int have_b_tgt = 0;
+
+        if (cc_rtpengine_sdp_target(session, 1, &a_tgt))
+            have_a_tgt = 1;
+        else if (session->rtp_b.port != 0) {
+            a_tgt = session->rtp_b;
+            have_a_tgt = 1;
+        }
+        if (cc_rtpengine_sdp_target(session, 0, &b_tgt))
+            have_b_tgt = 1;
+        else if (session->rtp_a.port != 0) {
+            b_tgt = session->rtp_a;
+            have_b_tgt = 1;
+        }
+
     if (call_id == session->call_a &&
         (session->update_a_pending || session->reinvite_a_pending) &&
-        session->rtp_b.valid)
+        have_a_tgt)
     {
         do_a = 1;
-        target = session->rtp_b;
+        target = a_tgt;
         was_update = session->update_a_pending;
         was_reinvite = session->reinvite_a_pending;
         session->update_a_pending = 0;
         session->reinvite_a_pending = 0;
     }
+    else if (call_id == session->call_a &&
+             rem_sdp != NULL &&
+             session->accepted &&
+             !session->torn_down &&
+             have_a_tgt &&
+             (session->media_bypassed || session->a_on_hold))
+    {
+        /* Incoming A-leg re-INVITE (hold/resume from the network). */
+        do_a = 1;
+        target = a_tgt;
+        was_reinvite = 1;
+        PJ_LOG(3, (THIS_FILE,
+                   "[SDP-REWRITE] A-leg incoming re-INVITE answer: keep RTP %s:%d",
+                   a_tgt.ip,
+                   a_tgt.port));
+    }
     else if (call_id == session->call_b &&
-             (session->update_b_pending || session->reinvite_b_pending) &&
-             session->rtp_a.valid)
+             session->hold_sdp_b_pending &&
+             have_b_tgt)
     {
         do_b = 1;
-        target = session->rtp_a;
+        target = b_tgt;
+        was_update = 1;
+        session->hold_sdp_b_pending = 0;
+        session->hold_sdp_direction = 1;  /* sendonly */
+        hold_direction = 1;
+    }
+    else if (call_id == session->call_b &&
+             session->resume_sdp_b_pending &&
+             have_b_tgt)
+    {
+        do_b = 1;
+        target = b_tgt;
+        was_update = 1;
+        session->resume_sdp_b_pending = 0;
+        session->hold_sdp_direction = 2;  /* sendrecv */
+        hold_direction = 2;
+    }
+    else if (call_id == session->call_a &&
+             session->hold_sdp_a_pending &&
+             have_a_tgt)
+    {
+        do_a = 1;
+        target = a_tgt;
+        was_update = 1;
+        session->hold_sdp_a_pending = 0;
+        session->hold_sdp_direction = 1;  /* sendonly */
+        hold_direction = 1;
+    }
+    else if (call_id == session->call_a &&
+             session->resume_sdp_a_pending &&
+             have_a_tgt)
+    {
+        do_a = 1;
+        target = a_tgt;
+        was_update = 1;
+        session->resume_sdp_a_pending = 0;
+        session->hold_sdp_direction = 2;  /* sendrecv */
+        hold_direction = 2;
+    }
+    else if (call_id == session->call_b &&
+             (session->update_b_pending || session->reinvite_b_pending) &&
+             have_b_tgt)
+    {
+        do_b = 1;
+        target = b_tgt;
         was_update = session->update_b_pending;
         was_reinvite = session->reinvite_b_pending;
         session->update_b_pending = 0;
         session->reinvite_b_pending = 0;
+    }
+    else if (cc_rtpengine_enabled() && have_a_tgt &&
+             call_id == session->call_a)
+    {
+        /* Initial A 200 / any A SDP: advertise RTPengine, not local PJSUA RTP. */
+        do_a = 1;
+        target = a_tgt;
+    }
+    else if (cc_rtpengine_enabled() && have_b_tgt &&
+             (call_id == session->call_b || leg == 2))
+    {
+        do_b = 1;
+        target = b_tgt;
+    }
+
     }
 
     CC_SESSION_UNLOCK(session);
@@ -2234,25 +3428,107 @@ void cc_on_call_sdp_created(pjsua_call_id call_id,
         method = "UPDATE+REINVITE";
     else if (was_reinvite)
         method = "REINVITE";
-    else
+    else if (was_update)
         method = "UPDATE";
+    else
+        method = "INVITE";
 
-    if (do_a) {
-        tag = was_reinvite ? "A-REINVITE" : "A-UPDATE";
+    if (do_a || do_b) {
+        const char *leg_tag = do_a ? "A" : "B";
+        const char *peer_tag = do_a ? "B" : "A";
+        int initial_rtpengine = cc_rtpengine_enabled() &&
+                                !was_update && !was_reinvite;
+
+        tag = was_reinvite
+              ? (do_a ? "A-REINVITE" : "B-REINVITE")
+              : was_update
+              ? (do_a ? "A-UPDATE"   : "B-UPDATE")
+              : (do_a ? "A-INVITE"   : "B-INVITE");
         cc_rewrite_sdp_audio_endpoint(pool, sdp, &target, tag);
-        PJ_LOG(3, (THIS_FILE,
-                   "[SDP-REWRITE] A-leg %s SDP rewritten to B RTP %s:%d",
-                   method,
-                   target.ip,
-                   target.port));
-    } else if (do_b) {
-        tag = was_reinvite ? "B-REINVITE" : "B-UPDATE";
-        cc_rewrite_sdp_audio_endpoint(pool, sdp, &target, tag);
-        PJ_LOG(3, (THIS_FILE,
-                   "[SDP-REWRITE] B-leg %s SDP rewritten to A RTP %s:%d",
-                   method,
-                   target.ip,
-                   target.port));
+
+        /* For hold/resume propagation (either direction), also rewrite the
+         * direction attribute on all audio m= sections: sendonly (hold) or
+         * sendrecv (resume). This is the only SDP change needed — RTP
+         * addresses stay pointed at the bypass (direct) peer endpoint. */
+        if (hold_direction != 0) {
+            const char *dir_str = (hold_direction == 1) ? "sendonly" : "sendrecv";
+            pj_size_t mi;
+            for (mi = 0; mi < sdp->media_count; mi++) {
+                pjmedia_sdp_media *m = sdp->media[mi];
+                unsigned ai;
+                if (!m || pj_strcmp2(&m->desc.media, "audio") != 0) continue;
+                /* Remove existing direction attributes */
+                for (ai = 0; ai < m->attr_count; ) {
+                    if (m->attr[ai] &&
+                        (pj_strcmp2(&m->attr[ai]->name, "sendonly") == 0 ||
+                         pj_strcmp2(&m->attr[ai]->name, "recvonly") == 0 ||
+                         pj_strcmp2(&m->attr[ai]->name, "sendrecv") == 0 ||
+                         pj_strcmp2(&m->attr[ai]->name, "inactive") == 0))
+                    {
+                        unsigned j;
+                        for (j = ai; j + 1 < m->attr_count; j++)
+                            m->attr[j] = m->attr[j+1];
+                        m->attr_count--;
+                    } else {
+                        ai++;
+                    }
+                }
+                /* Append new direction */
+                if (m->attr_count < PJMEDIA_MAX_SDP_ATTR) {
+                    pjmedia_sdp_attr *a = PJ_POOL_ZALLOC_T(pool, pjmedia_sdp_attr);
+                    a->name  = pj_strdup3(pool, dir_str);
+                    a->value = pj_str("");
+                    m->attr[m->attr_count++] = a;
+                }
+            }
+            PJ_LOG(3, (THIS_FILE,
+                       "[SDP-REWRITE] %s-leg hold/resume direction=%s endpoint=%s:%d",
+                       leg_tag, dir_str, target.ip, target.port));
+        } else if (initial_rtpengine) {
+            PJ_LOG(3, (THIS_FILE,
+                       "[SDP-REWRITE] %s-leg %s SDP rewritten to RTPengine "
+                       "%s-facing %s:%d",
+                       leg_tag, method, do_a ? "A" : "B",
+                       target.ip, target.port));
+        } else {
+            PJ_LOG(3, (THIS_FILE,
+                       "[SDP-REWRITE] %s-leg %s SDP rewritten to %s RTP %s:%d",
+                       leg_tag, method, peer_tag, target.ip, target.port));
+        }
+    } else if (cc_rtpengine_enabled()) {
+        /* No endpoint rewrite this time — still enforce PCMA+TE on wire. */
+        cc_sdp_restrict_audio_pcma_te(pool, sdp, "SDP");
+        if (leg == 2) {
+            PJ_LOG(1, (THIS_FILE,
+                       "[SDP-REWRITE] B-leg SDP has no RTPengine B-facing "
+                       "endpoint — media may stay on 127.0.0.1 (no prompt)"));
+        }
+    }
+
+    /* Log codecs after restrict/rewrite (what SIP will actually send). */
+    {
+        int has_pcma = cc_sdp_has_rtpmap(sdp, "PCMA/8000");
+        int has_pcmu = cc_sdp_has_rtpmap(sdp, "PCMU/8000");
+        int has_telephone_event =
+            cc_sdp_has_rtpmap(sdp, "telephone-event/8000");
+
+        if (has_pcma && has_telephone_event && !has_pcmu) {
+            PJ_LOG(3, (THIS_FILE,
+                       "[SDP] call_id=%d leg=%s PCMA/8000=yes PCMU/8000=no "
+                       "telephone-event/8000=yes",
+                       call_id,
+                       leg == 1 ? "A" : (leg == 2 ? "B" : "UNKNOWN")));
+        } else {
+            PJ_LOG(1, (THIS_FILE,
+                       "[SDP] call_id=%d leg=%s PCMA/8000=%s PCMU/8000=%s "
+                       "telephone-event/8000=%s "
+                       "(want PCMA+TE only)",
+                       call_id,
+                       leg == 1 ? "A" : (leg == 2 ? "B" : "UNKNOWN"),
+                       has_pcma ? "yes" : "no",
+                       has_pcmu ? "yes" : "no",
+                       has_telephone_event ? "yes" : "no"));
+        }
     }
 
     cc_session_release_reason(session, "callback-sdp");

@@ -16,7 +16,8 @@ typedef enum {
 typedef enum {
     CC_MEDIA_MODE_UPDATE = 0,
     CC_MEDIA_MODE_REINVITE,
-    CC_MEDIA_MODE_LOCAL_BRIDGE
+    CC_MEDIA_MODE_LOCAL_BRIDGE,
+    CC_MEDIA_MODE_RTPENGINE
 } cc_media_mode_t;
 
 const char *cc_cfg_local_host(void);
@@ -49,6 +50,15 @@ const char *cc_cfg_user_agent(void);
 
 cc_media_mode_t cc_cfg_media_mode(void);
 const char     *cc_cfg_media_mode_name(void);
+int             cc_cfg_media_uses_update(void);
+
+const char *cc_cfg_rtpengine_host(void);
+int         cc_cfg_rtpengine_port(void);
+int         cc_cfg_rtpengine_timeout_ms(void);
+const char *cc_cfg_rtpengine_flags(void);
+int         cc_cfg_rtpengine_dtmf_port(void);
+const char *cc_cfg_rtpengine_dtmf_dest(void);
+const char *cc_cfg_rtpengine_media_dir(void);
 
 int cc_cfg_free_period_ms(void);
 
@@ -62,5 +72,14 @@ int cc_cfg_rtp_port_start(void);
 int cc_cfg_rtp_port_count(void);
 int cc_cfg_max_calls(void);
 int cc_cfg_log_level(void);
+
+/**
+ * Soft admission caps (0 = disabled). Reject new A INVITEs with 503 when
+ * exceeded so PJSUA SIP/timer paths stay responsive under CPS.
+ * CC_ADMISSION_MAX_CALLS — max pjsua_call_get_count() (A+B legs).
+ * CC_ADMISSION_TIMER_HEAP_MAX — max pj_timer_heap_count().
+ */
+int cc_cfg_admission_max_calls(void);
+int cc_cfg_admission_timer_heap_max(void);
 
 #endif /* CC_RUNTIME_CONFIG_H */

@@ -4,9 +4,11 @@
 #include "session.h"
 #include "config.h"
 #include "runtime_config.h"
+#include "rtpengine.h"
 
 #include <pj/pool.h>
 #include <pj/os.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -78,6 +80,7 @@ cc_session_t *cc_session_create(void)
     s->b_number[0]   = '\0';
     s->service_key[0] = '\0';
     s->b_dial_number[0] = '\0';
+    s->b_validation_started = 0;
     s->b_leg_started = 0;
     s->b_origination_pending = 0;
     s->call_id[0]    = '\0';
@@ -93,6 +96,16 @@ cc_session_t *cc_session_create(void)
     s->sponsor_msisdn_normalized[0] = '\0';
     s->icid[0]       = '\0';
     s->call_start_ts = 0;
+    s->a_confirmed_ms = 0;
+    s->a_invite_cb_ms = 0;
+    s->a_100_sent_ms = 0;
+    s->a_answer_queued_ms = 0;
+    s->a_200_worker_ms = 0;
+    s->a_200_sent_ms = 0;
+    s->a_offer_start_ms = 0;
+    s->a_offer_done_ms = 0;
+    s->a_advertise_ms = 0;
+    s->b_confirmed_ms = 0;
     s->free_period_ms = cc_cfg_free_period_ms();
     s->call_connected_ts = 0;
     s->call_end_ts   = 0;
@@ -106,6 +119,8 @@ cc_session_t *cc_session_create(void)
     s->a_prompt_starting = 0;
     s->b_prompt_starting = 0;
     s->a_treatment_running = 0;
+    s->mca_waiting = 0;
+    s->mca_decided = 0;
     s->ring_timer_started = 0;
     s->dtmf_timer_started = 0;
     s->bypass_mode   = BYPASS_NONE;
@@ -117,6 +132,17 @@ cc_session_t *cc_session_create(void)
 
     memset(&s->rtp_a, 0, sizeof(s->rtp_a));
     memset(&s->rtp_b, 0, sizeof(s->rtp_b));
+    memset(&s->rtpengine_ep_a, 0, sizeof(s->rtpengine_ep_a));
+    memset(&s->rtpengine_ep_b, 0, sizeof(s->rtpengine_ep_b));
+    s->rtpengine_a_advertised = 0;
+    s->rtpengine_a_answer_pending = 0;
+    s->rtpengine_a_offer_pending = 0;
+    s->rtpengine_a_need_advertise = 0;
+    s->rtpengine_a_reinvite_done = 0;
+    s->rtpengine_a_ep_changed = 0;
+    s->rtpengine_a_play_file[0] = '\0';
+    s->rtpengine_a_play_loop = 0;
+    s->rtpengine_media_blocked = 0;
 
     s->update_a_pending = 0;
     s->update_b_pending = 0;
@@ -134,15 +160,47 @@ cc_session_t *cc_session_create(void)
         return NULL;
     }
 
-    PJ_LOG(3, ("session", "[SESSION] create session=%p refs=%u",
-               s, s->ref_count));
+    /* Monotonic serial — incremented globally; never zero.
+     * Copied into every cc_event_t at post time so workers can detect
+     * stale events even when the call_id slot has been reused. */
+    {
+        static _Atomic unsigned g_serial = 1;
+        s->session_serial = atomic_fetch_add_explicit(
+            &g_serial, 1u, memory_order_relaxed);
+        if (s->session_serial == 0)   /* wrap-around guard */
+            s->session_serial = atomic_fetch_add_explicit(
+                &g_serial, 1u, memory_order_relaxed);
+    }
+
+    PJ_LOG(3, ("session", "[SESSION] create session=%p serial=%u refs=%u",
+               s, s->session_serial, s->ref_count));
     return s;
 }
 
 void cc_session_destroy(cc_session_t *s)
 {
     pthread_mutex_t *lock;
+    pjsua_player_id pa, pb, ha, hb;
+
     if (!s) return;
+
+    /* Take any live players under lock before freeing the pool.
+     * These are leaked if the session is destroyed while a player is
+     * still running (e.g. stale-event fix dropped the stop call). */
+    CC_SESSION_LOCK(s);
+    pa = s->player_a;      s->player_a      = PJSUA_INVALID_ID;
+    pb = s->player_b;      s->player_b      = PJSUA_INVALID_ID;
+    ha = s->hold_player_a; s->hold_player_a = PJSUA_INVALID_ID;
+    hb = s->hold_player_b; s->hold_player_b = PJSUA_INVALID_ID;
+    CC_SESSION_UNLOCK(s);
+
+    if (pa != PJSUA_INVALID_ID) pjsua_player_destroy(pa);
+    if (pb != PJSUA_INVALID_ID) pjsua_player_destroy(pb);
+    if (ha != PJSUA_INVALID_ID) pjsua_player_destroy(ha);
+    if (hb != PJSUA_INVALID_ID) pjsua_player_destroy(hb);
+
+    cc_rtpengine_delete(s);
+
     PJ_LOG(3, ("session", "[SESSION] destroyed session=%p", s));
     lock = s->lock;
     pj_pool_release(s->pool);   /* frees s itself (pool-allocated) */
@@ -239,6 +297,7 @@ void cc_session_maybe_finalize(cc_session_t *s)
         !s->b_origination_pending &&
         !s->accept_transition_pending &&
         !s->a_treatment_running &&
+        !s->mca_waiting &&
         !s->ring_timer_started &&
         !s->dtmf_timer_started)
     {

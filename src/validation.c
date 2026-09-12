@@ -283,10 +283,14 @@ static int status_code_to_internal(const char *status_code)
         return CC_VALIDATION_CALLER_BLACKLISTED;
     if (strcmp(status_code, "SPONSOR_BALANCE_FAIL") == 0)
         return CC_VALIDATION_SPONSOR_BALANCE_FAIL;
+    if (strcmp(status_code, "LOW_BALANCE") == 0)
+        return CC_VALIDATION_SPONSOR_BALANCE_FAIL;
     if (strcmp(status_code, "SPONSOR_DND_ACTIVE") == 0)
         return CC_VALIDATION_SPONSOR_DND_ACTIVE;
     if (strcmp(status_code, "SPONSOR_ROAMING") == 0)
         return CC_VALIDATION_SPONSOR_ROAMING;
+    if (strcmp(status_code, "CALLER_ROAMING") == 0)
+        return CC_VALIDATION_CALLER_ROAMING;
 
     return CC_VALIDATION_API_FAILURE;
 }

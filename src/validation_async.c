@@ -209,10 +209,31 @@ static int extract_json_string_or_number(const char *json, const char *key,
 static int status_code_to_internal(const char *sc)
 {
     if (strcmp(sc, "CALLER_BLACKLISTED")   == 0) return CC_VALIDATION_CALLER_BLACKLISTED;
+    /* API may send either SPONSOR_BALANCE_FAIL or LOW_BALANCE */
     if (strcmp(sc, "SPONSOR_BALANCE_FAIL") == 0) return CC_VALIDATION_SPONSOR_BALANCE_FAIL;
+    if (strcmp(sc, "LOW_BALANCE")          == 0) return CC_VALIDATION_SPONSOR_BALANCE_FAIL;
     if (strcmp(sc, "SPONSOR_DND_ACTIVE")   == 0) return CC_VALIDATION_SPONSOR_DND_ACTIVE;
     if (strcmp(sc, "SPONSOR_ROAMING")      == 0) return CC_VALIDATION_SPONSOR_ROAMING;
+    if (strcmp(sc, "CALLER_ROAMING")       == 0) return CC_VALIDATION_CALLER_ROAMING;
+    /* Server-side timeout: treat as API_FAILURE but preserve the reason string
+     * so the CDR gets ELIGIBILITY_TIMEOUT not API_FAILURE. */
     return CC_VALIDATION_API_FAILURE;
+}
+
+/* Returns the CDR reason string for an INELIGIBLE response.
+ * Preserves the raw statusCode for unknown codes so CDRs are accurate. */
+static const char *ineligible_reason(const char *status_code, int internal)
+{
+    switch (internal) {
+    case CC_VALIDATION_CALLER_BLACKLISTED:  return "CALLER_BLACKLISTED";
+    case CC_VALIDATION_SPONSOR_BALANCE_FAIL:return "SPONSOR_BALANCE_FAIL";
+    case CC_VALIDATION_SPONSOR_DND_ACTIVE:  return "SPONSOR_DND_ACTIVE";
+    case CC_VALIDATION_SPONSOR_ROAMING:     return "SPONSOR_ROAMING";
+    case CC_VALIDATION_CALLER_ROAMING:      return "CALLER_ROAMING";
+    default:
+        /* Unknown or API_FAILURE: use raw statusCode if non-empty */
+        return (status_code && status_code[0]) ? status_code : "API_FAILURE";
+    }
 }
 
 static void parse_response(const char *buf, cc_validation_result_t *r)
@@ -244,7 +265,7 @@ static void parse_response(const char *buf, cc_validation_result_t *r)
                             r->reason_description, sizeof(r->reason_description));
         r->status = status_code_to_internal(status_code);
         snprintf(r->reason, sizeof(r->reason), "%s",
-                 r->status == CC_VALIDATION_API_FAILURE ? "API_FAILURE" : status_code);
+                 ineligible_reason(status_code, r->status));
     }
 }
 

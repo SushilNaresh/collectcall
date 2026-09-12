@@ -12,6 +12,7 @@
 #define CC_VALIDATION_API_FAILURE            3
 #define CC_VALIDATION_SPONSOR_DND_ACTIVE     4
 #define CC_VALIDATION_SPONSOR_ROAMING        5
+#define CC_VALIDATION_CALLER_ROAMING         6
 
 typedef struct {
     int  status;          /* CC_VALIDATION_* or -1 for transport error */

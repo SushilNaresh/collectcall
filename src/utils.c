@@ -8,10 +8,25 @@
 #include <limits.h>
 #include "api_mapping.h"
 #include "runtime_config.h"
+#include "rtpengine.h"
 #include "worker.h"
+#include "prompt_mapping.h"
 
 #include <pjsua-lib/pjsua.h>
+#include <pjsua-lib/pjsua_internal.h>  /* struct pjsua_data/pjsua_call/
+                                        * pjsua_call_media, extern pjsua_var —
+                                        * needed for cc_get_call_aud_stream().
+                                        * Requires building against pjproject
+                                        * source tree (not just installed
+                                        * pjsua-lib headers/.so), since this
+                                        * header isn't part of the public API. */
 #include <pjmedia/sdp.h>
+#include <pjmedia/stream.h>
+#include <pjmedia/echo.h>
+#include <pjmedia/mem_port.h>
+#include <pjmedia/jbuf.h>
+#include <pjmedia/wav_port.h>
+#include <pjmedia/port.h>
 #include <pjsip/sip_msg.h>
 #include <pjsip/sip_uri.h>
 #include <pjsip/sip_util.h>
@@ -965,7 +980,7 @@ pj_status_t cc_log_call_rtp_info(pjsua_call_id call_id, const char *tag)
         remote_port = pj_sockaddr_get_port(&ti.src_rtp_name);
     }
 
-    PJ_LOG(3, (THIS_FILE,
+    PJ_LOG(4, (THIS_FILE,
                "[%s] RTP local=%s:%d remote/src=%s:%d",
                tag ? tag : "RTP",
                local_rtp,
@@ -1021,100 +1036,774 @@ pj_status_t cc_get_call_remote_rtp(pjsua_call_id call_id, cc_rtp_ep_t *ep)
 
 /* ── Media helpers ────────────────────────────────────────────────────────── */
 
-pjsua_player_id cc_start_wav(pjsua_call_id call_id,
-                              const char *wav_path,
-                              pj_bool_t loop)
+#ifndef PJSUA_MAX_PLAYERS
+#define CC_PLAYER_SLOTS 256
+#else
+#define CC_PLAYER_SLOTS PJSUA_MAX_PLAYERS
+#endif
+
+typedef struct {
+    int                 in_use;
+    int                 is_mem;
+    int                 is_rtpengine;
+    int                 rtpengine_for_a;
+    cc_session_t       *rtpengine_session;
+    pjsua_player_id     file_id;
+    pjsua_conf_port_id  conf_slot;
+    pjmedia_port       *port;
+    pj_pool_t          *pool;
+    int                 duration_ms;
+} cc_player_slot_t;
+
+static cc_player_slot_t g_players[CC_PLAYER_SLOTS];
+static pthread_mutex_t g_player_lock = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct {
+    pjmedia_port          base;
+    pjmedia_port         *child;
+    pjmedia_echo_state   *echo;
+    pjmedia_echo_state   *deferred_echo;
+    pj_pool_t            *pool;
+    pthread_mutex_t       lock;
+    int                   dead;
+    int                   in_flight;
+    int                   lock_ready;
+} cc_ec_wrap_t;
+
+static cc_ec_wrap_t **g_ec_wrap;
+static int g_ec_wrap_max;
+static pthread_mutex_t g_ec_wrap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int player_alloc_slot(void)
 {
-    pjsua_player_id     player_id = PJSUA_INVALID_ID;
-    pjsua_call_info     ci;
-    pj_str_t            path;
-    unsigned            flags = 0;
-    pj_status_t         status;
+    int i;
+
+    pthread_mutex_lock(&g_player_lock);
+    for (i = 0; i < CC_PLAYER_SLOTS; i++) {
+        if (!g_players[i].in_use) {
+            memset(&g_players[i], 0, sizeof(g_players[i]));
+            g_players[i].in_use = 1;
+            g_players[i].file_id = PJSUA_INVALID_ID;
+            g_players[i].conf_slot = PJSUA_INVALID_ID;
+            pthread_mutex_unlock(&g_player_lock);
+            return i;
+        }
+    }
+    pthread_mutex_unlock(&g_player_lock);
+    return -1;
+}
+
+static void player_free_slot(int idx)
+{
+    if (idx < 0 || idx >= CC_PLAYER_SLOTS)
+        return;
+    pthread_mutex_lock(&g_player_lock);
+    memset(&g_players[idx], 0, sizeof(g_players[idx]));
+    g_players[idx].file_id = PJSUA_INVALID_ID;
+    g_players[idx].conf_slot = PJSUA_INVALID_ID;
+    pthread_mutex_unlock(&g_player_lock);
+}
+
+/*
+ * First active audio conference slot, or PJSUA_INVALID_ID (-1).
+ * MEDIA_ACTIVE alone is not enough: conf_slot can still be -1 while the
+ * stream is coming up or tearing down, and audio may not be media[0].
+ * pjsua_conf_connect2() asserts source >= 0 && sink >= 0.
+ */
+static pjsua_conf_port_id cc_call_conf_slot(const pjsua_call_info *ci)
+{
+    unsigned i;
+
+    if (!ci)
+        return PJSUA_INVALID_ID;
+
+    for (i = 0; i < ci->media_cnt; i++) {
+        if (ci->media[i].type != PJMEDIA_TYPE_AUDIO)
+            continue;
+        if (ci->media[i].status != PJSUA_CALL_MEDIA_ACTIVE)
+            continue;
+        if (ci->media[i].stream.aud.conf_slot >= 0)
+            return ci->media[i].stream.aud.conf_slot;
+    }
+    return PJSUA_INVALID_ID;
+}
+
+static pjsua_conf_port_id cc_live_call_conf_slot(pjsua_call_id call_id,
+                                                const pjsua_call_info *fallback)
+{
+    pjsua_call_info live;
+    pjsua_conf_port_id slot = PJSUA_INVALID_ID;
+
+    if (call_id != PJSUA_INVALID_ID &&
+        pjsua_call_get_info(call_id, &live) == PJ_SUCCESS)
+        slot = cc_call_conf_slot(&live);
+    if (slot < 0 && fallback)
+        slot = cc_call_conf_slot(fallback);
+    return slot;
+}
+
+static pj_status_t cc_conf_connect_checked(pjsua_conf_port_id source,
+                                           pjsua_conf_port_id sink,
+                                           const char *what)
+{
+    if (source < 0 || sink < 0) {
+        PJ_LOG(1, (THIS_FILE,
+                   "[CONF] skip connect %s source=%d sink=%d",
+                   what ? what : "", (int)source, (int)sink));
+        return PJ_EINVAL;
+    }
+    return pjsua_conf_connect(source, sink);
+}
+
+static int wav_file_duration_ms(pjsua_player_id pid)
+{
+    pjmedia_port *port = NULL;
+    pj_ssize_t data_len;
+    const pjmedia_port_info *info;
+    int bps, dur;
+
+    if (pid == PJSUA_INVALID_ID) return 4000;
+    if (pjsua_player_get_port(pid, &port) != PJ_SUCCESS || !port) return 4000;
+    data_len = pjmedia_wav_player_get_len(port);
+    if (data_len <= 0) return 4000;
+    info = &port->info;
+    bps  = (info->fmt.det.aud.bits_per_sample / 8) *
+            info->fmt.det.aud.channel_count;
+    if (bps <= 0 || info->fmt.det.aud.clock_rate == 0) return 4000;
+    dur = (int)((long long)data_len * 1000 /
+                (info->fmt.det.aud.clock_rate * bps));
+    return dur > 0 ? dur : 4000;
+}
+
+static int call_media_ready(pjsua_call_id call_id, pjsua_call_info *ci)
+{
+    pj_status_t status = pjsua_call_get_info(call_id, ci);
+    pjsua_conf_port_id slot = PJSUA_INVALID_ID;
+
+    if (status == PJ_SUCCESS)
+        slot = cc_call_conf_slot(ci);
+
+    if (status != PJ_SUCCESS ||
+        ci->state < PJSIP_INV_STATE_EARLY ||
+        ci->state >= PJSIP_INV_STATE_DISCONNECTED ||
+        slot < 0)
+    {
+        PJ_LOG(3, (THIS_FILE,
+                   "[VOICE] cc_start_wav: call %d not ready (state=%d media=%d slot=%d) — skip",
+                   call_id,
+                   status == PJ_SUCCESS ? (int)ci->state : -1,
+                   status == PJ_SUCCESS && ci->media_cnt > 0
+                       ? (int)ci->media[0].status : -1,
+                   (int)slot));
+        return 0;
+    }
+    return 1;
+}
+
+static pjsua_player_id start_wav_mem(pjsua_call_id call_id,
+                                     const pjsua_call_info *ci,
+                                     const char *wav_path,
+                                     const cc_wav_pcm_t *pcm,
+                                     pj_bool_t loop)
+{
+    int idx;
+    unsigned flags = loop ? 0 : PJMEDIA_MEM_NO_LOOP;
+    unsigned spf;
+    pj_status_t status;
+    pj_pool_t *pool;
+    pjmedia_port *port = NULL;
+    pjsua_conf_port_id slot = PJSUA_INVALID_ID;
+
+    idx = player_alloc_slot();
+    if (idx < 0) {
+        PJ_LOG(1, (THIS_FILE, "[VOICE] player slot exhausted"));
+        return PJSUA_INVALID_ID;
+    }
+
+    pool = pjsua_pool_create("cc-wav", 512, 512);
+    if (!pool) {
+        player_free_slot(idx);
+        return PJSUA_INVALID_ID;
+    }
+
+    spf = pcm->clock_rate * pcm->channel_count * CC_AUDIO_PTIME_MS / 1000;
+    if (spf == 0)
+        spf = pcm->clock_rate / 50;
+
+    status = pjmedia_mem_player_create(pool, pcm->pcm, pcm->nbytes,
+                                       pcm->clock_rate, pcm->channel_count,
+                                       spf, pcm->bits_per_sample, flags, &port);
+    if (status != PJ_SUCCESS) {
+        pj_pool_release(pool);
+        player_free_slot(idx);
+        PJ_LOG(2, (THIS_FILE,
+                   "[VOICE] mem player failed for %s status=%d — file fallback",
+                   wav_path, status));
+        return PJSUA_INVALID_ID;
+    }
+
+    status = pjsua_conf_add_port(pool, port, &slot);
+    if (status != PJ_SUCCESS || slot < 0) {
+        if (port)
+            pjmedia_port_destroy(port);
+        pj_pool_release(pool);
+        player_free_slot(idx);
+        PJ_LOG(1, (THIS_FILE,
+                   "[VOICE] mem player add_port failed call=%d status=%d slot=%d",
+                   call_id, status, (int)slot));
+        return PJSUA_INVALID_ID;
+    }
+
+    /*
+     * Cached PCM is shared read-only; each play still adds a conf port.
+     * Re-read the call slot immediately before connect: MEDIA_ACTIVE in
+     * the snapshot can race with conf_slot == -1 (load abort in
+     * pjsua_conf_connect2).
+     */
+    {
+        pjsua_conf_port_id call_slot = cc_live_call_conf_slot(call_id, ci);
+
+        status = cc_conf_connect_checked(slot, call_slot, "mem-player");
+        if (status != PJ_SUCCESS) {
+            pjsua_conf_remove_port(slot);
+            pjmedia_port_destroy(port);
+            pj_pool_release(pool);
+            player_free_slot(idx);
+            PJ_LOG(1, (THIS_FILE,
+                       "[VOICE] mem player connect failed call=%d "
+                       "player_slot=%d call_slot=%d status=%d",
+                       call_id, (int)slot, (int)call_slot, status));
+            return PJSUA_INVALID_ID;
+        }
+    }
+
+    g_players[idx].is_mem = 1;
+    g_players[idx].port = port;
+    g_players[idx].pool = pool;
+    g_players[idx].conf_slot = slot;
+    g_players[idx].duration_ms = pcm->duration_ms > 0 ? pcm->duration_ms : 4000;
+    PJ_LOG(4, (THIS_FILE, "WAV mem player %d connected to call %d (%s)",
+               idx, call_id, wav_path));
+    return (pjsua_player_id)idx;
+}
+
+static pjsua_player_id start_wav_file(pjsua_call_id call_id,
+                                      const pjsua_call_info *ci,
+                                      const char *wav_path,
+                                      pj_bool_t loop)
+{
+    pjsua_player_id file_id = PJSUA_INVALID_ID;
+    pj_str_t path;
+    unsigned flags = 0;
+    pj_status_t status;
+    int idx;
 
     if (!loop)
         flags |= PJMEDIA_FILE_NO_LOOP;
 
-    /* Validate call state before touching PJSUA player machinery */
-    status = pjsua_call_get_info(call_id, &ci);
-    if (status != PJ_SUCCESS ||
-        ci.state < PJSIP_INV_STATE_EARLY ||
-        ci.state >= PJSIP_INV_STATE_DISCONNECTED ||
-        ci.media_cnt == 0 ||
-        ci.media[0].status != PJSUA_CALL_MEDIA_ACTIVE)
-    {
-        PJ_LOG(2, (THIS_FILE,
-                   "[VOICE] cc_start_wav: call %d not ready (state=%d media=%d) — skip",
-                   call_id,
-                   status == PJ_SUCCESS ? (int)ci.state : -1,
-                   status == PJ_SUCCESS && ci.media_cnt > 0
-                       ? (int)ci.media[0].status : -1));
+    idx = player_alloc_slot();
+    if (idx < 0) {
+        PJ_LOG(1, (THIS_FILE, "[VOICE] player slot exhausted"));
         return PJSUA_INVALID_ID;
     }
 
     path = pj_str((char *)wav_path);
-    status = pjsua_player_create(&path, flags, &player_id);
+    status = pjsua_player_create(&path, flags, &file_id);
     if (status != PJ_SUCCESS) {
+        player_free_slot(idx);
         PJ_LOG(1, (THIS_FILE, "[VOICE] failed to create player for %s: %d",
                    wav_path, status));
         return PJSUA_INVALID_ID;
     }
 
-    /* Connect player to call's conference port — re-use ci from above */
-    if (ci.media_cnt > 0 && ci.media[0].status == PJSUA_CALL_MEDIA_ACTIVE &&
-        ci.media[0].stream.aud.conf_slot >= 0) {
-        pjsua_conf_port_id player_port = pjsua_player_get_conf_port(player_id);
-        status = pjsua_conf_connect(player_port,
-                                    ci.media[0].stream.aud.conf_slot);
+    {
+        pjsua_conf_port_id player_port = pjsua_player_get_conf_port(file_id);
+        pjsua_conf_port_id call_slot = cc_live_call_conf_slot(call_id, ci);
+
+        status = cc_conf_connect_checked(player_port, call_slot, "file-player");
         if (status != PJ_SUCCESS) {
-            pj_status_t destroy_status;
             PJ_LOG(1, (THIS_FILE,
-                       "[VOICE] player connect failed player=%d call=%d status=%d",
-                       player_id, call_id, status));
-            destroy_status = pjsua_player_destroy(player_id);
-            if (destroy_status != PJ_SUCCESS) {
-                PJ_LOG(1, (THIS_FILE,
-                           "[VOICE] player cleanup failed player=%d status=%d",
-                           player_id, destroy_status));
-            }
+                       "[VOICE] player connect failed player=%d call=%d "
+                       "player_port=%d call_slot=%d status=%d",
+                       file_id, call_id, (int)player_port, (int)call_slot,
+                       status));
+            pjsua_player_destroy(file_id);
+            player_free_slot(idx);
             return PJSUA_INVALID_ID;
         }
-        PJ_LOG(4, (THIS_FILE, "WAV player %d connected to call %d",
-                   player_id, call_id));
-    } else {
-        PJ_LOG(2, (THIS_FILE, "Call %d media not active — player not connected",
-                   call_id));
-        pjsua_player_destroy(player_id);
-        return PJSUA_INVALID_ID;
     }
 
-    return player_id;
+    g_players[idx].is_mem = 0;
+    g_players[idx].file_id = file_id;
+    g_players[idx].duration_ms = wav_file_duration_ms(file_id);
+    PJ_LOG(4, (THIS_FILE, "WAV file player %d connected to call %d",
+               idx, call_id));
+    return (pjsua_player_id)idx;
+}
+
+pjsua_player_id cc_start_wav(pjsua_call_id call_id,
+                              const char *wav_path,
+                              pj_bool_t loop)
+{
+    pjsua_call_info ci;
+    const cc_wav_pcm_t *pcm;
+    pjsua_player_id pid;
+
+    if (cc_rtpengine_enabled()) {
+        cc_session_t *s = (cc_session_t *)pjsua_call_get_user_data(call_id);
+        int for_a;
+        int dur = 0;
+        int idx;
+
+        if (!s || !wav_path)
+            return PJSUA_INVALID_ID;
+        for_a = (s->call_a == call_id);
+        if (cc_prompt_cache_get(wav_path) &&
+            cc_prompt_cache_get(wav_path)->duration_ms > 0)
+            dur = cc_prompt_cache_get(wav_path)->duration_ms;
+
+        if (cc_rtpengine_play(s, for_a, wav_path, loop ? 1 : 0, &dur) != PJ_SUCCESS)
+            return PJSUA_INVALID_ID;
+
+        if (for_a) {
+            CC_SESSION_LOCK(s);
+            snprintf(s->rtpengine_a_play_file, sizeof(s->rtpengine_a_play_file),
+                     "%s", wav_path);
+            s->rtpengine_a_play_loop = loop ? 1 : 0;
+            CC_SESSION_UNLOCK(s);
+        }
+
+        idx = player_alloc_slot();
+        if (idx < 0) {
+            cc_rtpengine_stop_play(s, for_a);
+            return PJSUA_INVALID_ID;
+        }
+        pthread_mutex_lock(&g_player_lock);
+        g_players[idx].is_rtpengine = 1;
+        g_players[idx].rtpengine_for_a = for_a;
+        g_players[idx].rtpengine_session = s;
+        g_players[idx].duration_ms = dur > 0 ? dur : 4000;
+        pthread_mutex_unlock(&g_player_lock);
+        PJ_LOG(3, (THIS_FILE,
+                   "[VOICE] RTPengine play call=%d file=%s duration=%dms loop=%d",
+                   call_id, wav_path, dur > 0 ? dur : 4000, (int)loop));
+        return (pjsua_player_id)idx;
+    }
+
+    if (!call_media_ready(call_id, &ci))
+        return PJSUA_INVALID_ID;
+
+    pcm = cc_prompt_cache_get(wav_path);
+    if (pcm && pcm->pcm && pcm->nbytes > 0) {
+        pid = start_wav_mem(call_id, &ci, wav_path, pcm, loop);
+        if (pid != PJSUA_INVALID_ID)
+            return pid;
+        /*
+         * Shared PCM is unchanged on failure. Skip file fallback when the
+         * call still has no conf slot: the file path would hit the same
+         * connect and only add disk I/O under load.
+         */
+        if (cc_live_call_conf_slot(call_id, &ci) < 0)
+            return PJSUA_INVALID_ID;
+    }
+
+    return start_wav_file(call_id, &ci, wav_path, loop);
 }
 
 void cc_stop_wav(pjsua_player_id player_id, pjsua_call_id call_id)
 {
-    pj_status_t status;
-    (void)call_id;  /* pjsua_player_destroy handles conf disconnect internally */
+    cc_player_slot_t slot;
+    (void)call_id;
 
-    if (player_id == PJSUA_INVALID_ID) return;
+    if (player_id == PJSUA_INVALID_ID)
+        return;
+    if (player_id < 0 || player_id >= CC_PLAYER_SLOTS)
+        return;
 
-    /* pjsua_player_destroy internally calls pjmedia_conf_remove_port which
-     * disconnects all connections. Do NOT call pjsua_conf_disconnect first —
-     * that zeroes transmitter_cnt and causes op_disconnect_ports to assert
-     * when pjmedia_conf_remove_port tries to disconnect the same connection.
-     *
-     * Do NOT guard on pjsua_player_get_conf_port() == PJSUA_INVALID_ID:
-     * a conf port of INVALID_ID means the port was already removed from the
-     * conference (e.g. call ended), but the player object still exists and
-     * still occupies a slot in the player pool. Skipping destroy here leaks
-     * the slot and eventually exhausts the pool (pjsua_player_create asserts). */
-    status = pjsua_player_destroy(player_id);
-    if (status == PJ_SUCCESS) {
-        PJ_LOG(4, (THIS_FILE, "WAV player %d destroyed", player_id));
-    } else {
-        PJ_LOG(1, (THIS_FILE,
-                   "[VOICE] player destroy failed player=%d status=%d",
-                   player_id, status));
+    pthread_mutex_lock(&g_player_lock);
+    slot = g_players[player_id];
+    pthread_mutex_unlock(&g_player_lock);
+
+    if (!slot.in_use)
+        return;
+
+    if (slot.is_rtpengine) {
+        if (slot.rtpengine_session)
+            cc_rtpengine_stop_play(slot.rtpengine_session, slot.rtpengine_for_a);
+        player_free_slot(player_id);
+        PJ_LOG(4, (THIS_FILE, "RTPengine player %d stopped", player_id));
+        return;
     }
+
+    if (slot.is_mem) {
+        if (slot.conf_slot >= 0)
+            pjsua_conf_remove_port(slot.conf_slot);
+        if (slot.port)
+            pjmedia_port_destroy(slot.port);
+        if (slot.pool)
+            pj_pool_release(slot.pool);
+        PJ_LOG(4, (THIS_FILE, "WAV mem player %d destroyed", player_id));
+    } else if (slot.file_id != PJSUA_INVALID_ID) {
+        pj_status_t status = pjsua_player_destroy(slot.file_id);
+        if (status == PJ_SUCCESS)
+            PJ_LOG(4, (THIS_FILE, "WAV player %d destroyed", player_id));
+        else
+            PJ_LOG(1, (THIS_FILE,
+                       "[VOICE] player destroy failed player=%d status=%d",
+                       player_id, status));
+    }
+
+    player_free_slot(player_id);
+}
+
+int cc_wav_player_duration_ms(pjsua_player_id player_id)
+{
+    int dur = 4000;
+
+    if (player_id == PJSUA_INVALID_ID ||
+        player_id < 0 || player_id >= CC_PLAYER_SLOTS)
+        return 4000;
+
+    pthread_mutex_lock(&g_player_lock);
+    if (g_players[player_id].in_use && g_players[player_id].duration_ms > 0)
+        dur = g_players[player_id].duration_ms;
+    pthread_mutex_unlock(&g_player_lock);
+    return dur;
+}
+
+int cc_line_echo_enabled(void)
+{
+    const char *e = getenv("CC_LINE_ECHO");
+
+    if (e && e[0] != '\0') {
+        if (e[0] == '0' || strcasecmp(e, "off") == 0 ||
+            strcasecmp(e, "no") == 0)
+            return 0;
+        if (e[0] == '1' || strcasecmp(e, "on") == 0 ||
+            strcasecmp(e, "yes") == 0)
+            return 1;
+    }
+    return CC_LINE_ECHO_ENABLE;
+}
+
+static void cc_ec_wrap_free(cc_ec_wrap_t *w, pjmedia_echo_state *echo)
+{
+    pj_pool_t *pool;
+
+    if (echo)
+        pjmedia_echo_destroy(echo);
+    if (w->lock_ready) {
+        pthread_mutex_destroy(&w->lock);
+        w->lock_ready = 0;
+    }
+    pool = w->pool;
+    w->pool = NULL;
+    if (pool)
+        pj_pool_release(pool);
+}
+
+static void cc_ec_wrap_release_in_flight(cc_ec_wrap_t *w)
+{
+    pjmedia_echo_state *echo = NULL;
+    int do_free = 0;
+
+    pthread_mutex_lock(&w->lock);
+    w->in_flight--;
+    if (w->dead && w->in_flight == 0) {
+        echo = w->deferred_echo;
+        w->deferred_echo = NULL;
+        do_free = 1;
+    }
+    pthread_mutex_unlock(&w->lock);
+
+    if (do_free)
+        cc_ec_wrap_free(w, echo);
+}
+
+static int cc_ec_wrap_acquire(cc_ec_wrap_t *w,
+                              pjmedia_echo_state **echo,
+                              pjmedia_port **child)
+{
+    pthread_mutex_lock(&w->lock);
+    if (w->dead) {
+        pthread_mutex_unlock(&w->lock);
+        return 0;
+    }
+    w->in_flight++;
+    *echo = w->echo;
+    *child = w->child;
+    pthread_mutex_unlock(&w->lock);
+    return 1;
+}
+
+static pj_status_t ec_put_frame(pjmedia_port *this_port, pjmedia_frame *frame)
+{
+    cc_ec_wrap_t *w;
+    pjmedia_echo_state *echo = NULL;
+    pjmedia_port *child = NULL;
+    pj_status_t status;
+
+    if (!this_port)
+        return PJ_EINVAL;
+    w = (cc_ec_wrap_t *)this_port->port_data.pdata;
+    if (!w || !w->lock_ready)
+        return PJ_EINVALIDOP;
+
+    if (!cc_ec_wrap_acquire(w, &echo, &child))
+        return PJ_SUCCESS;
+
+    if (echo && frame && frame->type == PJMEDIA_FRAME_TYPE_AUDIO &&
+        frame->buf && frame->size > 0)
+        pjmedia_echo_playback(echo, (pj_int16_t *)frame->buf);
+
+    status = child ? pjmedia_port_put_frame(child, frame) : PJ_SUCCESS;
+    cc_ec_wrap_release_in_flight(w);
+    return status;
+}
+
+static pj_status_t ec_get_frame(pjmedia_port *this_port, pjmedia_frame *frame)
+{
+    cc_ec_wrap_t *w;
+    pjmedia_echo_state *echo = NULL;
+    pjmedia_port *child = NULL;
+    pj_status_t status;
+
+    if (!this_port)
+        return PJ_EINVAL;
+    w = (cc_ec_wrap_t *)this_port->port_data.pdata;
+    if (!w || !w->lock_ready)
+        return PJ_EINVALIDOP;
+
+    if (!cc_ec_wrap_acquire(w, &echo, &child)) {
+        if (frame) {
+            frame->type = PJMEDIA_FRAME_TYPE_NONE;
+            frame->size = 0;
+        }
+        return PJ_SUCCESS;
+    }
+
+    if (!child) {
+        if (frame) {
+            frame->type = PJMEDIA_FRAME_TYPE_NONE;
+            frame->size = 0;
+        }
+        cc_ec_wrap_release_in_flight(w);
+        return PJ_SUCCESS;
+    }
+
+    status = pjmedia_port_get_frame(child, frame);
+    if (status == PJ_SUCCESS && echo && frame &&
+        frame->type == PJMEDIA_FRAME_TYPE_AUDIO &&
+        frame->buf && frame->size > 0)
+        pjmedia_echo_capture(echo, (pj_int16_t *)frame->buf, 0);
+
+    cc_ec_wrap_release_in_flight(w);
+    return status;
+}
+
+/* Echo and pool are owned by cc_ec_wrap_teardown(), not port destroy. */
+static pj_status_t ec_on_destroy(pjmedia_port *this_port)
+{
+    (void)this_port;
+    return PJ_SUCCESS;
+}
+
+/*
+ * SIP thread must not wait on media. Mark dead and return; the last
+ * in-flight get/put frees echo/pool. Immediate free only if idle.
+ */
+static void cc_ec_wrap_teardown(cc_ec_wrap_t *w)
+{
+    pjmedia_echo_state *echo;
+    int defer = 0;
+
+    if (!w)
+        return;
+
+    if (!w->lock_ready) {
+        echo = w->echo;
+        w->echo = NULL;
+        w->child = NULL;
+        cc_ec_wrap_free(w, echo);
+        return;
+    }
+
+    pthread_mutex_lock(&w->lock);
+    w->dead = 1;
+    echo = w->echo;
+    w->echo = NULL;
+    w->child = NULL;
+    if (w->in_flight > 0) {
+        w->deferred_echo = echo;
+        defer = 1;
+    }
+    pthread_mutex_unlock(&w->lock);
+
+    if (!defer)
+        cc_ec_wrap_free(w, echo);
+}
+
+void cc_media_qos_init(int max_calls)
+{
+    if (max_calls <= 0)
+        max_calls = 1;
+    g_ec_wrap_max = max_calls;
+    g_ec_wrap = (cc_ec_wrap_t **)calloc((size_t)max_calls, sizeof(*g_ec_wrap));
+}
+
+void cc_tune_audio_codecs(void)
+{
+    const char *names[] = { "PCMA/8000/1" };
+    unsigned i;
+
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        pj_str_t id = pj_str((char *)names[i]);
+        pjmedia_codec_param param;
+
+        if (pjsua_codec_get_param(&id, &param) != PJ_SUCCESS)
+            continue;
+        param.setting.vad = 0;
+        param.setting.plc = 1;
+        param.setting.cng = 0;
+        pjsua_codec_set_param(&id, &param);
+    }
+}
+
+void cc_on_stream_precreate(pjsua_call_id call_id,
+                            pjsua_on_stream_precreate_param *param)
+{
+    pjmedia_stream_info *ai;
+
+    (void)call_id;
+    if (!param || param->stream_info.type != PJMEDIA_TYPE_AUDIO)
+        return;
+
+    ai = &param->stream_info.info.aud;
+    ai->jb_init = CC_JB_INIT_MS;
+    ai->jb_min_pre = CC_JB_MIN_PRE_MS;
+    ai->jb_max_pre = CC_JB_MAX_PRE_MS;
+    ai->jb_max = CC_JB_MAX_MS;
+    ai->jb_discard_algo = PJMEDIA_JB_DISCARD_PROGRESSIVE;
+    /* rtpengine: media is on RE — skip stream RTCP SDES/BYE on local tp */
+    if (cc_rtpengine_enabled())
+        ai->rtcp_sdes_bye_disabled = PJ_TRUE;
+}
+
+void cc_on_stream_created2(pjsua_call_id call_id,
+                           pjsua_on_stream_created_param *param)
+{
+    pjmedia_port *child;
+    cc_ec_wrap_t *w;
+    pj_pool_t *pool;
+    unsigned clock, ccnt, bits, spf;
+    pj_str_t name;
+    pj_status_t status;
+
+    /*
+     * RTPengine owns media. Pause PJSUA TX+RX as soon as the stream exists
+     * (before on_call_media_state) so local sockets never emit stray RTP
+     * toward the MGW / SIPp while RE is relaying.
+     */
+    if (cc_rtpengine_enabled() && param && param->stream) {
+        pj_status_t ps = pjmedia_stream_pause(param->stream,
+                                              PJMEDIA_DIR_ENCODING_DECODING);
+        if (ps == PJ_SUCCESS) {
+            PJ_LOG(4, (THIS_FILE,
+                       "[RTPENGINE] call %d stream TX+RX paused at create",
+                       call_id));
+        } else {
+            PJ_LOG(2, (THIS_FILE,
+                       "[RTPENGINE] call %d early stream pause failed status=%d",
+                       call_id, ps));
+        }
+    }
+
+    if (!cc_line_echo_enabled())
+        return;
+    if (!param || !param->port || !g_ec_wrap)
+        return;
+    if (call_id < 0 || call_id >= g_ec_wrap_max)
+        return;
+
+    child = param->port;
+    clock = PJMEDIA_PIA_SRATE(&child->info);
+    ccnt  = PJMEDIA_PIA_CCNT(&child->info);
+    bits  = PJMEDIA_PIA_BITS(&child->info);
+    spf   = PJMEDIA_PIA_SPF(&child->info);
+    if (clock == 0 || spf == 0)
+        return;
+
+    pool = pjsua_pool_create("cc-ec", 1024, 1024);
+    if (!pool)
+        return;
+
+    w = PJ_POOL_ZALLOC_T(pool, cc_ec_wrap_t);
+    w->pool = pool;
+    w->child = child;
+
+    if (pthread_mutex_init(&w->lock, NULL) != 0) {
+        pj_pool_release(pool);
+        return;
+    }
+    w->lock_ready = 1;
+
+    name = pj_str("cc-ec");
+    pjmedia_port_info_init(&w->base.info, &name, 0, clock, ccnt, bits, spf);
+    w->base.get_frame = &ec_get_frame;
+    w->base.put_frame = &ec_put_frame;
+    w->base.on_destroy = &ec_on_destroy;
+    w->base.port_data.pdata = w;
+
+    status = pjmedia_echo_create2(pool, clock, ccnt, spf, CC_EC_TAIL_MS,
+                                  CC_JB_INIT_MS,
+                                  PJMEDIA_ECHO_SIMPLE | PJMEDIA_ECHO_USE_SW_ECHO,
+                                  &w->echo);
+    if (status != PJ_SUCCESS) {
+        PJ_LOG(2, (THIS_FILE,
+                   "[MEDIA] echo create failed call=%d status=%d — stream unwrapped",
+                   call_id, status));
+        cc_ec_wrap_teardown(w);
+        return;
+    }
+
+    {
+        cc_ec_wrap_t *old;
+
+        pthread_mutex_lock(&g_ec_wrap_lock);
+        old = g_ec_wrap[call_id];
+        g_ec_wrap[call_id] = w;
+        pthread_mutex_unlock(&g_ec_wrap_lock);
+
+        if (old) {
+            PJ_LOG(2, (THIS_FILE,
+                       "[MEDIA] replacing leftover echo wrapper call=%d",
+                       call_id));
+            cc_ec_wrap_teardown(old);
+        }
+    }
+    param->port = &w->base;
+    param->destroy_port = PJ_FALSE;
+    PJ_LOG(4, (THIS_FILE, "[MEDIA] line-echo wrapper on call=%d spf=%u",
+               call_id, spf));
+}
+
+void cc_on_stream_destroyed(pjsua_call_id call_id,
+                            pjmedia_stream *strm,
+                            unsigned stream_idx)
+{
+    cc_ec_wrap_t *w;
+
+    (void)strm;
+    (void)stream_idx;
+    if (!g_ec_wrap || call_id < 0 || call_id >= g_ec_wrap_max)
+        return;
+
+    pthread_mutex_lock(&g_ec_wrap_lock);
+    w = g_ec_wrap[call_id];
+    g_ec_wrap[call_id] = NULL;
+    pthread_mutex_unlock(&g_ec_wrap_lock);
+
+    cc_ec_wrap_teardown(w);
 }
 
 void cc_isolate_call_from_master(pjsua_call_id call_id)
@@ -1122,12 +1811,12 @@ void cc_isolate_call_from_master(pjsua_call_id call_id)
     pjsua_call_info ci;
     pjsua_conf_port_id call_slot;
 
-    if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS ||
-        ci.media_cnt == 0 ||
-        ci.media[0].status != PJSUA_CALL_MEDIA_ACTIVE)
+    if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS)
         return;
 
-    call_slot = ci.media[0].stream.aud.conf_slot;
+    call_slot = cc_call_conf_slot(&ci);
+    if (call_slot < 0)
+        return;
 
     /* Disconnect master (slot 0) -> call and call -> master (slot 0) */
     pjsua_conf_disconnect(0, call_slot);
@@ -1159,31 +1848,38 @@ pj_status_t cc_bridge_calls(pjsua_call_id call_a, pjsua_call_id call_b)
         return status;
     }
 
-    if (ci_a.media_cnt == 0 || ci_b.media_cnt == 0 ||
-        ci_a.media[0].status != PJSUA_CALL_MEDIA_ACTIVE ||
-        ci_b.media[0].status != PJSUA_CALL_MEDIA_ACTIVE) {
-        PJ_LOG(1, (THIS_FILE, "[BRIDGE] cannot connect: media not active"));
-        return PJ_EINVALIDOP;
-    }
+    {
+        pjsua_conf_port_id port_a = cc_call_conf_slot(&ci_a);
+        pjsua_conf_port_id port_b = cc_call_conf_slot(&ci_b);
 
-    pjsua_conf_port_id port_a = ci_a.media[0].stream.aud.conf_slot;
-    pjsua_conf_port_id port_b = ci_b.media[0].stream.aud.conf_slot;
+        if (port_a < 0 || port_b < 0) {
+            PJ_LOG(1, (THIS_FILE,
+                       "[BRIDGE] cannot connect: invalid conf slot A=%d (slot=%d) "
+                       "B=%d (slot=%d) mediaA=%d mediaB=%d",
+                       call_a, (int)port_a, call_b, (int)port_b,
+                       ci_a.media_cnt > 0 ? (int)ci_a.media[0].status : -1,
+                       ci_b.media_cnt > 0 ? (int)ci_b.media[0].status : -1));
+            return PJ_EINVALIDOP;
+        }
 
-    status = pjsua_conf_connect(port_a, port_b);
-    if (status != PJ_SUCCESS) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[BRIDGE] A->B connect failed A=%d B=%d status=%d",
-                   call_a, call_b, status));
-        return status;
-    }
+        status = cc_conf_connect_checked(port_a, port_b, "bridge-A-B");
+        if (status != PJ_SUCCESS) {
+            PJ_LOG(1, (THIS_FILE,
+                       "[BRIDGE] A->B connect failed A=%d B=%d slot %d->%d status=%d",
+                       call_a, call_b, (int)port_a, (int)port_b, status));
+            return status;
+        }
 
-    status = pjsua_conf_connect(port_b, port_a);
-    if (status != PJ_SUCCESS) {
-        pj_status_t rollback = pjsua_conf_disconnect(port_a, port_b);
-        PJ_LOG(1, (THIS_FILE,
-                   "[BRIDGE] B->A connect failed A=%d B=%d status=%d rollback=%d",
-                   call_a, call_b, status, rollback));
-        return status;
+        status = cc_conf_connect_checked(port_b, port_a, "bridge-B-A");
+        if (status != PJ_SUCCESS) {
+            pj_status_t rollback = pjsua_conf_disconnect(port_a, port_b);
+            PJ_LOG(1, (THIS_FILE,
+                       "[BRIDGE] B->A connect failed A=%d B=%d slot %d->%d "
+                       "status=%d rollback=%d",
+                       call_a, call_b, (int)port_b, (int)port_a, status,
+                       rollback));
+            return status;
+        }
     }
 
     PJ_LOG(3, (THIS_FILE,
@@ -1224,86 +1920,285 @@ pj_status_t cc_unbridge_calls(pjsua_call_id call_a, pjsua_call_id call_b)
         return status;
     }
 
-    if (ci_a.media_cnt == 0 || ci_b.media_cnt == 0 ||
-        ci_a.media[0].status != PJSUA_CALL_MEDIA_ACTIVE ||
-        ci_b.media[0].status != PJSUA_CALL_MEDIA_ACTIVE) {
-        PJ_LOG(2, (THIS_FILE, "[UNBRIDGE] Cannot unbridge: media not active"));
-        return PJ_EINVALIDOP;
-    }
+    {
+        pjsua_conf_port_id port_a = cc_call_conf_slot(&ci_a);
+        pjsua_conf_port_id port_b = cc_call_conf_slot(&ci_b);
 
-    pjsua_conf_port_id port_a = ci_a.media[0].stream.aud.conf_slot;
-    pjsua_conf_port_id port_b = ci_b.media[0].stream.aud.conf_slot;
+        if (port_a < 0 || port_b < 0) {
+            PJ_LOG(2, (THIS_FILE,
+                       "[UNBRIDGE] Invalid conference slots A=%d B=%d",
+                       (int)port_a, (int)port_b));
+            return PJ_EINVALIDOP;
+        }
 
-    PJ_LOG(3, (THIS_FILE,
-               "[UNBRIDGE] A conf slot=%d, B conf slot=%d",
-               port_a, port_b));
-
-    if (port_a < 0 || port_b < 0) {
-        PJ_LOG(2, (THIS_FILE,
-                   "[UNBRIDGE] Invalid conference slots A=%d B=%d",
+        PJ_LOG(3, (THIS_FILE,
+                   "[UNBRIDGE] A conf slot=%d, B conf slot=%d",
                    port_a, port_b));
-        return PJ_EINVALIDOP;
+
+        status_ab = pjsua_conf_disconnect(port_a, port_b);
+        if (status_ab == PJ_SUCCESS) {
+            PJ_LOG(3, (THIS_FILE, "[UNBRIDGE] A->B disconnected"));
+        } else {
+            PJ_LOG(2, (THIS_FILE,
+                       "[UNBRIDGE] A->B disconnect failed: %d",
+                       status_ab));
+        }
+
+        status_ba = pjsua_conf_disconnect(port_b, port_a);
+        if (status_ba == PJ_SUCCESS) {
+            PJ_LOG(3, (THIS_FILE, "[UNBRIDGE] B->A disconnected"));
+        } else {
+            PJ_LOG(2, (THIS_FILE,
+                       "[UNBRIDGE] B->A disconnect failed: %d",
+                       status_ba));
+        }
+
+        if (status_ab != PJ_SUCCESS)
+            return status_ab;
+        if (status_ba != PJ_SUCCESS)
+            return status_ba;
+
+        return PJ_SUCCESS;
     }
-
-    status_ab = pjsua_conf_disconnect(port_a, port_b);
-    if (status_ab == PJ_SUCCESS) {
-        PJ_LOG(3, (THIS_FILE, "[UNBRIDGE] A->B disconnected"));
-    } else {
-        PJ_LOG(2, (THIS_FILE,
-                   "[UNBRIDGE] A->B disconnect failed: %d",
-                   status_ab));
-    }
-
-    status_ba = pjsua_conf_disconnect(port_b, port_a);
-    if (status_ba == PJ_SUCCESS) {
-        PJ_LOG(3, (THIS_FILE, "[UNBRIDGE] B->A disconnected"));
-    } else {
-        PJ_LOG(2, (THIS_FILE,
-                   "[UNBRIDGE] B->A disconnect failed: %d",
-                   status_ba));
-    }
-
-    if (status_ab != PJ_SUCCESS)
-        return status_ab;
-    if (status_ba != PJ_SUCCESS)
-        return status_ba;
-
-    return PJ_SUCCESS;
 }
 
 /*
- * Disconnect a call's conf slot from every other port (including master).
+ * Return the pjmedia_stream* backing a call's active audio media, or NULL.
+ *
+ * CONFIRMED against this build's actual pjsua_internal.h (pjproject 2.17-dev,
+ * /usr/local/include/pjsua-lib/pjsua_internal.h on signaling-server2):
+ *
+ *   extern struct pjsua_data pjsua_var;          // line 709 — note: struct
+ *                                                 // pjsua_data, not typedef
+ *   struct pjsua_data { ... pjsua_call *calls; ... };   // line 629 — POINTER,
+ *                                                 // dynamically allocated,
+ *                                                 // indexes the same as an
+ *                                                 // array via calls[call_id]
+ *   struct pjsua_call {
+ *       ...
+ *       unsigned med_cnt;
+ *       pjsua_call_media media[PJSUA_MAX_CALL_MEDIA];
+ *       int audio_idx;    // first active audio media index
+ *       ...
+ *   };
+ *   struct pjsua_call_media {
+ *       ...
+ *       struct {
+ *           struct { pjmedia_stream *stream; ... } a;   // <-- what we want
+ *           ...
+ *       } strm;
+ *       ...
+ *   };
+ *
+ * LOCKING: PJSUA_LOCK()/PJSUA_UNLOCK() are compiled as EMPTY no-op macros in
+ * this build (confirmed: only one #define exists, both bodies empty). That's
+ * fine for pjsua-lib's own internal code, which only touches pjsua_var from
+ * PJSIP's single event-processing thread. It is NOT fine for us: this
+ * function is called both from PJSIP-callback context (cc_on_call_media_state
+ * -> cc_silence_call) AND from the application's separate worker thread
+ * (worker.c's ev_hold_propagate_a/ev_hold_propagate_b -> cc_resume_call_tx).
+ * Reaching into this raw struct from a foreign thread with zero locking is a
+ * genuine use-after-free risk if PJSIP's thread is concurrently tearing the
+ * same call down. pjsua_var.mutex is a real, actively-used mutex in this
+ * codebase (confirmed via grep — pj_mutex_lock(pjsua_var.mutex) appears in
+ * pjsua_internal.h), so we lock it directly rather than rely on the no-op
+ * PJSUA_LOCK() macro.
+ */
+static pjmedia_stream *cc_get_call_aud_stream(pjsua_call_id call_id)
+{
+    pjsua_call_info  ci;
+    pjmedia_stream  *strm = NULL;
+    unsigned         med_idx;
+
+    if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS ||
+        ci.media_cnt == 0 ||
+        ci.media[0].status != PJSUA_CALL_MEDIA_ACTIVE)
+        return NULL;
+
+    if (call_id < 0)
+        return NULL;
+
+    if (!pjsua_var.mutex) {
+        PJ_LOG(1, (THIS_FILE,
+                   "[BYPASS] pjsua_var.mutex is NULL — pjsua not initialised?"));
+        return NULL;
+    }
+
+    pj_mutex_lock(pjsua_var.mutex);
+
+    {
+        struct pjsua_call *call = &pjsua_var.calls[call_id];
+
+        med_idx = 0;
+        if (call->audio_idx >= 0 && (unsigned)call->audio_idx < call->med_cnt)
+            med_idx = (unsigned)call->audio_idx;
+
+        if (med_idx < PJSUA_MAX_CALL_MEDIA &&
+            med_idx < call->med_cnt &&
+            call->media[med_idx].type == PJMEDIA_TYPE_AUDIO)
+        {
+            strm = call->media[med_idx].strm.a.stream;
+        }
+    }
+
+    pj_mutex_unlock(pjsua_var.mutex);
+
+    if (!strm) {
+        PJ_LOG(2, (THIS_FILE,
+                   "[BYPASS] call %d: no active audio stream at media[%u] "
+                   "(med_cnt/audio_idx mismatch, or stream not yet created)",
+                   call_id, med_idx));
+    }
+
+    return strm;
+}
+
+/*
+ * Disconnect a call's conf slot from every other port (including master),
+ * AND pause the underlying RTP encoder so the B2BUA physically stops
+ * transmitting.
+ *
+ * NOTE ON PORTS: this does NOT close/release the local UDP socket — the
+ * port stays open and bound for the life of the call (so it can still be
+ * resumed instantly for hold/MOH — see cc_resume_call_tx below, and
+ * cc_bridge_calls() callers that re-enter the media path). Actually
+ * releasing the socket would require tearing down the call's media
+ * transport entirely, which only happens at call teardown (BYE) and is
+ * not compatible with keeping the SIP dialog alive for further
+ * hold/resume/DTMF signaling.
+ *
  * Called after UPDATE/re-INVITE bypass so B2BUA stops transmitting RTP.
  */
 void cc_silence_call(pjsua_call_id call_id)
 {
     pjsua_call_info ci;
-    pjsua_conf_port_id slot;
-    pjsua_conf_port_info pi;
+    pjsua_conf_port_id slot = PJSUA_INVALID_ID;
+    pjsua_conf_port_info *pi = NULL;
     unsigned i;
+    pjmedia_stream *strm;
+    int rtpengine = (cc_cfg_media_mode() == CC_MEDIA_MODE_RTPENGINE);
 
     if (call_id == PJSUA_INVALID_ID)
         return;
-    if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS ||
-        ci.media_cnt == 0 ||
-        ci.media[0].status != PJSUA_CALL_MEDIA_ACTIVE)
+    if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS)
+        return;
+    /* Empty / torn-down slot: get_info can succeed with NULL state. */
+    if (ci.state == PJSIP_INV_STATE_NULL ||
+        ci.state == PJSIP_INV_STATE_DISCONNECTED)
         return;
 
-    slot = ci.media[0].stream.aud.conf_slot;
+    /*
+     * pjsua_conf_port_info embeds listeners[PJMEDIA_CONF_MAX_PORTS] and is
+     * ~500KB+. Worker threads only have a 256KB stack — stack-allocating it
+     * SIGSEGVs at function entry (seen: ev_accept_bridge -> cc_silence_call).
+     *
+     * In rtpengine mode media is not on the conf bridge — skip disconnect
+     * work and only pause the PJSUA stream (stops stray local RTP).
+     */
+    slot = cc_call_conf_slot(&ci);
+    if (!rtpengine && slot > 0) {
+        pi = (pjsua_conf_port_info *)malloc(sizeof(*pi));
+        if (pi && pjsua_conf_get_port_info(slot, pi) == PJ_SUCCESS) {
+            for (i = 0; i < pi->listener_cnt; i++)
+                pjsua_conf_disconnect(slot, pi->listeners[i]);
+            /* Disconnect master (slot 0) -> this slot */
+            pjsua_conf_disconnect(0, slot);
+        }
+        free(pi);
+        pi = NULL;
+    }
 
-    if (pjsua_conf_get_port_info(slot, &pi) != PJ_SUCCESS)
-        return;
+    /*
+     * Disconnecting the conf bridge only stops audio CONTENT from being
+     * mixed into this call's stream — it does NOT stop the stream itself
+     * from transmitting. PJSUA's audio clock keeps calling get_frame() on
+     * every active stream regardless of conf-bridge connectivity, so a
+     * disconnected/isolated port still gets fed silence and the stream
+     * keeps encoding + sending that silence as real RTP packets to the
+     * network. Explicitly pause the encoder direction to actually stop
+     * outbound RTP transmission.
+     *
+     * In RTPengine mode, also pause the decoder: stray RTP can still hit
+     * PJSUA's local sockets (port collision with SIPp, hairpin, etc.) and
+     * otherwise floods "RTP status" / "Jitter buffer reset" logs even though
+     * we are not in the media path.
+     */
+    strm = cc_get_call_aud_stream(call_id);
+    if (strm) {
+        unsigned dir = PJMEDIA_DIR_ENCODING;
+        const char *dir_label = "TX";
 
-    /* Disconnect this slot from all its listeners (outbound connections) */
-    for (i = 0; i < pi.listener_cnt; i++)
-        pjsua_conf_disconnect(slot, pi.listeners[i]);
+        if (rtpengine) {
+            dir = PJMEDIA_DIR_ENCODING_DECODING;
+            dir_label = "TX+RX";
+        }
 
-    /* Disconnect master (slot 0) -> this slot (inbound from soundcard/master) */
-    pjsua_conf_disconnect(0, slot);
+        pj_status_t pause_status = pjmedia_stream_pause(strm, dir);
+        if (pause_status == PJ_SUCCESS) {
+            PJ_LOG(4, (THIS_FILE,
+                       "[BYPASS] call %d stream %s paused — RTP I/O stopped",
+                       call_id, dir_label));
+        } else {
+            PJ_LOG(1, (THIS_FILE,
+                       "[BYPASS] call %d stream %s pause failed status=%d — "
+                       "B2BUA may keep processing stray RTP",
+                       call_id, dir_label, pause_status));
+        }
+    } else if (!rtpengine && slot > 0) {
+        PJ_LOG(1, (THIS_FILE,
+                   "[BYPASS] call %d: could not resolve pjmedia_stream — "
+                   "wire up cc_get_call_aud_stream() for your PJSIP build, "
+                   "otherwise conf-bridge disconnect alone will NOT stop "
+                   "outbound RTP (see pcap evidence)",
+                   call_id));
+    }
 
-    PJ_LOG(3, (THIS_FILE,
+    PJ_LOG(4, (THIS_FILE,
                "[BYPASS] call %d (slot %d) silenced — B2BUA exited RTP path",
                call_id, slot));
+}
+
+/*
+ * Resume RTP transmission on a call previously silenced by cc_silence_call().
+ * Must be called BEFORE re-connecting the call into the conf bridge
+ * (e.g. before cc_bridge_calls()) whenever the B2BUA needs to re-enter the
+ * media path post-bypass — e.g. playing MOH to A while B is on hold.
+ * Safe to call on a call that was never paused (pjmedia_stream_resume is a
+ * no-op / returns success if the stream isn't currently paused in PJSIP).
+ */
+void cc_resume_call_tx(pjsua_call_id call_id)
+{
+    pjmedia_stream *strm;
+
+    if (call_id == PJSUA_INVALID_ID)
+        return;
+
+    strm = cc_get_call_aud_stream(call_id);
+    if (!strm) {
+        PJ_LOG(1, (THIS_FILE,
+                   "[BYPASS] call %d: could not resolve pjmedia_stream for resume",
+                   call_id));
+        return;
+    }
+
+    {
+        unsigned dir = PJMEDIA_DIR_ENCODING;
+        const char *dir_label = "TX";
+
+        if (cc_cfg_media_mode() == CC_MEDIA_MODE_RTPENGINE) {
+            dir = PJMEDIA_DIR_ENCODING_DECODING;
+            dir_label = "TX+RX";
+        }
+
+        if (pjmedia_stream_resume(strm, dir) == PJ_SUCCESS) {
+            PJ_LOG(3, (THIS_FILE,
+                       "[BYPASS] call %d stream %s resumed", call_id, dir_label));
+        } else {
+            PJ_LOG(1, (THIS_FILE,
+                       "[BYPASS] call %d stream %s resume failed",
+                       call_id, dir_label));
+        }
+    }
 }
 
 /*
@@ -1391,7 +2286,17 @@ static void cc_session_finish_end(cc_session_t *session,
         return;
     }
 
-    session->call_end_ts = time(NULL);
+    /*
+     * Keep an end stamp that was already taken at the decision point.
+     *
+     * The reject / DTMF-timeout paths deliberately defer mark_end until
+     * after A's treatment prompt, because in rtpengine mode that prompt is
+     * played by RTPengine and mark_end deletes the RE session. Stamping the
+     * end here unconditionally therefore added the treatment length to
+     * every duration — a 10 s no-DTMF window was reported as 16-18 s.
+     */
+    if (session->call_end_ts == 0)
+        session->call_end_ts = time(NULL);
 
     if (status)
         cc_copy_cstr(session->final_status,
@@ -1428,6 +2333,11 @@ static void cc_session_finish_end(cc_session_t *session,
     session->end_reported = 1;
 
     CC_SESSION_UNLOCK(session);
+
+    if (cc_rtpengine_enabled()) {
+        cc_rtpengine_query(session);
+        cc_rtpengine_delete(session);
+    }
 
     PJ_LOG(3, (THIS_FILE,
                "[CALL-END] callId=%s duration=%ld status=%s reason=%s start=%ld connected=%ld end=%ld",
@@ -1471,12 +2381,75 @@ pj_status_t cc_safe_hangup(pjsua_call_id call_id, pjsip_status_code code)
     return status;
 }
 
+/* One answer2 at a time — protects SIP I/O from PJSUA mutex saturation. */
+static pthread_mutex_t g_answer2_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+pj_status_t cc_call_answer2_serialized(pjsua_call_id call_id,
+                                       const pjsua_call_setting *opt,
+                                       unsigned code,
+                                       const pj_str_t *reason,
+                                       const pjsua_msg_data *msg_data,
+                                       long long *lock_wait_ms_out)
+{
+    long long t0;
+    long long waited;
+    pj_status_t status;
+    pjsua_call_info ci;
+
+    if (call_id == PJSUA_INVALID_ID)
+        return PJ_EINVAL;
+
+    t0 = cc_monotonic_ms();
+    pthread_mutex_lock(&g_answer2_mutex);
+    waited = cc_monotonic_ms() - t0;
+    if (lock_wait_ms_out)
+        *lock_wait_ms_out = waited;
+
+    if (waited > 0) {
+        PJ_LOG(3, (THIS_FILE,
+                   "[A-TIMING] call_a=%d phase=ANSWER2_LOCK "
+                   "lock_wait_ms=%lld",
+                   call_id, waited));
+    }
+
+    /*
+     * Re-check under the answer2 lock: CANCEL/BYE on the SIP thread can
+     * deinit media while we were waiting. Answering a DISCONNECTED call
+     * races pjsua_media_channel_deinit → heap corruption / SIGABRT.
+     */
+    if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS) {
+        pthread_mutex_unlock(&g_answer2_mutex);
+        return PJ_EINVALIDOP;
+    }
+    if (ci.state == PJSIP_INV_STATE_NULL ||
+        ci.state == PJSIP_INV_STATE_DISCONNECTED ||
+        ci.state == PJSIP_INV_STATE_CONFIRMED)
+    {
+        PJ_LOG(3, (THIS_FILE,
+                   "[A-TIMING] call_a=%d phase=ANSWER2_SKIP state=%d",
+                   call_id, (int)ci.state));
+        pthread_mutex_unlock(&g_answer2_mutex);
+        return PJ_EINVALIDOP;
+    }
+
+    status = pjsua_call_answer2(call_id, opt, code, reason, msg_data);
+    pthread_mutex_unlock(&g_answer2_mutex);
+    return status;
+}
+
 void cc_sleep_ms(int ms)
 {
     struct timespec ts;
     ts.tv_sec  = ms / 1000;
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
+}
+
+long long cc_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
 int cc_pthread_create(pthread_t *t, void *(*fn)(void *), void *arg)

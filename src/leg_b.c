@@ -12,6 +12,7 @@
 #include "prompt_mapping.h"
 #include "runtime_config.h"
 #include "worker.h"
+#include "rtpengine.h"
 
 #include <pjsua-lib/pjsua.h>
 #include <pjmedia/sdp.h>
@@ -34,18 +35,6 @@ static void on_reject_mapped(pjsua_call_id call_b,
                              const char *reason,
                              char decision_digit,
                              cc_prompt_tag_t prompt_tag);
-
-static const char *disconnect_before_accept_reason(pjsip_status_code code)
-{
-    if (code >= 300 &&
-        code != PJSIP_SC_BUSY_HERE &&
-        code != PJSIP_SC_DECLINE)
-    {
-        return "SPONSOR_UNREACHABLE_NoMCA";
-    }
-
-    return "REJECTED_BY_SPONSOR";
-}
 
 static const char *decision_name(char digit)
 {
@@ -141,6 +130,9 @@ void leg_b_on_call_state(pjsua_call_id call_id, cc_session_t *session)
             cc_stop_wav(player_b, PJSUA_INVALID_ID);
         }
 
+        /* A's own DTMF is needed for the MCA wait below. */
+        cc_rtpengine_unblock_media(session);
+
         cc_session_invalidate_b(session, call_id);
 
         if (should_reject_a) {
@@ -155,18 +147,33 @@ void leg_b_on_call_state(pjsua_call_id call_id, cc_session_t *session)
                 /* 486: play BUSY prompt, wait for A DTMF 1 for MCA */
                 leg_a_play_mca_wait(session, CC_PROMPT_BUSY);
             } else if (ci.last_status == PJSIP_SC_DECLINE) {
-                /* 603 Decline: B explicitly rejected */
-                cc_session_mark_end(session, "CANCELLED", "REJECTED_BY_SPONSOR");
+                /* 603 Decline: B explicitly rejected — play rejected.wav.
+                 * Defer mark_end so RTPengine stays up for A's treatment. */
+                int treatment_armed = 0;
+                CC_SESSION_LOCK(session);
+                snprintf(session->final_status, sizeof(session->final_status),
+                         "CANCELLED");
+                snprintf(session->final_reason, sizeof(session->final_reason),
+                         "REJECTED_BY_SPONSOR");
+                CC_SESSION_UNLOCK(session);
+                PJ_LOG(3, (THIS_FILE,
+                           "[B] 603 Decline — play rejected (defer mark_end)"));
                 leg_a_play_rejected_then_hangup(session);
+                CC_SESSION_LOCK(session);
+                treatment_armed = session->a_treatment_running;
+                CC_SESSION_UNLOCK(session);
+                if (!treatment_armed)
+                    cc_session_mark_end(session, "CANCELLED",
+                                        "REJECTED_BY_SPONSOR");
             } else {
-                /* 408 no-answer, 487 cancelled, 503 unreachable, etc. */
-                cc_session_mark_end(session,
-                                    "CANCELLED",
-                                    disconnect_before_accept_reason(
-                                        ci.last_status));
-                leg_a_play_prompt_then_hangup(session,
-                                             CC_PROMPT_NOT_AVAILABLE_TO_PAY,
-                                             PJSIP_SC_TEMPORARILY_UNAVAILABLE);
+                /* 503 No SBC / 408 / 500 / etc. — same MCA offer as 480/486.
+                 * Do not mark_end yet: A may press 1 → SPONSOR_UNREACHABLE_MCA.
+                 * Shared for local_bridge and UPDATE (A still on B2BUA media). */
+                PJ_LOG(3, (THIS_FILE,
+                           "[B] unreachable before accept status=%d — MCA wait "
+                           "prompt=UNAVAILABLE",
+                           ci.last_status));
+                leg_a_play_mca_wait(session, CC_PROMPT_UNAVAILABLE);
             }
         }
 
@@ -314,156 +321,31 @@ void leg_b_on_dtmf(pjsua_call_id call_id, int digit, cc_session_t *session)
 
 void leg_b_send_update_bypass(pjsua_call_id call_id, cc_session_t *session)
 {
-    pjsua_msg_data msg_data;
-    pj_status_t status;
-    pjsua_call_id call_a;
-    pjsua_call_id call_b;
-    cc_rtp_ep_t rtp_a;
-    cc_rtp_ep_t rtp_b;
-
-    /*
-     * Send UPDATE after B accepts. If both RTP endpoints are known,
-     * cc_on_call_sdp_created() rewrites this leg's SDP before send.
-     */
-
-	/* Learn current A/B remote RTP endpoints before sending UPDATE.
-	 * B-leg UPDATE SDP must advertise A-party RTP IP/port.
-	 */
-        CC_SESSION_LOCK(session);
-        call_a = session->call_a;
-        call_b = session->call_b;
-        CC_SESSION_UNLOCK(session);
-
-        if (call_a == PJSUA_INVALID_ID || call_b == PJSUA_INVALID_ID) {
-            PJ_LOG(3, (THIS_FILE,
-                       "[TIMER] skipped stale action: B UPDATE"));
-            return;
-        }
-
-        /* B-leg must be CONFIRMED before we redirect B's RTP to A */
-        {
-            pjsua_call_info ci_b;
-            if (pjsua_call_get_info(call_b, &ci_b) != PJ_SUCCESS ||
-                ci_b.state != PJSIP_INV_STATE_CONFIRMED) {
-                PJ_LOG(1, (THIS_FILE,
-                           "[B] UPDATE skipped: B-leg not CONFIRMED (call_b=%d)",
-                           call_b));
-                return;
-            }
-        }
-
-        /* Wait up to 5s for both:
-         *   1. SBC re-INVITE on B-leg to complete (b_reinvite_active == 0)
-         *   2. B's src_rtp_name valid (RTP packets from post-re-INVITE MGW)
-         *
-         * These must be checked simultaneously: b_reinvite_active clears at
-         * CONFIRMED but RTP from the new MGW IP may not have arrived yet.
-         * Checking them in sequence risks arming with the stale 183 endpoint
-         * if RTP restarts before the flag clears or vice versa. */
-        {
-            int wait_ms = 0;
-            for (; wait_ms < 5000; wait_ms += 50) {
-                int ri_active, torn;
-                CC_SESSION_LOCK(session);
-                ri_active = session->b_reinvite_active;
-                torn = session->torn_down || session->call_b != call_b;
-                CC_SESSION_UNLOCK(session);
-                if (torn) return;
-                if (!ri_active &&
-                    cc_get_call_remote_rtp(call_b, &rtp_b) == PJ_SUCCESS &&
-                    rtp_b.port != 0)
-                    break;
-                cc_sleep_ms(50);
-            }
-            PJ_LOG(3, (THIS_FILE,
-                       "[B] B RTP endpoint after %dms wait: %s:%d",
-                       wait_ms, rtp_b.ip, rtp_b.port));
-        }
-
-        /* Wait up to 1s for A's src_rtp_name — A has been confirmed since
-         * call start so this is typically 0ms. */
-        {
-            int rtp_wait_ms = 0;
-            cc_rtp_ep_t rtp_a_check;
-            while (rtp_wait_ms < 1000) {
-                int torn;
-                if (cc_get_call_remote_rtp(call_a, &rtp_a_check) == PJ_SUCCESS &&
-                    rtp_a_check.port != 0)
-                    break;
-                cc_sleep_ms(50);
-                rtp_wait_ms += 50;
-                CC_SESSION_LOCK(session);
-                torn = session->torn_down || session->call_a != call_a;
-                CC_SESSION_UNLOCK(session);
-                if (torn) return;
-            }
-            PJ_LOG(3, (THIS_FILE,
-                       "[B] A RTP endpoint after %dms wait: %s:%d",
-                       rtp_wait_ms, rtp_a_check.ip, rtp_a_check.port));
-        }
-
-	if (cc_get_call_remote_rtp(call_a, &rtp_a) == PJ_SUCCESS &&
-	    cc_get_call_remote_rtp(call_b, &rtp_b) == PJ_SUCCESS)
-	{
-	    CC_SESSION_LOCK(session);
-            if (session->call_a == call_a &&
-                session->call_b == call_b &&
-                !session->torn_down)
-            {
-                session->rtp_a = rtp_a;
-                session->rtp_b = rtp_b;
-	        session->update_b_pending = 1;
-            }
-	    CC_SESSION_UNLOCK(session);
-
-	    PJ_LOG(3, (THIS_FILE,
-	               "[B] UPDATE rewrite armed: B will receive A RTP %s:%d",
-	               rtp_a.ip, rtp_a.port));
-	} else {
-	    PJ_LOG(1, (THIS_FILE,
-	               "[B] Cannot arm UPDATE rewrite: RTP endpoints not ready"));
-	}
-
-
-    pjsua_msg_data_init(&msg_data);
-
-    PJ_LOG(3, (THIS_FILE, "[B] Sending basic SIP UPDATE"));
-
-    /* Retry up to 2s if dialog has a pending transaction (mirrors A-leg) */
-    {
-        int retry_ms = 0;
-        do {
-            status = pjsua_call_update(call_id, 0, &msg_data);
-            if (status == PJ_SUCCESS || retry_ms >= 2000)
-                break;
-            cc_sleep_ms(100);
-            retry_ms += 100;
-        } while (1);
-    }
-
-    if (status == PJ_SUCCESS) {
-        CC_SESSION_LOCK(session);
-        session->update_b_sent = 1;
-        CC_SESSION_UNLOCK(session);
-        PJ_LOG(3, (THIS_FILE, "[B] SIP UPDATE sent"));
-    } else {
-        CC_SESSION_LOCK(session);
-        session->update_b_pending = 0;
-        CC_SESSION_UNLOCK(session);
-        PJ_LOG(1, (THIS_FILE, "[B] SIP UPDATE failed: %d", status));
-    }
+    /* Non-blocking: post CC_EV_UPDATE_B_BYPASS to worker pool.
+     * The worker polls b_reinvite_active + RTP readiness via re-post
+     * every 50ms — no worker is blocked sleeping. */
+    cc_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type    = CC_EV_UPDATE_B_BYPASS;
+    ev.session = session;
+    ev.call_b  = call_id;
+    CC_SESSION_LOCK(session);
+    ev.call_a  = session->call_a;
+    CC_SESSION_UNLOCK(session);
+    snprintf(ev.reason, sizeof(ev.reason), "update-b-bypass");
+    if (cc_worker_post(&ev) != 0)
+        PJ_LOG(1, (THIS_FILE, "[B] UPDATE bypass post failed"));
 }
 
 /* ── Accept / Reject FSM ─────────────────────────────────────────────────── */
 
 void leg_b_send_reinvite_bypass(cc_session_t *session)
 {
-    pjsua_call_id call_a;
-    pjsua_call_id call_b;
-    cc_rtp_ep_t rtp_a;
-    cc_rtp_ep_t rtp_b;
-    pjsua_msg_data msg_data;
-    pj_status_t status;
+    /* Non-blocking: post CC_EV_REINVITE_B_BYPASS to worker pool.
+     * The worker polls b_reinvite_active + RTP readiness via 50ms re-post
+     * before sending pjsua_call_reinvite — no worker is blocked sleeping. */
+    cc_event_t ev;
+    pjsua_call_id call_a, call_b;
 
     if (!session)
         return;
@@ -473,53 +355,14 @@ void leg_b_send_reinvite_bypass(cc_session_t *session)
     call_b = session->call_b;
     CC_SESSION_UNLOCK(session);
 
-    PJ_LOG(3, (THIS_FILE, "[REINVITE] Preparing B-leg re-INVITE"));
-
-    if (call_a == PJSUA_INVALID_ID || call_b == PJSUA_INVALID_ID) {
-        PJ_LOG(1, (THIS_FILE,
-                   "[REINVITE] B-leg re-INVITE skipped: invalid call ids A=%d B=%d",
-                   call_a, call_b));
-        return;
-    }
-
-    if (cc_get_call_remote_rtp(call_a, &rtp_a) != PJ_SUCCESS ||
-        cc_get_call_remote_rtp(call_b, &rtp_b) != PJ_SUCCESS)
-    {
-        PJ_LOG(1, (THIS_FILE,
-                   "[REINVITE] B-leg re-INVITE skipped: RTP endpoints not ready"));
-        return;
-    }
-
-    CC_SESSION_LOCK(session);
-    if (session->call_a == call_a &&
-        session->call_b == call_b &&
-        !session->torn_down)
-    {
-        session->rtp_a = rtp_a;
-        session->rtp_b = rtp_b;
-        session->reinvite_b_pending = 1;
-    }
-    CC_SESSION_UNLOCK(session);
-
-    PJ_LOG(3, (THIS_FILE,
-               "[REINVITE] B-leg SDP target A RTP %s:%d",
-               rtp_a.ip, rtp_a.port));
-
-    pjsua_msg_data_init(&msg_data);
-
-    status = pjsua_call_reinvite(call_b, 0, &msg_data);
-
-    if (status == PJ_SUCCESS) {
-        PJ_LOG(3, (THIS_FILE, "[REINVITE] B-leg re-INVITE sent"));
-    } else {
-        CC_SESSION_LOCK(session);
-        session->reinvite_b_pending = 0;
-        CC_SESSION_UNLOCK(session);
-
-        PJ_LOG(1, (THIS_FILE,
-                   "[REINVITE] B-leg re-INVITE failed: %d",
-                   status));
-    }
+    memset(&ev, 0, sizeof(ev));
+    ev.type    = CC_EV_REINVITE_B_BYPASS;
+    ev.session = session;
+    ev.call_a  = call_a;
+    ev.call_b  = call_b;
+    snprintf(ev.reason, sizeof(ev.reason), "reinvite-b-bypass");
+    if (cc_worker_post(&ev) != 0)
+        PJ_LOG(1, (THIS_FILE, "[B] re-INVITE bypass post failed"));
 }
 
 static int spawn_accept_transition(cc_session_t *session,
@@ -605,7 +448,10 @@ static void on_reject_mapped(pjsua_call_id call_b,
                              cc_prompt_tag_t prompt_tag)
 {
     pjsua_player_id player_b = PJSUA_INVALID_ID;
+    pjsua_call_id call_a = PJSUA_INVALID_ID;
     char completed_digit;
+    int treatment_armed = 0;
+    long billable = -1;
 
     CC_SESSION_LOCK(session);
     completed_digit = session->decision_digit;
@@ -624,6 +470,32 @@ static void on_reject_mapped(pjsua_call_id call_b,
     session->decision_completed = 1;
     session->decision_digit = decision_digit;
     session->torn_down = 1;
+    /*
+     * Defer mark_end / RTPengine delete until after A's treatment WAV
+     * (1.45 / rejected). Same pattern as validation-reject and MCA resolve.
+     */
+    snprintf(session->final_status, sizeof(session->final_status), "%s",
+             status ? status : "FAILED");
+    snprintf(session->final_reason, sizeof(session->final_reason), "%s",
+             reason ? reason : "REJECTED");
+
+    /*
+     * Stop the billing clock here — this is the decision point. mark_end
+     * runs later (after A's treatment prompt) and would otherwise stamp the
+     * end then, adding the prompt length to the duration: a 10 s no-DTMF
+     * window was being reported as 16-18 s, and a digit-2 reject at 6 s as
+     * 12 s. mark_end keeps a non-zero call_end_ts.
+     */
+    if (session->call_end_ts == 0) {
+        session->call_end_ts = time(NULL);
+        billable = session->call_connected_ts > 0
+                   ? (long)(session->call_end_ts - session->call_connected_ts)
+                   : (session->b_prompt_start_ts > 0
+                      ? (long)(session->call_end_ts - session->b_prompt_start_ts)
+                      : 0);
+        if (billable < 0)
+            billable = 0;
+    }
 
     if (session->player_b != PJSUA_INVALID_ID) {
         player_b = session->player_b;
@@ -631,19 +503,43 @@ static void on_reject_mapped(pjsua_call_id call_b,
     }
     CC_SESSION_UNLOCK(session);
 
+    if (billable >= 0)
+        PJ_LOG(3, (THIS_FILE,
+                   "[CDR] billing clock stopped at decision reason=%s "
+                   "billable=%lds (A treatment excluded)",
+                   reason ? reason : "", billable));
+
     if (player_b != PJSUA_INVALID_ID) {
         PJ_LOG(3, (THIS_FILE, "[VOICE] Stop B collect prompt"));
         cc_stop_wav(player_b, PJSUA_INVALID_ID);
     }
 
-    PJ_LOG(3, (THIS_FILE, "[B] REJECTED"));
-    cc_session_mark_end(session, status, reason);
+    /* Collect phase over — A must hear its treatment prompt and be able
+     * to send DTMF again. */
+    cc_rtpengine_unblock_media(session);
+
+    PJ_LOG(3, (THIS_FILE,
+               "[B] REJECTED reason=%s (defer mark_end for A treatment)",
+               reason ? reason : ""));
     if (cc_session_call_is_current(session, call_b, 0))
         cc_safe_hangup(call_b, PJSIP_SC_OK);
     else
         PJ_LOG(3, (THIS_FILE,
                    "[TIMER] skipped stale action: reject B call=%d", call_b));
     leg_a_play_prompt_then_hangup(session, prompt_tag, PJSIP_SC_DECLINE);
+
+    CC_SESSION_LOCK(session);
+    treatment_armed = session->a_treatment_running;
+    call_a = session->call_a;
+    CC_SESSION_UNLOCK(session);
+    if (!treatment_armed) {
+        /* Prompt/worker post failed — hang up A and emit CDR now. */
+        if (call_a != PJSUA_INVALID_ID &&
+            (cc_session_call_is_current(session, call_a, 1) ||
+             pjsua_call_is_active(call_a) == PJ_TRUE))
+            cc_safe_hangup(call_a, PJSIP_SC_DECLINE);
+        cc_session_mark_end(session, status, reason);
+    }
 }
 
 /* ── Timer threads ───────────────────────────────────────────────────────── */
@@ -675,7 +571,7 @@ static void spawn_timer(cc_session_t *session, int timeout_sec, int is_ring)
     snprintf(ev.reason, sizeof(ev.reason),
              is_ring ? "ring-timer" : "dtmf-timer");
 
-    if (cc_worker_post(&ev) != 0) {
+    if (cc_worker_post_delayed(&ev, timeout_sec * 1000) != 0) {
         CC_SESSION_LOCK(session);
         if (is_ring) session->ring_timer_started = 0;
         else         session->dtmf_timer_started = 0;

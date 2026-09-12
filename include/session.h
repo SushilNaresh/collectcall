@@ -46,6 +46,8 @@ typedef struct cc_session {
     unsigned            ref_count;
     int                 final_cleanup_started;
 
+    unsigned            session_serial; /* monotonic counter — survives call_id slot reuse */
+
     pjsua_call_id       call_a;        /* inbound leg (PJSUA_INVALID_ID if gone) */
     pjsua_call_id       call_b;        /* outbound leg                      */
     pjsua_acc_id        acc_id;        /* account used for B-leg origination */
@@ -53,7 +55,8 @@ typedef struct cc_session {
     char                b_number[64];  /* normalized B/sponsor number */
     char                service_key[64]; /* optional prefix from validation */
     char                b_dial_number[128]; /* final serviceKey + B number */
-    int                 b_leg_started; /* 1 after A-leg ACK/CONFIRMED starts B-leg */
+    int                 b_validation_started; /* 1 once CONFIRMED kicked off initiate API */
+    int                 b_leg_started; /* 1 after eligible — B originate armed (not pre-validation) */
     int                 b_origination_pending;
 
     char                call_id[128];  /* SIP/API call id for later end_call mapping */
@@ -70,6 +73,15 @@ typedef struct cc_session {
     char                icid[128];     /* P-Charging-Vector icid-value */
     time_t              call_start_ts;
     long long           a_confirmed_ms;  /* monotonic ms when A-leg CONFIRMED */
+    /* A-leg setup timing (monotonic ms) — logged as [A-TIMING] at level 3 */
+    long long           a_invite_cb_ms;      /* on_incoming_call entry */
+    long long           a_100_sent_ms;       /* after pjsua_call_answer(100) */
+    long long           a_answer_queued_ms;  /* after answer(+offer) posted */
+    long long           a_200_worker_ms;     /* answer worker picked up event */
+    long long           a_200_sent_ms;       /* after pjsua_call_answer2(200) */
+    long long           a_offer_start_ms;    /* offer worker start */
+    long long           a_offer_done_ms;     /* ng offer(+dummy) finished */
+    long long           a_advertise_ms;      /* re-INVITE advertise attempt */
     long long           b_confirmed_ms;  /* monotonic ms when B-leg CONFIRMED */
     int                 free_period_ms;  /* snapshot of CC_FREE_PERIOD_MS at session start */
     time_t              b_answer_ts;     /* wall clock when B-leg answered (CONFIRMED) */
@@ -93,7 +105,7 @@ typedef struct cc_session {
     int                 b_collect_done;      /* 1 after one-shot B collect prompt finishes */
     int                 a_treatment_running;
     int                 mca_waiting;       /* 1 = waiting for A DTMF 1 to trigger MCA */
-    int                 mca_decided;       /* 1 = MCA decision claimed */
+    int                 mca_decided;       /* 0=none, 1=send MCA, 2=decline */
     int                 accept_transition_pending; /* 1 while accept-transition event is queued/running */
     int                 ring_timer_started;
     int                 dtmf_timer_started;
@@ -101,6 +113,25 @@ typedef struct cc_session {
     cc_bypass_mode_t    bypass_mode;
     cc_rtp_ep_t         rtp_a;         /* A's RTP endpoint from SDP         */
     cc_rtp_ep_t         rtp_b;         /* B's RTP endpoint from SDP         */
+
+    /* RTPengine ng session (one per collect-call pair). */
+    char                rtpengine_call_id[128];
+    char                rtpengine_from_tag[64];
+    char                rtpengine_to_tag[64];
+    int                 rtpengine_offered;
+    int                 rtpengine_answered;
+    int                 rtpengine_deleted;
+    int                 rtpengine_a_advertised; /* A SDP already has RTPengine ports */
+    int                 rtpengine_a_answer_pending; /* answer-pool: deferred A 200 OK */
+    int                 rtpengine_a_offer_pending;  /* general-pool: async ng offer */
+    int                 rtpengine_a_need_advertise; /* CONFIRMED before offer ready */
+    int                 rtpengine_a_reinvite_done; /* A re-INVITE advertised RTPengine ports */
+    int                 rtpengine_a_ep_changed; /* A-facing port changed after B answer */
+    char                rtpengine_a_play_file[256]; /* last play-media file on A */
+    int                 rtpengine_a_play_loop;
+    int                 rtpengine_media_blocked; /* A↔B forward blocked during B collect */
+    cc_rtp_ep_t         rtpengine_ep_a; /* ports A should send to (answer) */
+    cc_rtp_ep_t         rtpengine_ep_b; /* ports B should send to (offer)  */
 
     int                 update_a_pending; /* rewrite A UPDATE SDP with B RTP */
     int                 update_b_pending; /* rewrite B UPDATE SDP with A RTP */
@@ -121,8 +152,29 @@ typedef struct cc_session {
     int                 a_on_hold;       /* 1 while A-leg is on hold (sendonly) */
     pjsua_player_id     hold_player_b;   /* MOH player on B during A hold     */
 
+    /* Mode 2 (UPDATE relay) hold/resume propagation state */
+    int                 b_update_allowed;    /* 1 if Allow: UPDATE seen on B-leg dialog */
+    int                 hold_propagate_pending; /* 1 while hold UPDATE to B is in-flight */
+    int                 resume_propagate_pending; /* 1 while resume UPDATE to B is in-flight */
+    int                 hold_update_b_sent;  /* 1 after hold UPDATE/re-INVITE sent to B */
+    int                 hold_update_b_acked; /* 1 after hold UPDATE 200 OK from B */
+    int                 hold_sdp_b_pending;  /* rewrite B hold UPDATE SDP: rtp_a + sendonly */
+    int                 resume_sdp_b_pending;/* rewrite B resume UPDATE SDP: rtp_a + sendrecv */
+    int                 hold_sdp_direction;  /* 1=sendonly 2=sendrecv for hold/resume SDP rewrite */
+
+	int a_update_allowed;           /* mirrors b_update_allowed */
+	int hold_propagate_a_pending;
+	int resume_propagate_a_pending;
+	int hold_sdp_a_pending;         /* armed before pjsua_call_update(call_a) */
+	int resume_sdp_a_pending;
+	int hold_update_a_sent;
+	int hold_update_a_acked;
+
     cc_sip_hdr_t        fwd_hdrs[CC_MAX_FWD_HDRS];
     int                 fwd_hdr_count;
+
+    char                a_rr_host[128];  /* SSP/SBC extracted from A-leg topmost Record-Route */
+    int                 a_rr_port;       /* SSP port; 0 = not captured */
 
     pjsua_player_id     player_a;      /* A-leg WAV player                  */
     pjsua_player_id     player_b;      /* B-leg WAV player                  */

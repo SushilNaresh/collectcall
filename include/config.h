@@ -84,19 +84,17 @@
 
 /* ── RTP port range ────────────────────────────────────────────────────── */
 /*
- * Stay below Linux ephemeral range (default 32768–60999) to avoid
- * collision with OS-assigned sockets in TIME_WAIT.
+ * RTP port range.
  * 4 ports per session (RTP+RTCP × A+B legs):
- *   50 CPS × 60s hold  = 3,000 sessions × 4 = 12,000 ports needed
  *   100 CPS × 60s hold = 6,000 sessions × 4 = 24,000 ports needed
- * Range 16000–31999 = 16,000 ports → safe for 50 CPS
- * Range 16000–27999 = 12,000 ports → safe for 50 CPS with tighter bound
- * Use 16000–31999 (16000 ports) for single instance ≤50 CPS.
- * For 100 CPS: either raise to 16000–27999 and pin ephemeral above 40000,
- * or split across two instances on different IPs.
+ *   200 CPS × 60s hold = 12,000 sessions × 4 = 48,000 ports needed
+ * Stay below Linux ephemeral range (32768–60999).
+ * Range 16000–31999 = 16,000 ports → only covers ~4,000 sessions (~67 CPS) — too low
+ * Range 16000–65151 = 49,152 ports → covers 12,288 sessions (200 CPS) with headroom
+ * Pin ephemeral range above 65152: sysctl -w net.ipv4.ip_local_port_range="65152 65535"
  */
 #define CC_RTP_PORT_START            16000
-#define CC_RTP_PORT_COUNT            16000  /* 16000–31999: below ephemeral range */
+#define CC_RTP_PORT_COUNT            49152  /* 16000–65151: covers 200 CPS x 60s hold */
 
 /* Forward P-headers on INVITE. Keep UPDATE forwarding disabled unless required. */
 #define CC_COPY_P_HEADERS_IN_UPDATE  0
@@ -106,6 +104,25 @@
  * 1 = use SIP re-INVITE flow
  */
 #define CC_MEDIA_CHANGE_USE_REINVITE 0
+
+/* RTPengine ng control (used when CC_MEDIA_MODE=rtpengine). */
+#define CC_RTPENGINE_HOST            "127.0.0.1"
+#define CC_RTPENGINE_PORT            22222
+#define CC_RTPENGINE_TIMEOUT_MS      1500
+/* Do not use trust-address: phones often put a private LAN IP in SDP while
+ * RTP arrives from a public/NAT source; without trust-address RTPengine
+ * learns the real source so play-media reaches the handset. */
+/* port-latching: keep A-facing ports stable across dummy answer → real B
+ * answer so we do not mid-dialog re-INVITE A when B’s remote RTP changes. */
+/* detect-DTMF + force-transcoding (+ always-transcode): kernel forward relays
+ * RFC2833 without userspace, so DTMF-log-dest never fires. force-transcoding
+ * keeps media in userspace even when codecs match; detect-DTMF covers in-band.
+ * Dummy answer SDP also advertises telephone-event PT 120 (MicroSIP) + 101.
+ * codec-strip-*: single G.711 PCMA toward phones — SIP SDP is also restricted
+ * to PCMA+TE in b2bua rewrite (PJSUA must not advertise PCMU/G722). */
+#define CC_RTPENGINE_FLAGS           "replace-origin,replace-session-connection,ICE=remove,port-latching,detect-DTMF,force-transcoding,always-transcode,codec-strip-G722,codec-strip-opus,codec-strip-GSM,codec-strip-PCMU"
+#define CC_RTPENGINE_DTMF_PORT       22223
+#define CC_RTPENGINE_MEDIA_DIR       ""
 
 /* Unbridge local PJSUA conference after sending re-INVITE.
  * Only relevant when CC_MEDIA_CHANGE_USE_REINVITE=1.
@@ -130,18 +147,24 @@
 /* IPs matching these prefixes → MGW bypass (X-MGW-Directive)            */
 /* All other IPs               → DIRECT VoLTE hairpin (SDP rewrite)      */
 #define CC_MGW_SUBNET_COUNT         2
+/* IPs matching these prefixes → MGW bypass (X-MGW-Directive)            */
+/* All other IPs               → DIRECT VoLTE hairpin (SDP rewrite)      */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
 static const char *CC_MGW_SUBNETS[] = { "10.200.", "10.201." };
 
 /* ── Operator headers to forward A → B ───────────────────────────────── */
-#define CC_FWD_HDR_COUNT            6
+#define CC_FWD_HDR_COUNT            (sizeof(CC_FWD_HEADERS) / sizeof(CC_FWD_HEADERS[0]))
 static const char *CC_FWD_HEADERS[] = {
     "P-Asserted-Identity",
     "P-Preferred-Identity",
     "Privacy",
     "P-Access-Network-Info",
     "P-Charging-Vector",
-    "P-Charging-Function-Addresses"
+    "P-Charging-Function-Addresses",
+    "X-Orig-SBC"
 };
+#pragma GCC diagnostic pop
 
 /* ── PJSUA engine ─────────────────────────────────────────────────────── */
 /*
@@ -153,9 +176,23 @@ static const char *CC_FWD_HEADERS[] = {
  * CC_RTP_PORT_COUNT=16384 covers this range.
  * Requires PJSUA recompile with PJSUA_MAX_CALLS=8192 (set in Makefile).
  */
-#define CC_MAX_CALLS                8192   /* 4096 sessions × 2 legs; was 32768 — PJSUA pre-allocs all slots */
-#define CC_LOG_LEVEL                3    /* reduce from 4 at >50 CPS — level 4 logs every ref acquire/release */
+#define CC_MAX_CALLS                32768  /* matches PJSUA_MAX_CALLS in config_site.h; 200 CPS x 60s = 12000 sessions x 2 legs = 24000 */
+#define CC_LOG_LEVEL                2    /* 2=errors+warnings at >100 CPS; level 3 adds per-call INFO lines */
 #define CC_CLOCK_RATE               8000   /* G.711 narrowband */
+#define CC_AUDIO_PTIME_MS           20     /* conference / mem-player frame size */
+#define CC_JB_INIT_MS               40     /* initial jitter prefetch */
+#define CC_JB_MIN_PRE_MS            20     /* minimum prefetch; avoids underrun */
+#define CC_JB_MAX_PRE_MS            80     /* adaptive prefetch ceiling */
+#define CC_JB_MAX_MS                200    /* hard discard; later packets are useless */
+#define CC_EC_TAIL_MS               200    /* used only if line echo is enabled */
+/*
+ * Per-stream AEC on a null-snd B2BUA. Default off: endpoints own echo,
+ * and wrapping every leg caused delaybuf asserts and SIP-thread hangs.
+ * Override at runtime: CC_LINE_ECHO=1
+ */
+#ifndef CC_LINE_ECHO_ENABLE
+#define CC_LINE_ECHO_ENABLE         0
+#endif
 #define CC_POOL_INIT_SIZE           8192   /* fits cc_session_t(~3940B) + fwd_hdr values in one block; was 4000 */
 #define CC_POOL_INC_SIZE            4096   /* was 4000 */
 

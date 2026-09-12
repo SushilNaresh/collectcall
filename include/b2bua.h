@@ -81,4 +81,37 @@ void *cc_originate_b_thread(void *arg);
  */
 pjsua_call_id cc_start_b_leg_after_a_confirmed(cc_session_t *session);
 
+/**
+ * Worker (legacy): ng offer then queue A 200 (same as offer-then-answer).
+ */
+void cc_complete_a_rtpengine_answer(cc_session_t *session,
+                                    pjsua_call_id call_a,
+                                    const char *sdp);
+
+/**
+ * Worker: ng offer (+ dummy answer), patch A negotiator SDP to RTPengine,
+ * then queue A 200 on the answer pool (RE ports in initial 200 OK).
+ */
+void cc_complete_a_rtpengine_offer(cc_session_t *session,
+                                   pjsua_call_id call_a,
+                                   const char *sdp);
+
+/**
+ * Worker: A-leg 200 OK (UDP media bind + answer2).
+ * Rtpengine mode: expects negotiator already patched to RE ports when possible.
+ * Runs on the answer pool so SIP threads are not blocked by port bind.
+ */
+void cc_complete_a_local_answer(cc_session_t *session, pjsua_call_id call_a);
+
+/**
+ * Register the inbound-response fixup module. Must be called after
+ * pjsua_init() so the endpoint exists.
+ *
+ * Unwraps square brackets around an IPv4 host:port in a Contact URI (the
+ * shape Kamailio uses for public GRUUs) before the dialog layer stores it as
+ * the remote target, otherwise our ACK is unroutable and the callee tears the
+ * call down after retransmitting its 200 OK.
+ */
+pj_status_t cc_sip_contact_fix_install(void);
+
 #endif /* CC_B2BUA_H */
